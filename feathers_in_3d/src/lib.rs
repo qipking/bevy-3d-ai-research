@@ -10,9 +10,11 @@
 //! subtree root. The subtree must be laid out somewhere (it may be off-screen —
 //! that is how you avoid the 2D overlay drawing on top of the 3D copy).
 
+mod sort;
 mod text3d;
 mod world3d;
 
+pub use sort::{PanelSort, SORT_STEP};
 pub use text3d::{GlyphMaterials, Text3d, sync_text3d};
 pub use world3d::{MirrorRoot, PanelNode, WorldPanel, Z_BIAS_PER_LEVEL, sync_mirror};
 
@@ -26,5 +28,6 @@ impl Plugin for FeathersIn3dPlugin {
         app.add_plugins(bevy_luma::engine::layout::render::UnivisRenderPlugin)
             .init_resource::<GlyphMaterials>()
             .add_systems(PostUpdate, (sync_mirror, sync_text3d));
+        sort::install(app);
     }
 }

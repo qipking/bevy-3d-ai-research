@@ -181,7 +181,7 @@ pub fn sync_text3d(
             let transform = Transform::from_translation(Vec3::new(
                 parent_centre_offset.x * units_to_world,
                 -parent_centre_offset.y * units_to_world,
-                depth as f32 * Z_BIAS_PER_LEVEL + 0.0001,
+                depth as f32 * Z_BIAS_PER_LEVEL,
             ));
 
             commands.entity(entity).insert((

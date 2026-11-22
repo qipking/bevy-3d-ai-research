@@ -183,15 +183,9 @@ impl Material for UNodeMaterial3d {
 
     fn alpha_mode(&self) -> AlphaMode {
         // ROUTE-B SPIKE PATCH (local, documented in ../RESETUP_DOC.md):
-        // fully opaque UI nodes go through the *opaque* phase so depth testing resolves
-        // parent/child ordering. The premultiplied transparent phase sorts by mesh-centre
-        // distance, which inverts painter order on tilted or large panels (luma upstream
-        // works around this with `depth_sync.rs`'s Transparent3d sort overrides).
-        if self.color.w >= 0.999 {
-            AlphaMode::Opaque
-        } else {
-            AlphaMode::Premultiplied
-        }
+        // always premultiplied, so every UI node goes through the transparent queue and
+        // `feathers_in_3d::sort` can order them by UI painter order (luma's approach).
+        AlphaMode::Premultiplied
     }
 
     fn specialize(

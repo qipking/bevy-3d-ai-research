@@ -51,11 +51,56 @@ fn main() {
         .add_plugins(FeathersIn3dPlugin)
         .insert_resource(Runner { frame: 0, dir, shots: Vec::new() })
         .add_systems(Startup, setup)
-        .add_systems(Update, run_tour)
+        .add_systems(Update, (run_tour, spawn_row_markers))
         .run();
 }
 
 
+
+/// 一次性：在"工具行"的左右两端各放一个小方块（纯几何，不经文字），
+/// 作为 45° 下判断"文字是否跟色带同一条线"的参照物。
+fn spawn_row_markers(
+    mut done: Local<bool>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    frame: Res<bevy::diagnostic::FrameCount>,
+    panels: Query<(Entity, &WorldPanel), With<MirrorRoot>>,
+    nodes: Query<(Entity, &bevy::ui::ComputedNode, &bevy::ui::UiGlobalTransform)>,
+    children: Query<&Children>,
+) {
+    if *done || frame.0 < 30 || std::env::var("RF_MARKERS").is_err() {
+        return;
+    }
+    let Some((panel_entity, panel)) = panels.iter().next() else { return };
+    let Ok((_, _, panel_ugt)) = nodes.get(panel_entity) else { return };
+    let Ok(kids) = children.get(panel_entity) else { return };
+    // 第 5 个子节点 = 工具行（mock_rows 里的第 5 行）
+    let Some(row) = kids.iter().nth(4) else { return };
+    let Ok((_, cn, ugt)) = nodes.get(row) else { return };
+    *done = true;
+
+    let u = panel.units_to_world;
+    let off = ugt.affine().translation - panel_ugt.affine().translation;
+    let half_w = cn.size.x * 0.5;
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.15, 0.85),
+        unlit: true,
+        ..default()
+    });
+    for sign in [-1.0f32, 1.0] {
+        commands.spawn((
+            Mesh3d(meshes.add(Rectangle::new(0.012, 0.012))),
+            MeshMaterial3d(mat.clone()),
+            Transform::from_translation(Vec3::new(
+                (off.x + sign * half_w) * u,
+                -off.y * u,
+                0.0,
+            )),
+        ));
+    }
+    info!("[markers] tool row {:?} at off=({:.1},{:.1}) half_w={:.1}", row, off.x, off.y, half_w);
+}
 
 fn setup(
     mut commands: Commands,

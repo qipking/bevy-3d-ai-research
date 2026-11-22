@@ -563,3 +563,57 @@ rig-feathers/      适配层 + 应用
 
 下一步：做最小复现（一行两个 span + 单个面板），对照 luma 的 `ui3d_sync` 与 text 局部变换；
 若确认是透视（同一行的两端本来就该有高度差），则只需把排序改成 luma 方案并去掉 z 偏移。
+
+
+---
+
+# 进展四：45° "错位"结案 + luma 排序方案落地
+
+## ① 结论：不是错位，是透视被我读错了
+
+用**红色参照带 + 几何标记**做的定量检查：
+
+1. 把三条色带临时染成纯红（`Rgb(150,25,25)`），按列扫描 45° 截图：
+   文字像素的 y 区间**全部落在所属色带的 y 区间内**；
+2. 几何原因：面板 780 px × 0.0018 = **1.4 m 宽**，相机在 1.15 m 处、45° 侧视，
+   一行 18 px = 32 mm 的横条在屏幕上被拉成一条**长斜带**；
+   同一行右端的单元格（价格/店铺列）本来就比左端低几十像素 —— 这是正确的透视，不是漂移。
+
+此前四项实验也都指向同一结论：字形单行单图集、z 改 20 mm 画面 hash 不变、
+关掉色带文字仍"斜"、12° 完全正常。
+
+> 副产品：这轮排查仍然修掉了两个真问题（`TextSpan` 隐式 20 px 字体、无底色节点没有 Transform），
+> 并把排序方案换成了 luma 的做法。
+
+## ② 采纳 luma 的透明排序（`feathers_in_3d/src/sort.rs`）
+
+```rust
+// 每个面板节点：共享面板中心 + 按 UI 层序递增的 bias
+#[derive(Component)] pub struct PanelSort { pub center: Vec3, pub bias: f32 }
+pub const SORT_STEP: f32 = 0.0005;   // DFS 前序 × 0.5 mm
+
+// ExtractSchedule 收集 -> RenderSystems::PhaseSort 里、sort_phase_system::<Transparent3d> 之前覆写
+item.sorting_info = TransparentSortingInfo3d::Sorted {
+    mesh_center: center,      // 同一面板 = 同一个中心 -> 排序键只由 bias 决定
+    depth_bias: bias,         // 越大越后画（Transparent3d 按 distance+bias 升序 = 由远到近）
+};
+```
+
+配套改动：
+
+| 改动 | 原因 |
+|---|---|
+| `Z_BIAS_PER_LEVEL = 0`，文字 z 归零 | 与 luma 一致：**共面**，顺序交给排序键 |
+| 回滚 `bevy_luma` 的 opaque 补丁 → 材质回到 `Premultiplied` | 排序覆写只作用于透明队列 |
+| `sync_mirror` 用 DFS 前序给每个节点发 `PanelSort` | 父节点先画、子节点后画（文字压在色带上） |
+
+效果：45° 下文字/色带/子节点顺序全部正确（此前共面会 z-fighting）；
+`TransparentSortingInfo3d` 来自 `bevy_core_pipeline::core_3d`，`sort_distance = rangefinder.distance(mesh_center) + depth_bias`。
+
+## 仍未解决
+
+| 问题 | 状态 |
+|---|---|
+| ~~强斜视下文字与色带错位~~ | ✅ 结案：透视，不是 bug |
+| CJK 缺字 | 待办（TTC → OTF 抽 face） |
+| 每 Text 一次 draw call | 待办（面板级合批） |

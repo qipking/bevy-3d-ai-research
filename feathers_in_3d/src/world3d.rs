@@ -11,8 +11,10 @@ use bevy::prelude::*;
 use bevy_luma::engine::layout::render::material_3d::UNodeMaterial3d;
 use bevy_ui::{BackgroundColor, BorderColor, ComputedNode, Node, UiGlobalTransform};
 
+use crate::sort::{PanelSort, SORT_STEP};
+
 /// Extra local Z per hierarchy level, in world units.
-pub const Z_BIAS_PER_LEVEL: f32 = 0.0002;
+pub const Z_BIAS_PER_LEVEL: f32 = 0.0;
 
 /// Marks a `bevy_ui` subtree that should also exist in the 3D world.
 #[derive(Component, Clone, Copy, Debug)]
@@ -64,20 +66,24 @@ pub fn sync_mirror(
         return;
     }
 
-    let mut in_panel: HashMap<Entity, (Entity, u32)> = HashMap::new();
+    // Depth-first pre-order gives every node a painter index: a node always comes
+    // before its children, so children draw on top of their parent.
+    let mut in_panel: HashMap<Entity, (Entity, u32, u32)> = HashMap::new();
     for root in panel_map.keys() {
         let mut stack = vec![(*root, 0u32)];
+        let mut order = 0u32;
         while let Some((e, depth)) = stack.pop() {
-            in_panel.insert(e, (*root, depth));
+            in_panel.insert(e, (*root, depth, order));
+            order += 1;
             if let Ok(kids) = children.get(e) {
-                for kid in kids.iter() {
+                for kid in kids.iter().rev() {
                     stack.push((kid, depth + 1));
                 }
             }
         }
     }
 
-    for (node, (panel_root, depth)) in in_panel.iter() {
+    for (node, (panel_root, depth, order)) in in_panel.iter() {
         let Some((units_to_world, anchor)) = panel_map.get(panel_root).copied() else {
             continue;
         };
@@ -120,7 +126,13 @@ pub fn sync_mirror(
         } else {
             Transform::from_translation(local_pos)
         };
-        commands.entity(entity).insert(placed);
+        commands.entity(entity).insert((
+            placed,
+            PanelSort {
+                center: anchor.translation,
+                bias: *order as f32 * SORT_STEP,
+            },
+        ));
         if !has_fill {
             continue;
         }
