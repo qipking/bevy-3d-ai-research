@@ -1,0 +1,103 @@
+2026-11-22T22:57:08.429701Z  INFO bevy_diagnostic::system_information_diagnostics_plugin::internal: SystemInfo { os: "Linux (Fedora Linux 45)", kernel: "7.3.4-300.fc45.x86_64", cpu: "AMD Ryzen 7 7840H  w/ Radeon 780M Graphics", core_count: "8", memory: "58.7 GiB" }
+2026-11-22T22:57:08.463315Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:57:08.463371Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x558a8a11d280, name: ?)
+2026-11-22T22:57:08.465903Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:57:08.465943Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x558a8a11d280, name: ?)
+2026-11-22T22:57:08.466840Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:57:08.466871Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x558a8a11d280, name: ?)
+2026-11-22T22:57:08.466919Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:57:08.466934Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x558a8a11d280, name: ?)
+2026-11-22T22:57:08.469241Z  INFO bevy_render::renderer: AdapterInfo { name: "llvmpipe (LLVM 23.1.5, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: "", driver: "llvmpipe", driver_info: "Mesa 26.2.7 (LLVM 23.1.5)", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: Some(false), limit_bucket: None }
+2026-11-22T22:57:08.469286Z  WARN bevy_render::renderer: The selected adapter is using a driver that only supports software rendering. This is likely to be very slow. See https://bevy.org/learn/errors/b0006/
+2026-11-22T22:57:08.674466Z  INFO bevy_pbr::cluster: GPU clustering is supported on this device.
+2026-11-22T22:57:08.674645Z  INFO bevy_render::batching::gpu_preprocessing: GPU preprocessing is fully supported on this device.
+2026-11-22T22:57:08.677914Z  INFO bevy_winit::system: Creating new window rig-feathers: rig-tui looks in feathers + 3D (67v0)
+2026-11-22T22:57:08.718328Z  INFO rig_dbg::batch: [batch] built 10 rows from rig-tui RenderBatch
+2026-11-22T22:57:08.743328Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=459v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743401Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=462v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743412Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=465v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743423Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=468v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743432Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=475v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743441Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=480v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743451Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=483v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743462Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=490v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743471Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=497v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743493Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=506v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743513Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=513v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743528Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=457v0 is_panel_root=true -> Srgba(Srgba { red: 0.045, green: 0.055, blue: 0.08, alpha: 1.0 })
+2026-11-22T22:57:08.743540Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=458v0 is_panel_root=false -> Srgba(Srgba { red: 0.078431375, green: 0.101960786, blue: 0.14901961, alpha: 0.55 })
+2026-11-22T22:57:08.743552Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=461v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743562Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=464v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743575Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=467v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743582Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=472v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743592Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=474v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743602Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=479v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743612Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=482v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743622Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=489v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743631Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=496v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743641Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=503v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743651Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=505v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743661Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=510v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743671Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=512v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743682Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=473v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743693Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=504v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.743703Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=511v0 is_panel_root=false -> LinearRgba(LinearRgba { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 })
+2026-11-22T22:57:08.797858Z  INFO feathers_in_3d::text3d: [text3d] panel=457v0 rows=0 glyphs=0 atlases=0 draw_calls=0
+2026-11-22T22:57:08.893405Z  INFO feathers_in_3d::text3d: [text3d] panel=457v0 rows=0 glyphs=0 atlases=0 draw_calls=0
+ICU4X data error: No segmentation model for complex script: Chinese/Japanese
+ICU4X data error: No segmentation model for complex script: Chinese/Japanese
+2026-11-22T22:57:09.299150Z  INFO feathers_in_3d::text3d: [text3d] panel=457v0 rows=10 glyphs=538 atlases=2 draw_calls=2
+2026-11-22T22:57:09.416552Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:13.627811Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/01_overview.png
+2026-11-22T22:57:13.869338Z  INFO rig_dbg: [pickdbg] f=120 panel=457v0 has_pickable=false pick_rects=14
+2026-11-22T22:57:13.869402Z  INFO rig_dbg: [pickdbg] panel itself in PanelPickIndex=false
+2026-11-22T22:57:13.869416Z  INFO rig_dbg: [pickdbg] text nodes pickable (first 5): [(459, false), (462, false), (465, false), (468, false), (475, false)]
+2026-11-22T22:57:15.129077Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/02_near.png
+2026-11-22T22:57:16.464165Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/03a_mild_oblique.png
+2026-11-22T22:57:16.911119Z  INFO rig_dbg: [bgwatch] PointerOut entity=67v0
+2026-11-22T22:57:16.911231Z  INFO rig_dbg: [bgwatch] PointerOver entity=496v0 is_row=true
+2026-11-22T22:57:16.911254Z  INFO rig_dbg: [bgwatch] PointerOver entity=457v0 is_row=false
+2026-11-22T22:57:16.911263Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:17.844474Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/03b_oblique45.png
+2026-11-22T22:57:18.307925Z  INFO rig_dbg: [bgwatch] PointerOut entity=496v0
+2026-11-22T22:57:18.308007Z  INFO rig_dbg: [bgwatch] PointerOut entity=457v0
+2026-11-22T22:57:18.308018Z  INFO rig_dbg: [bgwatch] PointerOut entity=67v0
+2026-11-22T22:57:18.308055Z  INFO rig_dbg: [bgwatch] PointerOver entity=467v0 is_row=true
+2026-11-22T22:57:18.308065Z  INFO rig_dbg: [bgwatch] PointerOver entity=457v0 is_row=false
+2026-11-22T22:57:18.308072Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:18.308821Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=457v0 is_panel_root=true -> Srgba(Srgba { red: 0.1, green: 0.14, blue: 0.22, alpha: 0.0 })
+2026-11-22T22:57:18.466906Z  INFO rig_dbg: [pickdbg] f=240 panel=457v0 has_pickable=false pick_rects=14
+2026-11-22T22:57:18.466971Z  INFO rig_dbg: [pickdbg] panel itself in PanelPickIndex=false
+2026-11-22T22:57:18.466988Z  INFO rig_dbg: [pickdbg] text nodes pickable (first 5): [(459, false), (462, false), (465, false), (468, false), (475, false)]
+2026-11-22T22:57:19.117370Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/04_text_zoom.png
+2026-11-22T22:57:19.578628Z  INFO rig_dbg: [bgwatch] PointerOut entity=467v0
+2026-11-22T22:57:19.578706Z  INFO rig_dbg: [bgwatch] PointerOut entity=457v0
+2026-11-22T22:57:19.578715Z  INFO rig_dbg: [bgwatch] PointerOut entity=67v0
+2026-11-22T22:57:19.578745Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:19.579615Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=457v0 is_panel_root=true -> Srgba(Srgba { red: 0.1, green: 0.14, blue: 0.22, alpha: 0.0 })
+2026-11-22T22:57:20.413820Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/05_scrolled.png
+2026-11-22T22:57:21.392538Z  INFO rig_dbg: [demo] hover tool row at Vec2(640.0, 324.38678)
+2026-11-22T22:57:21.421261Z  INFO rig_dbg: [bgwatch] PointerOver entity=474v0 is_row=true
+2026-11-22T22:57:21.421333Z  INFO rig_dbg: [bgwatch] PointerOver entity=457v0 is_row=false
+2026-11-22T22:57:21.421342Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:21.479099Z  INFO rig_dbg: [bgwatch] PointerOut entity=474v0
+2026-11-22T22:57:21.479181Z  INFO rig_dbg: [bgwatch] PointerOut entity=457v0
+2026-11-22T22:57:21.479195Z  INFO rig_dbg: [bgwatch] PointerOut entity=67v0
+2026-11-22T22:57:21.479238Z  INFO rig_dbg: [bgwatch] PointerOver entity=467v0 is_row=true
+2026-11-22T22:57:21.479263Z  INFO rig_dbg: [bgwatch] PointerOver entity=457v0 is_row=false
+2026-11-22T22:57:21.479273Z  INFO rig_dbg: [bgwatch] PointerOver entity=67v0 is_row=false
+2026-11-22T22:57:21.480219Z  INFO rig_dbg: [bgwatch] BackgroundColor entity=457v0 is_panel_root=true -> Srgba(Srgba { red: 0.1, green: 0.14, blue: 0.22, alpha: 0.0 })
+2026-11-22T22:57:21.921916Z  INFO rig_dbg: [demo] click tool row
+2026-11-22T22:57:22.447404Z  INFO rig_dbg: [pickdbg] f=360 panel=457v0 has_pickable=false pick_rects=14
+2026-11-22T22:57:22.447475Z  INFO rig_dbg: [pickdbg] panel itself in PanelPickIndex=false
+2026-11-22T22:57:22.447488Z  INFO rig_dbg: [pickdbg] text nodes pickable (first 5): [(459, false), (462, false), (465, false), (468, false), (475, false)]
+2026-11-22T22:57:22.476222Z  INFO rig_dbg: [bgwatch] click hit 457v0 (not a row)
+2026-11-22T22:57:22.476285Z  INFO rig_dbg: [bgwatch] click hit 67v0 (not a row)
+2026-11-22T22:57:22.983237Z  WARN bevy_clipboard: Clipboard write used an in-process fallback buffer rather than the OS clipboard. Enable the `system_clipboard` feature on `bevy_clipboard` to use the OS clipboard.
+2026-11-22T22:57:22.983293Z  INFO rig_dbg: [demo] copied 56 bytes to clipboard
+2026-11-22T22:57:23.822725Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/06_selected.png
+2026-11-22T22:57:24.774510Z  INFO rig_dbg: [rig-feathers] tour done: ["/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/01_overview.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/02_near.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/03a_mild_oblique.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/03b_oblique45.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/04_text_zoom.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/05_scrolled.png", "/var/home/lichi/桌面/research/occlusion_probe/rig_dbg/../../render/probe/dbg_tour2/06_selected.png"]

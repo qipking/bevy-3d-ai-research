@@ -6185,6 +6185,7 @@ name = "rig-feathers"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_clipboard",
  "bevy_feathers",
  "bevy_text",
  "bevy_ui",
@@ -6193,7 +6194,12 @@ dependencies = [
  "bevy_window",
  "bevy_winit",
  "feathers_in_3d",
+ "rig-core",
+ "rig-ecs",
+ "rig-harness",
  "rig-tui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

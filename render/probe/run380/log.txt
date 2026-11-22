@@ -1,0 +1,100 @@
+2026-11-22T22:48:01.291844Z  INFO bevy_diagnostic::system_information_diagnostics_plugin::internal: SystemInfo { os: "Linux (Fedora Linux 45)", kernel: "7.3.4-300.fc45.x86_64", cpu: "AMD Ryzen 7 7840H  w/ Radeon 780M Graphics", core_count: "8", memory: "58.7 GiB" }
+2026-11-22T22:48:01.325499Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:48:01.325554Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x55dfa148c6f0, name: ?)
+2026-11-22T22:48:01.328725Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:48:01.328779Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x55dfa148c6f0, name: ?)
+2026-11-22T22:48:01.329483Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:48:01.329505Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x55dfa148c6f0, name: ?)
+2026-11-22T22:48:01.329535Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:48:01.329543Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x55dfa148c6f0, name: ?)
+2026-11-22T22:48:01.331729Z  INFO bevy_render::renderer: AdapterInfo { name: "llvmpipe (LLVM 23.1.5, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: "", driver: "llvmpipe", driver_info: "Mesa 26.2.7 (LLVM 23.1.5)", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: Some(false), limit_bucket: None }
+2026-11-22T22:48:01.331778Z  WARN bevy_render::renderer: The selected adapter is using a driver that only supports software rendering. This is likely to be very slow. See https://bevy.org/learn/errors/b0006/
+2026-11-22T22:48:01.520823Z  INFO bevy_pbr::cluster: GPU clustering is supported on this device.
+2026-11-22T22:48:01.521527Z  INFO bevy_render::batching::gpu_preprocessing: GPU preprocessing is fully supported on this device.
+2026-11-22T22:48:01.524875Z  INFO bevy_winit::system: Creating new window occlusion_probe (64v0)
+2026-11-22T22:48:01.563622Z  INFO occlusion_probe: [probe] cube entity=329v0 (index 329) front_cube=None panel entity=330v0 (index 330)
+2026-11-22T22:48:01.627724Z  INFO feathers_in_3d::text3d: [text3d] panel=330v0 rows=0 glyphs=0 atlases=0 draw_calls=0
+2026-11-22T22:48:01.756813Z  INFO feathers_in_3d::text3d: [text3d] panel=330v0 rows=11 glyphs=465 atlases=1 draw_calls=1
+2026-11-22T22:48:02.680421Z  INFO occlusion_probe: [probe][render f=22] transparent view=RetainedViewEntity { main_entity: MainEntity(327v0), auxiliary_entity: None, subview_index: 0 } items=6
+2026-11-22T22:48:02.680497Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(330v0) panel_item=true cube_item=false distance=-1.450310
+2026-11-22T22:48:02.680510Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(333v0) panel_item=true cube_item=false distance=-1.448810
+2026-11-22T22:48:02.680520Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(341v0) panel_item=true cube_item=false distance=-1.444810
+2026-11-22T22:48:02.680529Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(349v0) panel_item=true cube_item=false distance=-1.440810
+2026-11-22T22:48:02.680538Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(357v0) panel_item=true cube_item=false distance=-1.436810
+2026-11-22T22:48:02.680547Z  INFO occlusion_probe: [probe][render f=22]   item main=MainEntity(372v0) panel_item=true cube_item=false distance=-1.435310
+2026-11-22T22:48:02.680557Z  INFO occlusion_probe: [probe][render f=22] panel entities with PanelSort=32 reference cubes=1
+2026-11-22T22:48:02.727599Z  INFO occlusion_probe: [probe][render f=24] transparent view=RetainedViewEntity { main_entity: MainEntity(327v0), auxiliary_entity: None, subview_index: 0 } items=6
+2026-11-22T22:48:02.727669Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(330v0) panel_item=true cube_item=false distance=-1.450310
+2026-11-22T22:48:02.727678Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(333v0) panel_item=true cube_item=false distance=-1.448810
+2026-11-22T22:48:02.727685Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(341v0) panel_item=true cube_item=false distance=-1.444810
+2026-11-22T22:48:02.727691Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(349v0) panel_item=true cube_item=false distance=-1.440810
+2026-11-22T22:48:02.727698Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(357v0) panel_item=true cube_item=false distance=-1.436810
+2026-11-22T22:48:02.727704Z  INFO occlusion_probe: [probe][render f=24]   item main=MainEntity(372v0) panel_item=true cube_item=false distance=-1.435310
+2026-11-22T22:48:02.727711Z  INFO occlusion_probe: [probe][render f=24] panel entities with PanelSort=32 reference cubes=1
+2026-11-22T22:48:03.050479Z  INFO occlusion_probe: [probe] screenshots f=38 pending=0 capturing=0 captured=0
+2026-11-22T22:48:03.073559Z  INFO occlusion_probe: [probe] screenshots f=39 pending=0 capturing=0 captured=0
+2026-11-22T22:48:03.097140Z  INFO occlusion_probe: [probe] screenshot -> /var/home/lichi/桌面/research/render/probe/run380/a_before.png
+2026-11-22T22:48:03.097243Z  INFO occlusion_probe: [probe] screenshots f=40 pending=0 capturing=0 captured=0
+2026-11-22T22:48:03.119942Z  INFO occlusion_probe: [probe] screenshots f=41 pending=1 capturing=1 captured=0
+2026-11-22T22:48:03.148505Z  INFO occlusion_probe: [probe] screenshots f=42 pending=1 capturing=1 captured=0
+2026-11-22T22:48:03.152385Z  INFO occlusion_probe: [probe][before-scroll] panel_h=380 wanted_scroll=0
+2026-11-22T22:48:03.152446Z  INFO occlusion_probe: [probe][before-scroll] panel 330v0 size=Vec2(780.0, 380.0) content_size=Vec2(776.0, 330.0) scroll=Vec2(0.0, 0.0) layout_centre=Vec2(-19610.0, 190.0)
+2026-11-22T22:48:03.152479Z  INFO occlusion_probe: [probe][before-scroll] node 330v0 depth=0 cached_size=Vec2(1.4039999, 0.684) local=Vec3(0.0, 0.0, 0.0) world=Vec3(0.0, 0.0, 0.0) sort_bias=Some(0.0) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:03.152493Z  INFO occlusion_probe: [probe][before-scroll] node 357v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, -0.17459999, 0.0) world=Vec3(0.0, -0.17459999, 0.0) sort_bias=Some(0.0135) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:03.152505Z  INFO occlusion_probe: [probe][before-scroll] node 349v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, -0.0306, 0.0) world=Vec3(0.0, -0.0306, 0.0) sort_bias=Some(0.009500001) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:03.152515Z  INFO occlusion_probe: [probe][before-scroll] node 341v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, 0.1134, 0.0) world=Vec3(0.0, 0.1134, 0.0) sort_bias=Some(0.0055000004) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:03.152525Z  INFO occlusion_probe: [probe][before-scroll] node 333v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, 0.2574, 0.0) world=Vec3(0.0, 0.2574, 0.0) sort_bias=Some(0.0015) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:03.152546Z  INFO occlusion_probe: [probe][before-scroll] cube 329v0 alpha_mode=Opaque local=Vec3(0.68, -0.18, -0.28) world=Vec3(0.68, -0.18, -0.28)
+2026-11-22T22:48:03.173001Z  INFO occlusion_probe: [probe] screenshots f=43 pending=1 capturing=1 captured=0
+2026-11-22T22:48:03.195793Z  INFO occlusion_probe: [probe] screenshots f=44 pending=1 capturing=1 captured=0
+2026-11-22T22:48:03.220097Z  INFO occlusion_probe: [probe][render f=44] transparent view=RetainedViewEntity { main_entity: MainEntity(327v0), auxiliary_entity: None, subview_index: 0 } items=6
+2026-11-22T22:48:03.220159Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(330v0) panel_item=true cube_item=false distance=-1.450310
+2026-11-22T22:48:03.220168Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(333v0) panel_item=true cube_item=false distance=-1.448810
+2026-11-22T22:48:03.220174Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(341v0) panel_item=true cube_item=false distance=-1.444810
+2026-11-22T22:48:03.220181Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(349v0) panel_item=true cube_item=false distance=-1.440810
+2026-11-22T22:48:03.220187Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(357v0) panel_item=true cube_item=false distance=-1.436810
+2026-11-22T22:48:03.220193Z  INFO occlusion_probe: [probe][render f=44]   item main=MainEntity(372v0) panel_item=true cube_item=false distance=-1.435310
+2026-11-22T22:48:03.220200Z  INFO occlusion_probe: [probe][render f=44] panel entities with PanelSort=32 reference cubes=1
+2026-11-22T22:48:03.266422Z  INFO occlusion_probe: [probe][render f=46] transparent view=RetainedViewEntity { main_entity: MainEntity(327v0), auxiliary_entity: None, subview_index: 0 } items=6
+2026-11-22T22:48:03.266495Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(330v0) panel_item=true cube_item=false distance=-1.450310
+2026-11-22T22:48:03.266508Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(333v0) panel_item=true cube_item=false distance=-1.448810
+2026-11-22T22:48:03.266518Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(341v0) panel_item=true cube_item=false distance=-1.444810
+2026-11-22T22:48:03.266526Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(349v0) panel_item=true cube_item=false distance=-1.440810
+2026-11-22T22:48:03.266535Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(357v0) panel_item=true cube_item=false distance=-1.436810
+2026-11-22T22:48:03.266544Z  INFO occlusion_probe: [probe][render f=46]   item main=MainEntity(372v0) panel_item=true cube_item=false distance=-1.435310
+2026-11-22T22:48:03.266554Z  INFO occlusion_probe: [probe][render f=46] panel entities with PanelSort=32 reference cubes=1
+2026-11-22T22:48:03.336891Z  INFO occlusion_probe: [probe] set ScrollPosition.y=0 (frame 50)
+2026-11-22T22:48:03.669557Z  INFO occlusion_probe: [probe][render f=60] transparent view=RetainedViewEntity { main_entity: MainEntity(327v0), auxiliary_entity: None, subview_index: 0 } items=6
+2026-11-22T22:48:03.669624Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(330v0) panel_item=true cube_item=false distance=-1.450310
+2026-11-22T22:48:03.669633Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(333v0) panel_item=true cube_item=false distance=-1.448810
+2026-11-22T22:48:03.669639Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(341v0) panel_item=true cube_item=false distance=-1.444810
+2026-11-22T22:48:03.669646Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(349v0) panel_item=true cube_item=false distance=-1.440810
+2026-11-22T22:48:03.669652Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(357v0) panel_item=true cube_item=false distance=-1.436810
+2026-11-22T22:48:03.669659Z  INFO occlusion_probe: [probe][render f=60]   item main=MainEntity(372v0) panel_item=true cube_item=false distance=-1.435310
+2026-11-22T22:48:03.669666Z  INFO occlusion_probe: [probe][render f=60] panel entities with PanelSort=32 reference cubes=1
+2026-11-22T22:48:04.040590Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/render/probe/run380/a_before.png
+2026-11-22T22:48:05.317349Z  INFO occlusion_probe: [probe] screenshots f=78 pending=0 capturing=0 captured=0
+2026-11-22T22:48:05.346078Z  INFO occlusion_probe: [probe] screenshots f=79 pending=0 capturing=0 captured=0
+2026-11-22T22:48:05.373922Z  INFO occlusion_probe: [probe] screenshot -> /var/home/lichi/桌面/research/render/probe/run380/b_after.png
+2026-11-22T22:48:05.374003Z  INFO occlusion_probe: [probe] screenshots f=80 pending=0 capturing=0 captured=0
+2026-11-22T22:48:05.401637Z  INFO occlusion_probe: [probe] screenshots f=81 pending=1 capturing=1 captured=0
+2026-11-22T22:48:05.465043Z  INFO occlusion_probe: [probe] screenshots f=82 pending=1 capturing=1 captured=0
+2026-11-22T22:48:05.493774Z  INFO occlusion_probe: [probe] screenshots f=83 pending=1 capturing=1 captured=0
+2026-11-22T22:48:05.747529Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/render/probe/run380/b_after.png
+2026-11-22T22:48:05.755865Z  INFO occlusion_probe: [probe] screenshots f=84 pending=0 capturing=0 captured=0
+2026-11-22T22:48:06.217736Z  INFO occlusion_probe: [probe][after-scroll] panel_h=380 wanted_scroll=0
+2026-11-22T22:48:06.217813Z  INFO occlusion_probe: [probe][after-scroll] panel 330v0 size=Vec2(780.0, 380.0) content_size=Vec2(776.0, 330.0) scroll=Vec2(0.0, 0.0) layout_centre=Vec2(-19610.0, 190.0)
+2026-11-22T22:48:06.217850Z  INFO occlusion_probe: [probe][after-scroll] node 330v0 depth=0 cached_size=Vec2(1.4039999, 0.684) local=Vec3(0.0, 0.0, 0.0) world=Vec3(0.0, 0.0, 0.0) sort_bias=Some(0.0) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:06.217867Z  INFO occlusion_probe: [probe][after-scroll] node 357v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, -0.17459999, 0.0) world=Vec3(0.0, -0.17459999, 0.0) sort_bias=Some(0.0135) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:06.217879Z  INFO occlusion_probe: [probe][after-scroll] node 349v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, -0.0306, 0.0) world=Vec3(0.0, -0.0306, 0.0) sort_bias=Some(0.009500001) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:06.217893Z  INFO occlusion_probe: [probe][after-scroll] node 341v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, 0.1134, 0.0) world=Vec3(0.0, 0.1134, 0.0) sort_bias=Some(0.0055000004) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:06.217904Z  INFO occlusion_probe: [probe][after-scroll] node 333v0 depth=1 cached_size=Vec2(1.3392, 0.0324) local=Vec3(0.0, 0.2574, 0.0) world=Vec3(0.0, 0.2574, 0.0) sort_bias=Some(0.0015) clip_half=Vec4(0.70199996, 0.342, 1.0, 0.0) clip_inv_x0=Vec4(1.0, -0.0, 0.0, -0.0) alpha_mode=Premultiplied
+2026-11-22T22:48:06.217931Z  INFO occlusion_probe: [probe][after-scroll] cube 329v0 alpha_mode=Opaque local=Vec3(0.68, -0.18, -0.28) world=Vec3(0.68, -0.18, -0.28)
+2026-11-22T22:48:06.731805Z  INFO occlusion_probe: [probe] screenshots f=118 pending=0 capturing=0 captured=0
+2026-11-22T22:48:06.757899Z  INFO occlusion_probe: [probe] screenshots f=119 pending=0 capturing=0 captured=0
+2026-11-22T22:48:06.786678Z  INFO occlusion_probe: [probe] done; exiting
+2026-11-22T22:48:06.786753Z  INFO occlusion_probe: [probe] screenshots f=120 pending=0 capturing=0 captured=0

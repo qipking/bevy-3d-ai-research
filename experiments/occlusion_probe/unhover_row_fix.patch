@@ -1,0 +1,28 @@
+Fix for "cube appears in front of the panel": `PointerOut` auto-propagates from a row to
+all ancestors, but `unhover_row` writes the transparent band colour into whatever entity
+it receives. That includes the panel root, whose BackgroundColor feeds
+`feathers_in_3d::world3d::sync_mirror` -> `UNodeMaterial3d.color`; alpha 0 discards the
+SDF body (border still draws), so the opaque cube behind becomes visible.
+
+This patch is illustrative (line numbers may drift while rig-feathers is edited).
+Verified on a copy in `occlusion_probe/rig_dbg` (see `render/probe/fix_tour/`).
+
+--- a/rig-feathers/src/main.rs
++++ b/rig-feathers/src/main.rs
+@@ -318,6 +318,7 @@
+ fn unhover_row(
+     out: On<bevy::picking::events::PointerOut>,
++    rows: Query<&RowText>,
+     mut backgrounds: Query<&mut BackgroundColor>,
+     selected: Res<Selected>,
+ ) {
+     let entity = out.entity;
+-    if selected.0.contains(&entity) {
++    // `PointerOut` bubbles to every ancestor; only a real row may lose its band.
++    if !rows.contains(entity) || selected.0.contains(&entity) {
+         return;
+     }
+     if let Ok(mut bg) = backgrounds.get_mut(entity) {
+         bg.0 = Color::srgba(0.10, 0.14, 0.22, 0.0);
+     }
+ }

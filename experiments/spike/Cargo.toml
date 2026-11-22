@@ -1,0 +1,77 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ---------------------------------------------------------------------------
+# VERSION PINNING (important - read before changing)
+#
+# bevy_feathers 0.20.1 enables `bevy_picking/custom_cursor`, which in turn
+# enables `bevy_window/custom_cursor`. That feature adds a `CursorIcon::Custom`
+# variant to the enum. But `bevy_winit`'s own `custom_cursor` feature was NOT
+# enabled, so its `match cursor.as_ref()` had no arm for the new variant:
+#
+#   error[E0004]: pattern `&bevy_window::CursorIcon::Custom(_)` not covered
+#     --> bevy_winit-0.20.1/src/cursor/mod.rs:124:35
+#
+# Fix: enable `bevy_window/custom_cursor` so the variant is feature-gated out
+# consistently, OR enable `bevy_winit/custom_cursor`.
+#
+# We also pin the whole tree to 0.20.0 because:
+#   - bevy_luma targets bevy 0.20.0 (Cargo.lock says bevy 0.20.0)
+#   - bevy_feathers 0.20.0 depends on the bevy 0.20.0 tree
+#   - the 0.20.1 tree has the bevy_winit compile error above
+# ---------------------------------------------------------------------------
+bevy = { version = "=0.20.0", default-features = false, features = [
+    "default_app",
+    "std",
+    "bevy_winit",
+    "x11",
+    "multi_threaded",
+    "default_font",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_picking",
+    "mesh_picking",
+    "bevy_scene",
+    "bevy_gilrs",
+    "bevy_asset",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_ui_widgets",
+    "bevy_text",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_gizmos_render",
+    "bevy_post_process",
+    "tonemapping_luts",
+    "keyboard",
+    "mouse",
+    "webgl2",
+    "sysinfo_plugin",
+    "common_api",
+    "bevy_input_focus",
+] }
+bevy_feathers = "=0.20.0"
+bevy_luma = { path = "../../bevy_luma" }
+
+# Force `custom_cursor` on bevy_window / bevy_winit so the CursorIcon::Custom
+# variant is consistently feature-gated across the whole tree.
+# Without this, bevy_feathers' `bevy_picking/custom_cursor` turns the variant ON
+# in bevy_window while bevy_winit's match has no arm for it -> E0004.
+bevy_window = { version = "=0.20.1", features = ["custom_cursor"] }
+bevy_winit = { version = "=0.20.1", features = ["custom_cursor"] }
+
+# `bevy_ui` / `bevy_ui_widgets` are separate crates (also enabled as features of
+# the `bevy` facade above) and must be declared explicitly to `use` their items.
+bevy_ui = { version = "=0.20.1" }
+bevy_ui_widgets = { version = "=0.20.1" }
+bevy_ui_render = { version = "=0.20.1" }
+bevy_text = { version = "=0.20.1" }
+bevy_scene = { version = "=0.20.0" }
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"

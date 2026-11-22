@@ -1,0 +1,36 @@
+2026-11-22T22:49:31.978948Z  INFO bevy_diagnostic::system_information_diagnostics_plugin::internal: SystemInfo { os: "Linux (Fedora Linux 45)", kernel: "7.3.4-300.fc45.x86_64", cpu: "AMD Ryzen 7 7840H  w/ Radeon 780M Graphics", core_count: "8", memory: "58.7 GiB" }
+2026-11-22T22:49:32.017814Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:49:32.017868Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x5565c5b23370, name: ?)
+2026-11-22T22:49:32.018600Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:49:32.018629Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x5565c5b23370, name: ?)
+2026-11-22T22:49:32.019542Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:49:32.019563Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x5565c5b23370, name: ?)
+2026-11-22T22:49:32.019604Z ERROR wgpu_hal::vulkan::instance: GENERAL [Loader Message (0x0)]
+	setup_loader_term_phys_devs: Call to 'vkEnumeratePhysicalDevices' in ICD /usr/lib64/libvulkan_powervr_mesa.so failed with error code -3
+2026-11-22T22:49:32.019613Z ERROR wgpu_hal::vulkan::instance: 	objects: (type: INSTANCE, hndl: 0x5565c5b23370, name: ?)
+2026-11-22T22:49:32.021952Z  INFO bevy_render::renderer: AdapterInfo { name: "llvmpipe (LLVM 23.1.5, 256 bits)", vendor: 65541, device: 0, device_type: Cpu, device_pci_bus_id: "", driver: "llvmpipe", driver_info: "Mesa 26.2.7 (LLVM 23.1.5)", backend: Vulkan, subgroup_min_size: 8, subgroup_max_size: 8, transient_saves_memory: Some(false), limit_bucket: None }
+2026-11-22T22:49:32.021996Z  WARN bevy_render::renderer: The selected adapter is using a driver that only supports software rendering. This is likely to be very slow. See https://bevy.org/learn/errors/b0006/
+2026-11-22T22:49:32.231493Z  INFO bevy_pbr::cluster: GPU clustering is supported on this device.
+2026-11-22T22:49:32.231689Z  INFO bevy_render::batching::gpu_preprocessing: GPU preprocessing is fully supported on this device.
+2026-11-22T22:49:32.234940Z  INFO bevy_winit::system: Creating new window rig-feathers: rig-tui looks in feathers + 3D (67v0)
+2026-11-22T22:49:32.275876Z  INFO rig_feathers::batch: [batch] built 10 rows from rig-tui RenderBatch
+2026-11-22T22:49:32.356102Z  INFO feathers_in_3d::text3d: [text3d] panel=456v0 rows=0 glyphs=0 atlases=0 draw_calls=0
+2026-11-22T22:49:32.452520Z  INFO feathers_in_3d::text3d: [text3d] panel=456v0 rows=0 glyphs=0 atlases=0 draw_calls=0
+ICU4X data error: No segmentation model for complex script: Chinese/Japanese
+ICU4X data error: No segmentation model for complex script: Chinese/Japanese
+2026-11-22T22:49:32.878749Z  INFO feathers_in_3d::text3d: [text3d] panel=456v0 rows=10 glyphs=538 atlases=2 draw_calls=2
+2026-11-22T22:49:37.350678Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/01_overview.png
+2026-11-22T22:49:38.941144Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/02_near.png
+2026-11-22T22:49:40.314204Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/03a_mild_oblique.png
+2026-11-22T22:49:41.744712Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/03b_oblique45.png
+2026-11-22T22:49:43.072238Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/04_text_zoom.png
+2026-11-22T22:49:44.402299Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/05_scrolled.png
+2026-11-22T22:49:45.373191Z  INFO rig_feathers: [demo] hover tool row at Vec2(640.0, 324.38678)
+2026-11-22T22:49:45.918122Z  INFO rig_feathers: [demo] click tool row
+2026-11-22T22:49:47.042644Z  WARN bevy_clipboard: Clipboard write used an in-process fallback buffer rather than the OS clipboard. Enable the `system_clipboard` feature on `bevy_clipboard` to use the OS clipboard.
+2026-11-22T22:49:47.042699Z  INFO rig_feathers: [demo] copied 56 bytes to clipboard
+2026-11-22T22:49:47.907402Z  INFO bevy_render::view::window::screenshot: Screenshot saved to /var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/06_selected.png
+2026-11-22T22:49:48.897024Z  INFO rig_feathers: [rig-feathers] tour done: ["/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/01_overview.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/02_near.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/03a_mild_oblique.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/03b_oblique45.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/04_text_zoom.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/05_scrolled.png", "/var/home/lichi/桌面/research/rig-feathers/../render/probe/parent_repro/06_selected.png"]

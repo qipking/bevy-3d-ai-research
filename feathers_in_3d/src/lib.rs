@@ -10,13 +10,18 @@
 //! subtree root. The subtree must be laid out somewhere (it may be off-screen —
 //! that is how you avoid the 2D overlay drawing on top of the 3D copy).
 
+mod pick;
 mod sort;
 mod text3d;
+mod util;
 mod world3d;
 
+pub use pick::{PanelPickIndex, PickRect};
 pub use sort::{PanelSort, SORT_STEP};
 pub use text3d::{GlyphMaterials, GlyphMeshChild, PanelTextMeshes, TextDirty, mark_text_dirty, sync_panel_text};
-pub use world3d::{MirrorRoot, PanelNode, WorldPanel, Z_BIAS_PER_LEVEL, sync_mirror};
+pub use world3d::{
+    LAYER_BIAS, MirrorRoot, PanelNode, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL, sync_mirror,
+};
 
 use bevy::prelude::*;
 
@@ -30,5 +35,6 @@ impl Plugin for FeathersIn3dPlugin {
             .init_resource::<TextDirty>()
             .add_systems(PostUpdate, (mark_text_dirty, sync_mirror, sync_panel_text).chain());
         sort::install(app);
+        pick::install(app);
     }
 }

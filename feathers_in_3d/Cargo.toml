@@ -7,7 +7,7 @@ description = "Render a bevy_ui/feathers subtree as world-space 3D panels (route
 [dependencies]
 bevy = { version = "=0.20.1", default-features = false, features = [
     "std", "multi_threaded", "bevy_asset", "bevy_render", "bevy_core_pipeline",
-    "bevy_ui", "bevy_ui_render", "bevy_text", "bevy_pbr", "bevy_sprite",
+    "bevy_ui", "bevy_ui_render", "bevy_text", "bevy_pbr", "bevy_sprite", "bevy_picking",
     "bevy_log", "default_font",
 ] }
 bevy_ui = "=0.20.1"

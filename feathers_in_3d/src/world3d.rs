@@ -17,10 +17,26 @@ use crate::sort::{PanelSort, SORT_STEP};
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct PanelSortRange {
     pub max_bias: f32,
+    /// The [`WorldLayer`] the range was measured on.
+    pub layer: u16,
 }
 
 /// Extra local Z per hierarchy level, in world units.
 pub const Z_BIAS_PER_LEVEL: f32 = 0.0;
+
+/// How much one [`WorldLayer`] step adds to the painter bias.
+///
+/// The bias is a *sort key*, not geometry: a panel on layer 1 always draws over
+/// everything on layer 0, at any camera angle, however many nodes layer 0 has.
+/// That is what a UI wants for overlays (a picker over the transcript); sorting
+/// coplanar quads by their mesh centre alone cannot express it.
+pub const LAYER_BIAS: f32 = 1.0;
+
+/// Painter layer of a whole panel: `0` is the screen's own layout, `1` a box
+/// drawn over it, and so on. Every node and glyph of the panel inherits it.
+/// A frame model sets it from its placements.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorldLayer(pub u16);
 
 /// Marks a `bevy_ui` subtree that should also exist in the 3D world.
 #[derive(Component, Clone, Copy, Debug)]
@@ -49,7 +65,7 @@ pub fn sync_mirror(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<UNodeMaterial3d>>,
-    panels: Query<(Entity, &WorldPanel), With<MirrorRoot>>,
+    panels: Query<(Entity, &WorldPanel, Option<&WorldLayer>), With<MirrorRoot>>,
     mut existing: Query<&mut PanelNode>,
     all_nodes: Query<
         (
@@ -64,9 +80,9 @@ pub fn sync_mirror(
     children: Query<&Children>,
     parents: Query<&ChildOf>,
 ) {
-    let panel_map: HashMap<Entity, (f32, Transform)> = panels
+    let panel_map: HashMap<Entity, (f32, Transform, u16)> = panels
         .iter()
-        .map(|(e, p)| (e, (p.units_to_world, p.anchor)))
+        .map(|(e, p, layer)| (e, (p.units_to_world, p.anchor, layer.map_or(0, |l| l.0))))
         .collect();
     if panel_map.is_empty() {
         return;
@@ -76,11 +92,14 @@ pub fn sync_mirror(
     // transcript needs once it scrolls. The material clips in *panel-local* space, so the
     // uniform rows are the rows of the panel's world -> local matrix.
     let mut panel_clip: HashMap<Entity, (Vec4, Vec4, Vec2)> = HashMap::new();
-    for (root, _) in panels.iter() {
+    for (root, _, _) in panels.iter() {
         let Ok((_, cn, _, _, _)) = all_nodes.get(root) else {
             continue;
         };
-        let (units, anchor) = panel_map.get(&root).copied().unwrap_or((0.001, Transform::default()));
+        let (units, anchor, _) = panel_map
+            .get(&root)
+            .copied()
+            .unwrap_or((0.001, Transform::default(), 0));
         let inv = anchor.to_matrix().inverse();
         let m = inv.to_cols_array_2d();
         let row0 = Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]);
@@ -105,16 +124,20 @@ pub fn sync_mirror(
                 }
             }
         }
-        panel_max_bias.insert(*root, order.saturating_sub(1) as f32 * SORT_STEP);
+        let layer = panel_map.get(root).map_or(0, |(_, _, layer)| *layer);
+        let layer_bias = layer as f32 * LAYER_BIAS;
+        panel_max_bias.insert(*root, layer_bias + order.saturating_sub(1) as f32 * SORT_STEP);
     }
     for (root, max_bias) in panel_max_bias {
-        commands.entity(root).insert(PanelSortRange { max_bias });
+        let layer = panel_map.get(&root).map_or(0, |(_, _, layer)| *layer);
+        commands.entity(root).insert(PanelSortRange { max_bias, layer });
     }
 
     for (node, (panel_root, depth, order)) in in_panel.iter() {
-        let Some((units_to_world, anchor)) = panel_map.get(panel_root).copied() else {
+        let Some((units_to_world, anchor, layer)) = panel_map.get(panel_root).copied() else {
             continue;
         };
+        let layer_bias = layer as f32 * LAYER_BIAS;
         let Ok((entity, cn, ugt, bg, border_color)) = all_nodes.get(*node) else {
             continue;
         };
@@ -158,7 +181,7 @@ pub fn sync_mirror(
             placed,
             PanelSort {
                 center: anchor.translation,
-                bias: *order as f32 * SORT_STEP,
+                bias: layer_bias + *order as f32 * SORT_STEP,
             },
         ));
         if !has_fill {

@@ -2,6 +2,12 @@
 name = "rig-feathers"
 version = "0.1.0"
 edition = "2024"
+description = "Another complete front end for rig-tui: feathers UI rendered in world-space 3D."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/<you>/rig-feathers"
+keywords = ["bevy", "rig", "llm", "ui"]
+categories = ["gui"]
+
 
 [dependencies]
 # Bevy (same pinning as spike/ — see spike/RESETUP_DOC.md §7.1)
@@ -10,6 +16,7 @@ bevy = { version = "=0.20.1", default-features = false, features = [
     "bevy_render", "bevy_core_pipeline", "bevy_ui", "bevy_ui_render", "bevy_ui_widgets",
     "bevy_text", "bevy_sprite", "bevy_sprite_render", "bevy_pbr", "bevy_picking",
     "bevy_asset", "bevy_scene", "tonemapping_luts", "keyboard", "mouse", "common_api",
+    "bevy_gilrs",
 ] }
 bevy_feathers = "=0.20.1"
 bevy_ui = { version = "=0.20.1" }
@@ -21,6 +28,16 @@ bevy_winit  = { version = "=0.20.1", features = ["custom_cursor"] }
 
 # rig-tui (look pipeline types) — kernel side comes later
 rig-tui = "=0.47.0"
+rig-core = "=0.47.0"
+rig-ecs = "=0.47.0"
+rig-harness = "=0.47.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # route B 3D material
 feathers_in_3d = { path = "../feathers_in_3d" }
+bevy_clipboard = "=0.20.1"
+
+[lib]
+name = "rig_feathers"
+path = "src/lib.rs"

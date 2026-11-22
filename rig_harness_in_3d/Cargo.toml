@@ -1,0 +1,32 @@
+[package]
+name = "rig_harness_in_3d"
+version = "0.1.0"
+edition = "2024"
+description = "A rig harness for 3D apps: rig-ecs kernel + rig-feathers view + feathers_in_3d renderer, as a fork template."
+
+[dependencies]
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "default_app", "std", "bevy_winit", "x11", "multi_threaded", "default_font",
+    "bevy_render", "bevy_core_pipeline", "bevy_ui", "bevy_ui_render", "bevy_ui_widgets",
+    "bevy_text", "bevy_sprite", "bevy_sprite_render", "bevy_pbr", "bevy_picking",
+    "bevy_asset", "bevy_scene", "tonemapping_luts", "keyboard", "mouse", "common_api",
+    "bevy_gilrs",
+] }
+bevy_feathers = "=0.20.1"
+bevy_ui = { version = "=0.20.1" }
+bevy_ui_widgets = { version = "=0.20.1" }
+bevy_ui_render = { version = "=0.20.1" }
+bevy_text = { version = "=0.20.1" }
+bevy_window = { version = "=0.20.1", features = ["custom_cursor"] }
+bevy_winit  = { version = "=0.20.1", features = ["custom_cursor"] }
+bevy_clipboard = "=0.20.1"
+
+rig-tui = "=0.47.0"
+rig-core = "=0.47.0"
+rig-ecs = "=0.47.0"
+rig-harness = "=0.47.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+feathers_in_3d = { path = "../feathers_in_3d" }
+rig-feathers = { path = "../rig-feathers" }

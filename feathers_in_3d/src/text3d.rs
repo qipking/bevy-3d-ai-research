@@ -15,8 +15,8 @@ use bevy::prelude::*;
 use bevy::text::{ComputedTextBlock, TextLayoutInfo};
 use bevy_ui::{ComputedNode, Node, UiGlobalTransform};
 
-use crate::sort::{PanelSort, SORT_STEP};
-use crate::world3d::{MirrorRoot, PanelSortRange, WorldPanel, Z_BIAS_PER_LEVEL};
+use crate::sort::PanelSort;
+use crate::world3d::{LAYER_BIAS, MirrorRoot, PanelSortRange, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL};
 
 /// Cache of one `StandardMaterial` per font-atlas texture.
 #[derive(Resource, Default)]
@@ -38,7 +38,7 @@ pub struct PanelTextMeshes {
 pub struct GlyphMeshChild;
 
 pub fn mark_text_dirty(
-    mut added_or_changed: Query<(), Changed<TextLayoutInfo>>,
+    added_or_changed: Query<(), Changed<TextLayoutInfo>>,
     mut removed: RemovedComponents<TextLayoutInfo>,
     mut dirty: ResMut<TextDirty>,
 ) {
@@ -60,6 +60,7 @@ pub fn sync_panel_text(
             Entity,
             &WorldPanel,
             &ComputedNode,
+            Option<&WorldLayer>,
             Option<&PanelSortRange>,
             Option<&mut PanelTextMeshes>,
         ),
@@ -84,8 +85,9 @@ pub fn sync_panel_text(
     let mut any_rebuild = dirty.0;
     dirty.0 = false;
 
-    for (panel_entity, panel, panel_cn, bias_range, existing) in panels.iter_mut() {
+    for (panel_entity, panel, panel_cn, layer, bias_range, existing) in panels.iter_mut() {
         let units = panel.units_to_world;
+        let layer_bias = layer.map_or(0, |layer| layer.0) as f32 * LAYER_BIAS;
 
         // Collect this panel's text nodes and their offsets from the panel centre.
         let clip_half = panel_cn.size * 0.5;
@@ -250,7 +252,9 @@ pub fn sync_panel_text(
                     GlyphMeshChild,
                     PanelSort {
                         center: panel.anchor.translation,
-                        bias: bias_range.map_or(0.02, |r| r.max_bias) + 0.0002 * children.len() as f32,
+                        bias: layer_bias
+                            + bias_range.map_or(0.02, |r| r.max_bias)
+                            + 0.0002 * children.len() as f32,
                     },
                 ))
                 .id();
@@ -317,6 +321,5 @@ impl BitsParts for Vec2 {
 }
 
 // `Node` keeps the query bounds aligned with the mirror's.
-const _: fn() = || {
-    fn needs_node(_: &Node) {}
-};
+#[allow(dead_code)]
+fn needs_node(_: &Node) {}

@@ -1,0 +1,16 @@
+[package]
+name = "occlusion_probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "default_app", "std", "bevy_winit", "x11", "multi_threaded", "default_font",
+    "bevy_render", "bevy_core_pipeline", "bevy_ui", "bevy_ui_render",
+    "bevy_text", "bevy_sprite", "bevy_sprite_render", "bevy_pbr", "bevy_asset",
+    "bevy_log",
+] }
+bevy_ui = "=0.20.1"
+bevy_text = "=0.20.1"
+bevy_luma = { path = "../../bevy_luma" }
+feathers_in_3d = { path = "../../feathers_in_3d" }

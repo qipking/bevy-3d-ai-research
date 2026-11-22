@@ -1,0 +1,29 @@
+[package]
+name = "rig_dbg"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Bevy (same pinning as spike/ — see spike/RESETUP_DOC.md §7.1)
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "default_app", "std", "bevy_winit", "x11", "multi_threaded", "default_font",
+    "bevy_render", "bevy_core_pipeline", "bevy_ui", "bevy_ui_render", "bevy_ui_widgets",
+    "bevy_text", "bevy_sprite", "bevy_sprite_render", "bevy_pbr", "bevy_picking",
+    "bevy_asset", "bevy_scene", "tonemapping_luts", "keyboard", "mouse", "common_api",
+] }
+bevy_feathers = "=0.20.1"
+bevy_ui = { version = "=0.20.1" }
+bevy_ui_widgets = { version = "=0.20.1" }
+bevy_ui_render = { version = "=0.20.1" }
+bevy_text = { version = "=0.20.1" }
+bevy_window = { version = "=0.20.1", features = ["custom_cursor"] }
+bevy_winit  = { version = "=0.20.1", features = ["custom_cursor"] }
+
+# rig-tui (look pipeline types) — kernel side comes later
+rig-tui = "=0.47.0"
+rig-core = "=0.47.0"
+serde_json = "1"
+
+# route B 3D material
+feathers_in_3d = { path = "../../../feathers_in_3d" }
+bevy_clipboard = "=0.20.1"
