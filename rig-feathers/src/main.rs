@@ -19,7 +19,7 @@ use crate::transcript::{Row, spawn_rows};
 use feathers_in_3d::{FeathersIn3dPlugin, MirrorRoot, WorldPanel};
 
 const PANEL_W: f32 = 780.0;
-const PANEL_H: f32 = 440.0;
+const PANEL_H: f32 = 380.0;
 const UNITS_TO_WORLD: f32 = 0.0018;
 
 #[derive(Component)]
@@ -134,7 +134,10 @@ fn setup(
         Transform::from_xyz(0.68, -0.18, -0.28),
     ));
 
-    let font: Handle<Font> = asset_server.load(bevy_feathers::constants::fonts::MONO);
+    // Latin 用 feathers 的等宽字体，中文回退到 Noto Sans CJK SC（tools/fetch_cjk_font.sh 生成）
+    let mono: Handle<Font> = asset_server.load(bevy_feathers::constants::fonts::MONO);
+    let cjk: Handle<Font> = asset_server.load("fonts/NotoSansCJKsc-Regular.otf");
+    let font: FontSource = FontSource::List(vec![mono.into(), cjk.into()]);
 
     commands
         .spawn((
@@ -170,6 +173,7 @@ fn mock_rows() -> Vec<Row> {
     let rate = Style::default().fg(RColor::LightYellow);
     let ask = Style::default().fg(RColor::Cyan);
     let text = Style::default().fg(RColor::Rgb(210, 216, 228));
+    // 让中文行也用同一个 span 样式（上面已引用）
 
     vec![
         Row::new(Line::from(Span::styled(
@@ -178,7 +182,11 @@ fn mock_rows() -> Vec<Row> {
         )))
         .band(RColor::Rgb(20, 26, 38)),
         Row::new(Line::from(Span::styled("", Style::default()))),
-        Row::new(Line::from(Span::styled("> find me a running shoe under 500", ask))),
+        Row::new(Line::from(Span::styled("> 帮我找一双 500 以内的跑鞋", ask))),
+        Row::new(Line::from(vec![
+            Span::styled("  中文 + Latin 混排: ", dim),
+            Span::styled("¥469 · 官方旗舰店 · 4.8 分", text),
+        ])),
         Row::new(Line::from(Span::styled("", Style::default()))),
         Row::new(Line::from(vec![
             Span::styled("* ", Style::default().fg(RColor::Green)),

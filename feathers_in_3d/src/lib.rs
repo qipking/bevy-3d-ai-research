@@ -15,7 +15,7 @@ mod text3d;
 mod world3d;
 
 pub use sort::{PanelSort, SORT_STEP};
-pub use text3d::{GlyphMaterials, Text3d, sync_text3d};
+pub use text3d::{GlyphMaterials, GlyphMeshChild, PanelTextMeshes, TextDirty, mark_text_dirty, sync_panel_text};
 pub use world3d::{MirrorRoot, PanelNode, WorldPanel, Z_BIAS_PER_LEVEL, sync_mirror};
 
 use bevy::prelude::*;
@@ -27,7 +27,8 @@ impl Plugin for FeathersIn3dPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(bevy_luma::engine::layout::render::UnivisRenderPlugin)
             .init_resource::<GlyphMaterials>()
-            .add_systems(PostUpdate, (sync_mirror, sync_text3d));
+            .init_resource::<TextDirty>()
+            .add_systems(PostUpdate, (mark_text_dirty, sync_mirror, sync_panel_text).chain());
         sort::install(app);
     }
 }

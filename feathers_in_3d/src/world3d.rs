@@ -13,6 +13,12 @@ use bevy_ui::{BackgroundColor, BorderColor, ComputedNode, Node, UiGlobalTransfor
 
 use crate::sort::{PanelSort, SORT_STEP};
 
+/// The painter bias a panel's nodes reach; text meshes are placed just above it.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct PanelSortRange {
+    pub max_bias: f32,
+}
+
 /// Extra local Z per hierarchy level, in world units.
 pub const Z_BIAS_PER_LEVEL: f32 = 0.0;
 
@@ -66,9 +72,27 @@ pub fn sync_mirror(
         return;
     }
 
+    // Per-panel clip: UI subtree content is clipped to the panel's own box, which is what a
+    // transcript needs once it scrolls. The material clips in *panel-local* space, so the
+    // uniform rows are the rows of the panel's world -> local matrix.
+    let mut panel_clip: HashMap<Entity, (Vec4, Vec4, Vec2)> = HashMap::new();
+    for (root, _) in panels.iter() {
+        let Ok((_, cn, _, _, _)) = all_nodes.get(root) else {
+            continue;
+        };
+        let (units, anchor) = panel_map.get(&root).copied().unwrap_or((0.001, Transform::default()));
+        let inv = anchor.to_matrix().inverse();
+        let m = inv.to_cols_array_2d();
+        let row0 = Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]);
+        let row1 = Vec4::new(m[0][1], m[1][1], m[2][1], m[3][1]);
+        // bounds are in the *clip space* the shader works in: metres, not UI pixels
+        panel_clip.insert(root, (row0, row1, cn.size * 0.5 * units));
+    }
+
     // Depth-first pre-order gives every node a painter index: a node always comes
     // before its children, so children draw on top of their parent.
     let mut in_panel: HashMap<Entity, (Entity, u32, u32)> = HashMap::new();
+    let mut panel_max_bias: HashMap<Entity, f32> = HashMap::new();
     for root in panel_map.keys() {
         let mut stack = vec![(*root, 0u32)];
         let mut order = 0u32;
@@ -81,6 +105,10 @@ pub fn sync_mirror(
                 }
             }
         }
+        panel_max_bias.insert(*root, order.saturating_sub(1) as f32 * SORT_STEP);
+    }
+    for (root, max_bias) in panel_max_bias {
+        commands.entity(root).insert(PanelSortRange { max_bias });
     }
 
     for (node, (panel_root, depth, order)) in in_panel.iter() {
@@ -170,6 +198,16 @@ pub fn sync_mirror(
                 || !(node3d.cached_border_width - b_width).abs().lt(&1e-9)
             {
                 if let Some(mut mat) = materials.get_mut(&node3d.material) {
+                    if let Some((row0, row1, half)) = panel_clip.get(panel_root) {
+                        mat.clip_inv_x = [*row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
+                        mat.clip_inv_y = [*row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
+                        mat.clip_bounds = [
+                            Vec4::new(half.x, half.y, 1.0, 0.0),
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                        ];
+                    }
                     mat.color = color4;
                     mat.border_color = border4;
                     mat.radius = radius_vec;
@@ -183,7 +221,19 @@ pub fn sync_mirror(
                 }
             }
         } else {
+            let (clip_row0, clip_row1, clip_half) = panel_clip
+                .get(panel_root)
+                .copied()
+                .unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
             let material = UNodeMaterial3d {
+                clip_inv_x: [clip_row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                clip_inv_y: [clip_row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                clip_bounds: [
+                    Vec4::new(clip_half.x, clip_half.y, 1.0, 0.0),
+                    Vec4::ZERO,
+                    Vec4::ZERO,
+                    Vec4::ZERO,
+                ],
                 color: color4,
                 radius: radius_vec,
                 border_color: border4,

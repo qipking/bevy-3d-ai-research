@@ -6,7 +6,7 @@
 //! `TextSpan` chain, which the 3D mirror / glyph bridge then places in the world.
 
 use bevy::prelude::*;
-use bevy::text::{LineBreak, TextLayout};
+use bevy::text::{FontSource, LineBreak, TextLayout};
 use bevy_ui::{BorderRadius, Node, percent, px};
 use rig_tui::LookLine;
 use rig_tui::ratatui::style::Color as RColor;
@@ -39,12 +39,14 @@ impl Row {
 }
 
 /// Spawns `rows` as a column of UI nodes under `parent`.
-pub fn spawn_rows(parent: &mut ChildSpawnerCommands, rows: &[Row], font: &Handle<Font>) {
+pub fn spawn_rows(parent: &mut ChildSpawnerCommands, rows: &[Row], font: &FontSource) {
     let font = font.clone();
     for row in rows {
         let mut entity = parent.spawn(Node {
             width: percent(100.0),
             height: px(ROW_HEIGHT),
+            // 行高固定：不让 flex 压缩（否则面板变矮时行会被挤到一起而不是溢出）
+            flex_shrink: 0.0,
             align_items: AlignItems::Center,
             border_radius: BorderRadius::all(px(3.0)),
             ..default()
@@ -56,7 +58,7 @@ pub fn spawn_rows(parent: &mut ChildSpawnerCommands, rows: &[Row], font: &Handle
             line.spawn((
                 Text::new(String::new()),
                 TextFont {
-                    font: font.clone().into(),
+                    font: font.clone(),
                     font_size: FontSize::Px(FONT_SIZE),
                     ..default()
                 },
@@ -75,7 +77,7 @@ pub fn spawn_rows(parent: &mut ChildSpawnerCommands, rows: &[Row], font: &Handle
                     text.spawn((
                         TextSpan::new(span.content.clone()),
                         TextFont {
-                            font: font.clone().into(),
+                            font: font.clone(),
                             font_size: FontSize::Px(FONT_SIZE),
                             ..default()
                         },

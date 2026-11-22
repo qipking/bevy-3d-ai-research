@@ -13,3 +13,6 @@ render/rf_shots/crop_*.png
 
 # jj 的 XDG 重定向目录
 .jjenv/
+
+# 生成的 CJK 字体（用 tools/fetch_cjk_font.sh 重新生成）
+rig-feathers/assets/fonts/*.otf

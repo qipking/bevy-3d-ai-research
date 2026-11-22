@@ -491,6 +491,13 @@ mock 转写（商品列表 + 工具卡 + 状态行）已经在 3D 面板里正�
    而文字是这些行节点的**子节点** → 所有无底色行的文字塌到面板原点，叠成一团。
    **修法**：面板内**每个节点**都先落位（`Transform`），只有有填充的才加 mesh/material。
 
+## ④ 裁剪：面板边界即视口
+
+- 四边形：给 `UNodeMaterial3d` 的 `clip_inv_x/clip_inv_y/clip_bounds` 填**面板世界→局部矩阵的行**
+  与 `half_size * units`（注意单位是米，不是 UI 像素 —— 第一版写成像素导致完全不裁剪）；
+- 字形：`StandardMaterial` 没有 clip uniform，所以按面板框做 CPU 剔除（2 px 余量）；
+- 验证：把面板高度压到 250 px（内容 15 行 ≈ 300 px），底部行被材质裁掉、没有任何"浮在面板外"的色块或文字。
+
 ## 仍未解决（按优先级）
 
 | 问题 | 现象 | 方向 |
@@ -610,6 +617,13 @@ item.sorting_info = TransparentSortingInfo3d::Sorted {
 效果：45° 下文字/色带/子节点顺序全部正确（此前共面会 z-fighting）；
 `TransparentSortingInfo3d` 来自 `bevy_core_pipeline::core_3d`，`sort_distance = rangefinder.distance(mesh_center) + depth_bias`。
 
+## ④ 裁剪：面板边界即视口
+
+- 四边形：给 `UNodeMaterial3d` 的 `clip_inv_x/clip_inv_y/clip_bounds` 填**面板世界→局部矩阵的行**
+  与 `half_size * units`（注意单位是米，不是 UI 像素 —— 第一版写成像素导致完全不裁剪）；
+- 字形：`StandardMaterial` 没有 clip uniform，所以按面板框做 CPU 剔除（2 px 余量）；
+- 验证：把面板高度压到 250 px（内容 15 行 ≈ 300 px），底部行被材质裁掉、没有任何"浮在面板外"的色块或文字。
+
 ## 仍未解决
 
 | 问题 | 状态 |
@@ -617,3 +631,64 @@ item.sorting_info = TransparentSortingInfo3d::Sorted {
 | ~~强斜视下文字与色带错位~~ | ✅ 结案：透视，不是 bug |
 | CJK 缺字 | 待办（TTC → OTF 抽 face） |
 | 每 Text 一次 draw call | 待办（面板级合批） |
+
+
+---
+
+# 进展五：为适配 rig-tui 做的三项加固（CJK / 合批 / 排序）
+
+## ① CJK：TTC 抽 face → OTF，`FontSource::List` 回退
+
+Bevy 的字体加载器只认 `.ttf`/`.otf`（`bevy_text/src/font_loader.rs:38`），系统里的中文字体是
+`NotoSansCJK-VF.ttc`（集合）。写了纯 stdlib 的 **TTC 抽 face 工具**：
+
+```sh
+python3 tools/ttc_extract.py <font.ttc> out.otf --list     # 列出 face
+./tools/fetch_cjk_font.sh                                   # 抽 SC face 到 rig-feathers/assets/fonts/
+#  faces=[JP, KR, SC, TC, HK] -> picking 2 (Noto Sans CJK SC)
+```
+
+字体 **30 MB，不进版本库**（`.gitignore`），克隆后跑一次脚本即可。
+
+排版侧用**字体回退链**，Latin 走 feathers 的 FiraMono、中文回退 Noto：
+
+```rust
+let font = FontSource::List(vec![mono.into(), cjk.into()]);
+```
+
+验证：“帮我找一双 500 以内的跑鞋”、“中文 + Latin 混排: ¥469 · 官方旗舰店 · 4.8 分”
+在 3D 面板里正常显示（`¥` `·` 也有字了，之前是方块）。
+
+> 开发期跑二进制要给 `BEVY_ASSET_ROOT=$PWD`，否则 Bevy 会去 `target/debug/assets` 找资源。
+
+## ② 合批：每个（面板 × 图集）一个 mesh
+
+原来每个 Text 一个 mesh：11 行 = 11 次 draw call，而且一行里 Latin+CJK 会落到**两个图集**，
+旧实现用"每个图集一个 mesh 插到同一实体"会互相覆盖，后半行直接消失。
+
+重写后（`text3d.rs`）：
+
+- 按面板汇总所有 Text 的字形，按图集分组，**每个图集一个 mesh**，挂在面板根节点下（顶点是面板局部坐标）；
+- 实测日志：`rows=11 glyphs=584 atlases=2 draw_calls=2`；
+- 重建由 `Changed<TextLayoutInfo>`/移除 + 面板尺寸/偏移签名共同触发（不再靠"字形数量"猜）。
+
+## ③ 字形 mesh 也纳入排序表
+
+新建的字形 mesh 子实体一开始没有 `PanelSort`，会退回按距离排序 → 色带/文字顺序不稳。
+现在它们拿到 `bias = 面板节点的 max_bias + i*0.0002`（由 `sync_mirror` 发布 `PanelSortRange`），
+保证文字永远在该面板所有节点之上。
+
+## 现在的 `feathers_in_3d` 能力清单
+
+| 能力 | 状态 |
+|---|---|
+| 布局 → 3D 几何（圆角/边框/SDF） | ✅ 路线B，U4 实测 delta=0 |
+| 任意角度清晰 | ✅ SDF + 屏幕导数 AA（647% 放大 1 px 过渡） |
+| 画笔顺序（父子/色带/文字） | ✅ luma 式 Transparent3d 排序覆写，共面 |
+| 3D 文本（含富文本逐 span 着色） | ✅ 字形四边形，按 section 取色 |
+| 中英混排 + 字体回退 | ✅ FontSource::List + CJK face |
+| 合批 | ✅ 每面板每图集 1 次 draw call |
+| 半透明面板 | ✅ 回到 Premultiplied + 排序键 |
+| 裁剪（面板边界） | ✅ 四边形走材质 clip uniform（面板局部空间，随旋转/平移正确），字形按面板框 CPU 剔除 |
+| 文本选择/复制 | ❌ 未做 |
+| 拾取（射线 → 控件） | ❌ 未接（spike 里验证过机制） |
