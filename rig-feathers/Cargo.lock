@@ -3020,6 +3020,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "feathers_in_3d"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_luma",
+ "bevy_text",
+ "bevy_ui",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6176,13 +6186,13 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_feathers",
- "bevy_luma",
  "bevy_text",
  "bevy_ui",
  "bevy_ui_render",
  "bevy_ui_widgets",
  "bevy_window",
  "bevy_winit",
+ "feathers_in_3d",
  "rig-tui",
 ]
 

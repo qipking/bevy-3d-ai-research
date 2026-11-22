@@ -507,3 +507,59 @@ mock 转写（商品列表 + 工具卡 + 状态行）已经在 3D 面板里正�
 2. **CJK 字库**：从 `NotoSansMonoCJK-VF.ttc` 抽 SC face（fonttools）转 OTF；验证 `¥ 中文` 在 3D 里显示。
 3. 面板级合批 + 面板随相机距离缩放（移动端陀螺仪之前先把静态质量做对）。
 4. 然后接 rig-tui 的真实转写（`transcript/pane`）：mock 换成 `RenderBatch` 驱动。
+
+
+---
+
+# 进展三：crate 拆分 + 斜视错位排查（jj 管理）
+
+## 结构
+
+```
+feathers_in_3d/    3D 渲染（独立 crate）
+  src/lib.rs       FeathersIn3dPlugin（挂 UnivisRenderPlugin + 两个镜像系统）
+  src/world3d.rs   路线B：每个节点落位 + 有填充的加 SDF mesh/material
+  src/text3d.rs    bevy_text 字形 -> 3D 四边形（逐 section 着色）
+rig-feathers/      适配层 + 应用
+  src/transcript.rs  LookLine::colored() -> feathers Node/Text/TextSpan
+  src/style.rs       ratatui Style/Color -> bevy Color
+  src/main.rs        mock 转写 + 相机巡游 + 截图
+```
+`feathers_in_3d` 只依赖 `bevy` + `bevy_ui` + `bevy_text` + `bevy_luma`，不含 rig 依赖，可单独复用。
+
+## 版本管理（jj）
+
+本会话 `~/.config` 只读，jj 的 XDG 目录重定向到工作区，封装成 `research/jjx`：
+
+```sh
+./jjx st          # 改动
+./jjx describe -m "..."   # 给当前改动写说明
+./jjx new         # 下一个改动
+./jjx log         # 历史
+```
+
+## luma 怎么解决"斜看时的文字/色带错位"（源码）
+
+关键不在 z 偏移，而在**排序键**：
+
+| 位置 | 内容 |
+|---|---|
+| `layout/render/depth_sync.rs:23` | `WORLD3D_SORT_BIAS_BAND = 0.02` |
+| `depth_sync.rs:156` | `world3d_layer_sort_bias(stacking, sublayer)`：`base(0..1) * 0.02`，子层 Node 0 / 高亮 0.25 / 文本 0.5 |
+| `depth_sync.rs:262` | `apply_world3d_ui_transparent_sort_overrides`：把同一面板所有透明 item 改写成 `TransparentSortingInfo3d::Sorted { mesh_center: 面板根中心, depth_bias }` |
+| `layout/text/render.rs:554` | 3D 文本子实体用 `Transform::default()`（**z = 0，与节点共面**） |
+
+**结论**：luma 让整个面板共面，然后用渲染阶段的排序覆写决定绘制顺序；不靠几何 z 分层。
+我们目前是"小 z 偏移"方案，属于另一种取舍；要彻底对齐 luma，应改为共面 + 排序覆写。
+
+## 本轮实验（45° 斜视错位的归因）
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| 转储字形位置 | 每个 Text 单行、单图集（`atlases=1`），`y∈[7,12]`、`x` 连续 | 布局没问题，不是 span 折行 |
+| 文字 z 从 0.1 mm 改到 **20 mm** | 截图 **hash 完全不变** | **不是 z 视差** |
+| 关掉色带（只留文字）45° | 文字仍呈斜置 | 与色带的相对位置无关，问题在文字自身/透视 |
+| 12° 轻斜视 | 完全对齐 | 与角度强相关 |
+
+下一步：做最小复现（一行两个 span + 单个面板），对照 luma 的 `ui3d_sync` 与 text 局部变换；
+若确认是透视（同一行的两端本来就该有高度差），则只需把排序改成 luma 方案并去掉 z 偏移。

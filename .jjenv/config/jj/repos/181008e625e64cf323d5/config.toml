@@ -2,3 +2,7 @@
 
 [snapshot]
 max-new-file-size = "4MiB"
+
+[user]
+name = "lichi"
+email = "lichi@localhost"

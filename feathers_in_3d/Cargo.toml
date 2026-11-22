@@ -1,0 +1,15 @@
+[package]
+name = "feathers_in_3d"
+version = "0.1.0"
+edition = "2024"
+description = "Render a bevy_ui/feathers subtree as world-space 3D panels (route B): SDF geometry via bevy_luma's material plus real 3D text from bevy_text's glyph layout."
+
+[dependencies]
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "std", "multi_threaded", "bevy_asset", "bevy_render", "bevy_core_pipeline",
+    "bevy_ui", "bevy_ui_render", "bevy_text", "bevy_pbr", "bevy_sprite",
+    "bevy_log", "default_font",
+] }
+bevy_ui = "=0.20.1"
+bevy_text = "=0.20.1"
+bevy_luma = { path = "../bevy_luma" }

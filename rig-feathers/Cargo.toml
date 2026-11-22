@@ -23,4 +23,4 @@ bevy_winit  = { version = "=0.20.1", features = ["custom_cursor"] }
 rig-tui = "=0.47.0"
 
 # route B 3D material
-bevy_luma = { path = "../bevy_luma" }
+feathers_in_3d = { path = "../feathers_in_3d" }

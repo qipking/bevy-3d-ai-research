@@ -6,21 +6,17 @@
 //! real 3D text.
 
 mod style;
-mod text3d;
 mod transcript;
-mod world3d;
 
 use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy_luma::engine::layout::render::UnivisRenderPlugin;
 use bevy_ui::{BorderRadius, Node, UiRect, px};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
-use crate::text3d::{GlyphMaterials, sync_text3d};
 use crate::transcript::{Row, spawn_rows};
-use crate::world3d::{MirrorRoot, WorldPanel, sync_mirror};
+use feathers_in_3d::{FeathersIn3dPlugin, MirrorRoot, WorldPanel};
 
 const PANEL_W: f32 = 780.0;
 const PANEL_H: f32 = 440.0;
@@ -52,14 +48,14 @@ fn main() {
             ..default()
         }))
         .add_plugins(bevy_feathers::FeathersPlugins)
-        .add_plugins(UnivisRenderPlugin)
-        .init_resource::<GlyphMaterials>()
+        .add_plugins(FeathersIn3dPlugin)
         .insert_resource(Runner { frame: 0, dir, shots: Vec::new() })
         .add_systems(Startup, setup)
-        .add_systems(PostUpdate, (sync_mirror, sync_text3d))
         .add_systems(Update, run_tour)
         .run();
 }
+
+
 
 fn setup(
     mut commands: Commands,
@@ -217,15 +213,16 @@ fn run_tour(
         6 if sub == 0 => shoot(&mut runner, &mut commands, "01_overview"),
         7 => set_cam(&mut camera, Vec3::new(0.0, 0.0, 0.62), Vec3::ZERO),
         8 if sub == 0 => shoot(&mut runner, &mut commands, "02_near"),
-        9 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO),
-        10 if sub == 0 => shoot(&mut runner, &mut commands, "03_oblique"),
-        // 文字特写：面板 A 顶部几行
-        11 => {
+        9 => set_cam(&mut camera, Vec3::new(0.22, 0.10, 1.35), Vec3::ZERO),
+        10 if sub == 0 => shoot(&mut runner, &mut commands, "03a_mild_oblique"),
+        11 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO),
+        12 if sub == 0 => shoot(&mut runner, &mut commands, "03b_oblique45"),
+        13 => {
             let target = Vec3::new(-0.30, 0.26, 0.0);
             set_cam(&mut camera, target + Vec3::new(0.0, 0.0, 0.40), target);
         }
-        12 if sub == 0 => shoot(&mut runner, &mut commands, "04_text_zoom"),
-        14 if sub == 0 => {
+        14 if sub == 0 => shoot(&mut runner, &mut commands, "04_text_zoom"),
+        16 if sub == 0 => {
             info!("[rig-feathers] tour done: {:?}", runner.shots);
             exit.write(AppExit::Success);
         }
