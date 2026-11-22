@@ -1,0 +1,302 @@
+use bevy::prelude::*;
+use std::collections::HashMap;
+
+use super::root_resolution::clamp_canvas_size;
+use super::roots::{
+    ROOT_CAPSULE_GAP_FACTOR, ROOT_CAPSULE_LOCAL_LAYER_DIVISOR, ROOT_CAPSULE_MIN_BAND_WIDTH,
+    ROOT_CAPSULE_MIN_GAP, ROOT_STACK_EDIT_EPSILON, ResolvedRootStack, ResolvedRootUi,
+    RootSpawnRank, SCREEN_ROOT_CAPSULE_BAND_WIDTH, UiCanvasSize, UiSpace,
+    WORLD_ROOT_CAPSULE_BAND_UI_UNITS,
+};
+use super::screen_transform::compute_screen_root_transform;
+use super::{URootUi, UScreenRoot, UWorldRoot};
+use crate::internal_prelude::*;
+use crate::layout::univis_node::UZIndex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RootZPriority {
+    Min,
+    Explicit(i32),
+    Max,
+}
+
+impl RootZPriority {
+    pub fn from_zindex(zindex_opt: Option<&UZIndex>) -> Self {
+        match zindex_opt {
+            Some(UZIndex::GlobalMin | UZIndex::LocalMin | UZIndex::Min) => Self::Min,
+            Some(UZIndex::GlobalMax | UZIndex::LocalMax | UZIndex::Max) => Self::Max,
+            Some(UZIndex::Global(z) | UZIndex::Local(z)) => Self::Explicit(*z),
+            Some(UZIndex::Auto) | None => Self::Explicit(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RootStackCandidate {
+    entity: Entity,
+    authored_root_z: f32,
+    priority: RootZPriority,
+    spawn_rank: u64,
+    band_width: f32,
+    xy_center: Vec2,
+    xy_half_extents: Vec2,
+}
+
+fn world_xy_half_extents(resolved: &ResolvedRootUi, transform: &Transform) -> Vec2 {
+    if resolved.canvas_size.x <= 0.0 || resolved.canvas_size.y <= 0.0 {
+        return Vec2::ZERO;
+    }
+    let half = resolved.world_size_for(resolved.canvas_size) * 0.5 * transform.scale.xy().abs();
+    let right = (transform.rotation * Vec3::X).truncate().abs();
+    let up = (transform.rotation * Vec3::Y).truncate().abs();
+    right * half.x + up * half.y
+}
+
+fn world2d_footprints_overlap(a: &RootStackCandidate, b_center: Vec2, b_half: Vec2) -> bool {
+    if a.xy_half_extents == Vec2::ZERO || b_half == Vec2::ZERO {
+        return true;
+    }
+    (a.xy_center.x - b_center.x).abs() < (a.xy_half_extents.x + b_half.x)
+        && (a.xy_center.y - b_center.y).abs() < (a.xy_half_extents.y + b_half.y)
+}
+
+fn capture_authored_root_z(current_root_z: f32, stack: &ResolvedRootStack) -> f32 {
+    if !stack.initialized || (current_root_z - stack.applied_root_z).abs() > ROOT_STACK_EDIT_EPSILON
+    {
+        current_root_z
+    } else {
+        stack.authored_root_z
+    }
+}
+
+pub(super) fn root_capsule_band_width(resolved: &ResolvedRootUi) -> f32 {
+    match resolved.space {
+        UiSpace::Screen => SCREEN_ROOT_CAPSULE_BAND_WIDTH,
+        UiSpace::World2d | UiSpace::World3d => (resolved.ui_units_to_world_scale()
+            * WORLD_ROOT_CAPSULE_BAND_UI_UNITS)
+            .max(ROOT_CAPSULE_MIN_BAND_WIDTH),
+    }
+}
+
+fn root_capsule_gap(previous_band_width: f32, current_band_width: f32) -> f32 {
+    previous_band_width
+        .max(current_band_width)
+        .mul_add(ROOT_CAPSULE_GAP_FACTOR, 0.0)
+        .max(ROOT_CAPSULE_MIN_GAP)
+}
+
+pub(crate) fn resolve_root_stacking(
+    mut roots: ParamSet<(
+        Query<
+            (
+                Entity,
+                &ResolvedRootUi,
+                &Transform,
+                &RootSpawnRank,
+                &ResolvedRootStack,
+                Option<&UZIndex>,
+            ),
+            Or<(With<URootUi>, With<UScreenRoot>, With<UWorldRoot>)>,
+        >,
+        Query<&mut ResolvedRootStack>,
+    )>,
+) {
+    let mut groups: HashMap<(UiSpace, Option<Entity>), Vec<RootStackCandidate>> = HashMap::new();
+
+    for (entity, resolved, transform, spawn_rank, stack, zindex_opt) in roots.p0().iter() {
+        let authored_root_z = capture_authored_root_z(transform.translation.z, stack);
+        let priority = RootZPriority::from_zindex(zindex_opt);
+        groups
+            .entry((resolved.space, resolved.camera_entity))
+            .or_default()
+            .push(RootStackCandidate {
+                entity,
+                authored_root_z,
+                priority,
+                spawn_rank: spawn_rank.0,
+                band_width: root_capsule_band_width(resolved),
+                xy_center: transform.translation.xy(),
+                xy_half_extents: world_xy_half_extents(resolved, transform),
+            });
+    }
+
+    let mut next_states = Vec::new();
+
+    for ((space, _camera), mut candidates) in groups {
+        candidates.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.authored_root_z.total_cmp(&right.authored_root_z))
+                .then_with(|| left.spawn_rank.cmp(&right.spawn_rank))
+        });
+
+        let mut next_floor = 0.0;
+        let mut previous_band_width = 0.0;
+        let mut first = true;
+        let mut placed_world2d: Vec<(f32, RootStackCandidate)> = Vec::new();
+        let mut world3d_sort_cursor = 0.0f32;
+
+        for candidate in candidates {
+            let (floor, sort_key) = match space {
+                UiSpace::Screen => {
+                    let base = if candidate.authored_root_z > 0.0 {
+                        candidate.authored_root_z
+                    } else {
+                        0.0
+                    };
+                    let floor = if first {
+                        base
+                    } else {
+                        (next_floor + root_capsule_gap(previous_band_width, candidate.band_width))
+                            .max(base)
+                    };
+                    next_floor = floor + candidate.band_width;
+                    previous_band_width = candidate.band_width;
+                    first = false;
+                    (floor, floor)
+                }
+                UiSpace::World2d => {
+                    let mut floor = candidate.authored_root_z;
+                    for &(placed_floor, placed_candidate) in &placed_world2d {
+                        if world2d_footprints_overlap(
+                            &placed_candidate,
+                            candidate.xy_center,
+                            candidate.xy_half_extents,
+                        ) {
+                            let required = placed_floor
+                                + placed_candidate.band_width
+                                + root_capsule_gap(placed_candidate.band_width, candidate.band_width);
+                            floor = floor.max(required);
+                        }
+                    }
+                    let sort_key = if first {
+                        floor
+                    } else {
+                        floor.max(
+                            next_floor + root_capsule_gap(previous_band_width, candidate.band_width),
+                        )
+                    };
+                    next_floor = sort_key + candidate.band_width;
+                    previous_band_width = candidate.band_width;
+                    first = false;
+                    placed_world2d.push((floor, candidate));
+                    (floor, sort_key)
+                }
+                UiSpace::World3d => {
+                    let sort_key = if first {
+                        candidate.authored_root_z
+                    } else {
+                        candidate.authored_root_z.max(
+                            world3d_sort_cursor
+                                + root_capsule_gap(previous_band_width, candidate.band_width),
+                        )
+                    };
+                    world3d_sort_cursor = sort_key + candidate.band_width;
+                    previous_band_width = candidate.band_width;
+                    first = false;
+                    (candidate.authored_root_z, sort_key)
+                }
+            };
+
+            let band_step = candidate.band_width / ROOT_CAPSULE_LOCAL_LAYER_DIVISOR;
+            next_states.push((
+                candidate.entity,
+                candidate.authored_root_z,
+                candidate.spawn_rank,
+                floor,
+                sort_key,
+                candidate.band_width,
+                band_step,
+            ));
+        }
+    }
+
+    let mut writable_stacks = roots.p1();
+
+    for (entity, authored_root_z, spawn_rank, floor, sort_key, band_width, band_step) in
+        next_states
+    {
+        let Ok(mut stack) = writable_stacks.get_mut(entity) else {
+            continue;
+        };
+
+        let next = ResolvedRootStack {
+            authored_root_z,
+            spawn_rank,
+            capsule_sort_key: sort_key,
+            capsule_band_base: floor,
+            capsule_band_width: band_width,
+            capsule_band_step: band_step,
+            applied_root_z: stack.applied_root_z,
+            initialized: stack.initialized,
+        };
+
+        if *stack != next {
+            *stack = next;
+        }
+    }
+}
+
+pub(crate) fn sync_root_capsule_transforms(
+    mut roots: Query<
+        (&ResolvedRootUi, &mut ResolvedRootStack, &mut Transform),
+        Or<(With<UScreenRoot>, With<URootUi>, With<UWorldRoot>)>,
+    >,
+    cameras: Query<(&GlobalTransform, Option<&Projection>), With<Camera>>,
+) {
+    for (resolved, mut stack, mut transform) in roots.iter_mut() {
+        match resolved.space {
+            UiSpace::Screen => {
+                let Some(camera_entity) = resolved.camera_entity else {
+                    continue;
+                };
+                let Ok((camera_transform, projection)) = cameras.get(camera_entity) else {
+                    continue;
+                };
+                let Some(next_transform) =
+                    compute_screen_root_transform(resolved, &stack, camera_transform, projection)
+                else {
+                    continue;
+                };
+
+                if *transform != next_transform {
+                    *transform = next_transform;
+                }
+            }
+            UiSpace::World2d => {
+                if (transform.translation.z - stack.capsule_band_base).abs() > f32::EPSILON {
+                    transform.translation.z = stack.capsule_band_base;
+                }
+            }
+            UiSpace::World3d => {}
+        }
+
+        if (stack.applied_root_z - transform.translation.z).abs() > f32::EPSILON {
+            stack.applied_root_z = transform.translation.z;
+        }
+        if !stack.initialized {
+            stack.initialized = true;
+        }
+    }
+}
+
+pub(crate) fn sync_fit_content_root_canvas_sizes(
+    mut roots: Query<(&IntrinsicSize, &mut ResolvedRootUi), With<ResolvedRootUi>>,
+) {
+    for (intrinsic, mut resolved) in roots.iter_mut() {
+        let UiCanvasSize::FitContent { min, max } = resolved.canvas else {
+            continue;
+        };
+
+        if resolved.space == UiSpace::Screen {
+            continue;
+        }
+
+        let measured = Vec2::new(intrinsic.width, intrinsic.height).max(Vec2::ZERO);
+        let next_canvas_size = clamp_canvas_size(measured, min, max);
+
+        if resolved.canvas_size != next_canvas_size {
+            resolved.canvas_size = next_canvas_size;
+        }
+    }
+}

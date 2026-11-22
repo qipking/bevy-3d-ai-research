@@ -1,0 +1,15 @@
+# 依赖缓存与构建产物（体积大、可重建）
+.cargo-home/
+target/
+*/target/
+**/target/
+
+# 抓取的上游源码与运行日志（可重建）
+rig-tui-inspect/
+.tmp/
+
+# 临时截图
+render/rf_shots/crop_*.png
+
+# jj 的 XDG 重定向目录
+.jjenv/

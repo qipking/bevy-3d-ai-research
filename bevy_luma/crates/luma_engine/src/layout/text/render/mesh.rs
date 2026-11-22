@@ -1,0 +1,193 @@
+use super::*;
+
+#[derive(Clone, Debug)]
+pub(crate) struct TextGlyphQuad {
+    pub(crate) center: Vec2,
+    pub(crate) size: Vec2,
+    pub(crate) uv_min: Vec2,
+    pub(crate) uv_max: Vec2,
+    pub(crate) color: LinearRgba,
+}
+
+#[derive(Clone)]
+pub(super) struct TextPageBatch {
+    pub(super) texture: Handle<Image>,
+    pub(super) quads: Vec<TextGlyphQuad>,
+}
+
+/// Minimum physical texels per glyph em to guarantee SDF quality for small text.
+const MIN_SDF_PHYSICAL_SIZE: f32 = 128.0;
+
+pub(super) fn resolved_render_scale(render_scale: f32) -> f32 {
+    if render_scale.is_finite() && render_scale >= 1.0 {
+        render_scale
+    } else {
+        1.0
+    }
+}
+
+/// Returns the render scale, ensuring the physical raster size meets a minimum
+/// threshold for good SDF quality. For small font sizes this may increase the
+/// effective render scale beyond the user-specified value.
+pub(super) fn resolved_render_scale_for_font(render_scale: f32, font_size: f32) -> f32 {
+    let base = resolved_render_scale(render_scale);
+    if font_size > 0.0 {
+        let physical = font_size * base;
+        if physical < MIN_SDF_PHYSICAL_SIZE {
+            (MIN_SDF_PHYSICAL_SIZE / font_size).max(base)
+        } else {
+            base
+        }
+    } else {
+        base
+    }
+}
+
+pub(crate) fn text_horizontal_offset(
+    label: &UTextLabel,
+    node: &UNode,
+    computed_size: &ComputedSize,
+    text_size: Vec2,
+) -> f32 {
+    let content_width = (computed_size.width - node.padding.width_sum()).max(0.0);
+
+    match label.justify {
+        Justify::Left | Justify::Start => (-content_width * 0.5) + (text_size.x * 0.5),
+        Justify::Center | Justify::Justified => 0.0,
+        Justify::Right | Justify::End => (content_width * 0.5) - (text_size.x * 0.5),
+    }
+}
+
+pub(crate) fn build_text_page_mesh(quads: &[TextGlyphQuad]) -> Mesh {
+    let mut positions = Vec::with_capacity(quads.len() * 4);
+    let mut normals = Vec::with_capacity(quads.len() * 4);
+    let mut uvs = Vec::with_capacity(quads.len() * 4);
+    let mut colors = Vec::with_capacity(quads.len() * 4);
+    let mut indices = Vec::with_capacity(quads.len() * 6);
+
+    for (quad_index, quad) in quads.iter().enumerate() {
+        let base = (quad_index * 4) as u32;
+        let half = quad.size * 0.5;
+        let min = quad.center - half;
+        let max = quad.center + half;
+
+        positions.extend_from_slice(&[
+            [min.x, min.y, 0.0],
+            [max.x, min.y, 0.0],
+            [min.x, max.y, 0.0],
+            [max.x, max.y, 0.0],
+        ]);
+        normals.extend_from_slice(&[[0.0, 0.0, 1.0]; 4]);
+        uvs.extend_from_slice(&[
+            [quad.uv_min.x, quad.uv_max.y],
+            [quad.uv_max.x, quad.uv_max.y],
+            [quad.uv_min.x, quad.uv_min.y],
+            [quad.uv_max.x, quad.uv_min.y],
+        ]);
+        let col = [
+            quad.color.red,
+            quad.color.green,
+            quad.color.blue,
+            quad.color.alpha,
+        ];
+        colors.extend_from_slice(&[col; 4]);
+        indices.extend_from_slice(&[base, base + 2, base + 1, base + 1, base + 2, base + 3]);
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+fn sdf_material_params(label: &UTextLabel) -> (LinearRgba, LinearRgba, f32) {
+    let render_scale = resolved_render_scale(label.render_scale);
+    let normalized_outline_width = if label.outline_width > 0.0 {
+        (label.outline_width * render_scale) / (2.0 * TEXT_SDF_PADDING as f32)
+    } else {
+        0.0
+    };
+    let base_color = if label.has_spans() {
+        LinearRgba::WHITE
+    } else {
+        label.color.into()
+    };
+    (base_color, label.outline_color.into(), normalized_outline_width)
+}
+
+fn build_sdf_material(
+    color: LinearRgba,
+    outline_color: LinearRgba,
+    outline_width: f32,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial {
+    UTextLabelSdfMaterial {
+        color,
+        outline_color,
+        edge_softness: DEFAULT_TEXT_EDGE_SOFTNESS,
+        outline_width,
+        _pad0: 0.0,
+        _pad1: 0.0,
+        clip_inv_x: [Vec4::ZERO; 4],
+        clip_inv_y: [Vec4::ZERO; 4],
+        clip_bounds: [Vec4::ZERO; 4],
+        clip_radius: [Vec4::ZERO; 4],
+        texture,
+    }
+}
+
+fn build_sdf_material_3d(
+    color: LinearRgba,
+    outline_color: LinearRgba,
+    outline_width: f32,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial3d {
+    UTextLabelSdfMaterial3d {
+        color,
+        outline_color,
+        edge_softness: DEFAULT_TEXT_EDGE_SOFTNESS,
+        outline_width,
+        _pad0: 0.0,
+        _pad1: 0.0,
+        clip_inv_x: [Vec4::ZERO; 4],
+        clip_inv_y: [Vec4::ZERO; 4],
+        clip_bounds: [Vec4::ZERO; 4],
+        clip_radius: [Vec4::ZERO; 4],
+        texture,
+    }
+}
+
+pub(crate) fn build_text_material(
+    label: &UTextLabel,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial {
+    let (color, outline_color, outline_width) = sdf_material_params(label);
+    build_sdf_material(color, outline_color, outline_width, texture)
+}
+
+pub(super) fn build_text_material_3d(
+    label: &UTextLabel,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial3d {
+    let (color, outline_color, outline_width) = sdf_material_params(label);
+    build_sdf_material_3d(color, outline_color, outline_width, texture)
+}
+
+pub(super) fn build_solid_highlight_material(
+    color: LinearRgba,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial {
+    build_sdf_material(color, LinearRgba::NONE, 0.0, texture)
+}
+
+pub(super) fn build_solid_highlight_material_3d(
+    color: LinearRgba,
+    texture: Handle<Image>,
+) -> UTextLabelSdfMaterial3d {
+    build_sdf_material_3d(color, LinearRgba::NONE, 0.0, texture)
+}

@@ -1,0 +1,8 @@
+#!/bin/sh
+# jj 在这个会话里需要把 XDG 目录重定向到工作区（~/.config 只读），
+# 这个包装脚本保证每次调用都带同样的环境。
+cd "$(dirname "$0")" || exit 1
+XDG_CONFIG_HOME=$PWD/.jjenv/config \
+XDG_CACHE_HOME=$PWD/.jjenv/cache \
+XDG_DATA_HOME=$PWD/.jjenv/data \
+exec jj "$@"

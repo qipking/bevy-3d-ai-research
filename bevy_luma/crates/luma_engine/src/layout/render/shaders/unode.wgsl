@@ -1,0 +1,408 @@
+// 1. Vertex Output
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+};
+
+// 2. Material Uniform Buffer (Organized into strict 16-byte aligned blocks)
+struct UNodeMaterial {
+    color: vec4<f32>,        // Offset 0
+    border_color: vec4<f32>, // Offset 16
+    radius: vec4<f32>,       // Offset 32
+    size: vec2<f32>,         // Offset 48
+    border_width: f32,       // Offset 56
+    border_offset: f32,      // Offset 60
+    softness: f32,           // Offset 64
+    shape_mode: u32,         // Offset 68
+    use_texture: u32,        // Offset 72
+    _pad0: f32,              // Offset 76
+    
+    clip_inv_x: array<vec4<f32>, 4>,   // Offset 80
+    clip_inv_y: array<vec4<f32>, 4>,   // Offset 144
+    clip_bounds: array<vec4<f32>, 4>,  // Offset 208: xy = half_size, z = active, w = shape_mode
+    clip_radius: array<vec4<f32>, 4>,  // Offset 272
+
+    grad_colors: array<vec4<f32>, 8>, // Offset 128 (8 * 16 = 128 bytes)
+    grad_stops: array<vec4<f32>, 2>,  // Offset 256 (2 * 16 = 32 bytes)
+    grad_params: vec4<f32>,           // Offset 288: x = type (0=none, 1=linear, 2=radial), y = angle/radius, z = count, w = 0.0
+    grad_center: vec4<f32>,           // Offset 304: xy = center, z = offset, w = 0.0
+
+    shadow_color: vec4<f32>, // Offset 320
+    shadow_params: vec4<f32>,// Offset 336: x = offset.x, y = offset.y, z = blur, w = spread
+
+    inner_glow_color: vec4<f32>, // Offset 352
+    inner_glow_params: vec4<f32>,// Offset 368: x = blur, y = active (1.0 or 0.0), z = spread, w = 0.0
+
+    custom_params: array<vec4<f32>, 4>, // Offset 384 (4 * 16 = 64 bytes)
+    custom_meta: vec4<f32>,             // Offset 448: x = time, y = blend_mode, z = opacity, w = active
+    custom_cursor: vec4<f32>,           // Offset 464: xy = local cursor UV, z = hover (0..1), w = press (0..1)
+};
+
+@group(2) @binding(0) var<uniform> material: UNodeMaterial;
+@group(2) @binding(1) var texture: texture_2d<f32>;
+@group(2) @binding(2) var texture_sampler: sampler;
+
+// -----------------------------------------------------------------------------
+// SDF Functions
+// -----------------------------------------------------------------------------
+
+fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
+    let is_right = p.x > 0.0;
+    let is_top   = p.y > 0.0;
+    
+    let r_top = select(r.z, r.x, is_right);
+    let r_bot = select(r.w, r.y, is_right);
+    let radius = select(r_bot, r_top, is_top);
+    
+    let q = abs(p) - b + radius;
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+fn sd_cut_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
+    let is_right = p.x > 0.0;
+    let is_top   = p.y > 0.0;
+
+    let r_top = select(r.z, r.x, is_right);
+    let r_bot = select(r.w, r.y, is_right);
+    let radius = select(r_bot, r_top, is_top);
+
+    let q = abs(p) - b;
+    let d_box = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0);
+    let d_cut = (abs(p.x) + abs(p.y) - (b.x + b.y - radius)) * 0.70710678;
+
+    return max(d_box, d_cut);
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Stop Gradient Sampling
+// -----------------------------------------------------------------------------
+
+fn get_gradient_stop_pos(idx: u32) -> f32 {
+    if (idx < 4u) {
+        if (idx == 0u) { return material.grad_stops[0].x; }
+        if (idx == 1u) { return material.grad_stops[0].y; }
+        if (idx == 2u) { return material.grad_stops[0].z; }
+        return material.grad_stops[0].w;
+    } else {
+        if (idx == 4u) { return material.grad_stops[1].x; }
+        if (idx == 5u) { return material.grad_stops[1].y; }
+        if (idx == 6u) { return material.grad_stops[1].z; }
+        return material.grad_stops[1].w;
+    }
+}
+
+fn sample_gradient(t_in: f32) -> vec4<f32> {
+    let count = u32(material.grad_params.z);
+    if (count == 0u) {
+        return material.color;
+    }
+    if (count == 1u) {
+        return material.grad_colors[0];
+    }
+
+    let t = clamp(t_in, 0.0, 1.0);
+    let is_stepped = material.grad_params.w >= 0.5;
+
+    // Stepped mode: discrete color bands without interpolation
+    if (is_stepped) {
+        var color = material.grad_colors[0];
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            if (i >= count) {
+                break;
+            }
+            let p = get_gradient_stop_pos(i);
+            if (t >= p) {
+                color = material.grad_colors[i];
+            } else {
+                break;
+            }
+        }
+        return color;
+    }
+
+    let p_first = get_gradient_stop_pos(0u);
+    if (t <= p_first) {
+        return material.grad_colors[0];
+    }
+    let p_last = get_gradient_stop_pos(count - 1u);
+    if (t >= p_last) {
+        return material.grad_colors[count - 1u];
+    }
+
+    var color = material.grad_colors[count - 1u];
+    for (var i = 0u; i < 7u; i = i + 1u) {
+        if (i + 1u >= count) {
+            break;
+        }
+        let p_curr = get_gradient_stop_pos(i);
+        let p_next = get_gradient_stop_pos(i + 1u);
+        if (t >= p_curr && t <= p_next) {
+            let span = p_next - p_curr;
+            if (span <= 0.0001) {
+                color = material.grad_colors[i + 1u];
+            } else {
+                let factor = clamp((t - p_curr) / span, 0.0, 1.0);
+                color = mix(material.grad_colors[i], material.grad_colors[i + 1u], factor);
+            }
+            break;
+        }
+    }
+    return color;
+}
+
+// -----------------------------------------------------------------------------
+// Procedural Noise & Custom Shader Hook (UShader)
+// -----------------------------------------------------------------------------
+
+fn luma_hash21(p_in: vec2<f32>) -> f32 {
+    var p = fract(p_in * vec2<f32>(123.34, 456.21));
+    p = p + dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+fn luma_hash22(p_in: vec2<f32>) -> vec2<f32> {
+    let n = sin(dot(p_in, vec2<f32>(41.0, 289.0)));
+    return fract(vec2<f32>(262144.0, 32768.0) * n);
+}
+
+fn luma_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = luma_hash21(i);
+    let b = luma_hash21(i + vec2<f32>(1.0, 0.0));
+    let c = luma_hash21(i + vec2<f32>(0.0, 1.0));
+    let d = luma_hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn luma_fbm(p_in: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var a = 0.5;
+    var p = p_in;
+    let rot = mat2x2<f32>(cos(0.5), sin(0.5), -sin(0.5), cos(0.5));
+    for (var i = 0; i < 4; i = i + 1) {
+        v = v + a * luma_noise(p);
+        p = rot * p * 2.02 + vec2<f32>(100.0, 100.0);
+        a = a * 0.5;
+    }
+    return v;
+}
+
+// Built-in Mouse / Pointer helpers for UShader
+fn luma_cursor_uv() -> vec2<f32> {
+    return material.custom_cursor.xy;
+}
+
+fn luma_cursor_hover() -> f32 {
+    return material.custom_cursor.z;
+}
+
+fn luma_cursor_press() -> f32 {
+    return material.custom_cursor.w;
+}
+
+fn luma_cursor_dist(uv: vec2<f32>, size: vec2<f32>) -> f32 {
+    let aspect = size.x / max(size.y, 1.0);
+    let diff = (uv - material.custom_cursor.xy) * vec2<f32>(aspect, 1.0);
+    return length(diff);
+}
+
+// __LUMA_CUSTOM_SHADER_HOOK_START__
+fn sample_custom_shader(
+    uv: vec2<f32>,
+    size: vec2<f32>,
+    time: f32,
+    params: array<vec4<f32>, 4>,
+) -> vec4<f32> {
+    return params[0];
+}
+// __LUMA_CUSTOM_SHADER_HOOK_END__
+
+// -----------------------------------------------------------------------------
+// Fragment Shader
+// -----------------------------------------------------------------------------
+@fragment
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    let shadow_blur = material.shadow_params.z;
+    let shadow_spread = material.shadow_params.w;
+    let shadow_offset = material.shadow_params.xy;
+    let shadow_margin = select(0.0, shadow_blur * 2.5 + shadow_spread + max(abs(shadow_offset.x), abs(shadow_offset.y)), shadow_blur > 0.0);
+    let mesh_size = material.size + vec2<f32>(shadow_margin * 2.0);
+
+    let uv_centered = in.uv - 0.5;
+    let p = vec2<f32>(uv_centered.x, -uv_centered.y) * mesh_size;
+    let half_size = material.size * 0.5;
+    
+    var dist_outer: f32;
+    if (material.shape_mode == 1u) {
+        dist_outer = sd_cut_box(p, half_size, material.radius);
+    } else {
+        dist_outer = sd_rounded_box(p, half_size, material.radius);
+    }
+    
+    let softness = max(material.softness, 0.0001);
+    let grad_outer = length(vec2<f32>(dpdx(dist_outer), dpdy(dist_outer)));
+    let aa_width = max(grad_outer, softness);
+    let aa_inner = aa_width * 0.5;
+
+    // Multi-layer rotation/scale-aware clipping against ancestor containers
+    var alpha_clip = 1.0;
+    let clip_wp = vec4<f32>(in.world_position.xyz, 1.0);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let bounds = material.clip_bounds[i];
+        if (bounds.z < 0.5) {
+            break;
+        }
+        let p_clip = vec2<f32>(
+            dot(material.clip_inv_x[i], clip_wp),
+            dot(material.clip_inv_y[i], clip_wp),
+        );
+        let d_round = sd_rounded_box(p_clip, bounds.xy, material.clip_radius[i]);
+        let d_cut = sd_cut_box(p_clip, bounds.xy, material.clip_radius[i]);
+        let d_clip = select(d_round, d_cut, bounds.w > 0.5);
+        let grad_clip = length(vec2<f32>(dpdx(d_clip), dpdy(d_clip)));
+        let clip_aa = max(grad_clip, softness) * 0.5;
+        alpha_clip = alpha_clip * (1.0 - smoothstep(-clip_aa, clip_aa, d_clip));
+    }
+    if (alpha_clip < 0.001) {
+        discard;
+    }
+
+    let border_width = material.border_width;
+    let border_offset = material.border_offset;
+    let dist_body = dist_outer + border_width + border_offset;
+
+    let border_outer_alpha = 1.0 - smoothstep(-aa_inner, aa_inner, dist_outer);
+    let border_inner_alpha = 1.0 - smoothstep(-aa_inner, aa_inner, dist_outer + border_width);
+
+    var border_alpha = 0.0;
+    if (border_width > 0.0) {
+        border_alpha = max(border_outer_alpha - border_inner_alpha, 0.0);
+    }
+
+    var body_alpha = border_outer_alpha;
+    if (border_width > 0.0 || border_offset > 0.0) {
+        body_alpha = min(1.0 - smoothstep(-aa_inner, aa_inner, dist_body), border_outer_alpha);
+    }
+
+    // Body UV relative to the base element bounds
+    let body_uv = (p / material.size) * vec2<f32>(1.0, -1.0) + 0.5;
+
+    // Multi-stop gradient fill: color, linear gradient, or radial gradient
+    var body_color = material.color;
+    let offset = material.grad_center.z;
+    if (material.grad_params.x == 1.0) {
+        // Multi-stop linear gradient
+        let angle = material.grad_params.y;
+        let dir = vec2<f32>(cos(angle), sin(angle));
+        let t_lin = dot(body_uv - 0.5, dir) + 0.5 - offset;
+        body_color = sample_gradient(t_lin);
+    } else if (material.grad_params.x == 2.0) {
+        // Multi-stop radial gradient
+        let center = material.grad_center.xy;
+        let radius = max(material.grad_params.y, 0.001);
+        let dist_rad = length(body_uv - center);
+        let t_rad = (dist_rad / radius) - offset;
+        body_color = sample_gradient(t_rad);
+    } else if (material.grad_params.x == 3.0) {
+        // Multi-stop conic / angular gradient
+        let center = material.grad_center.xy;
+        let dir = body_uv - center;
+        let angle = atan2(dir.x, -dir.y);
+        let norm_angle = fract((angle / 6.283185307179586) + 1.0);
+        let t_conic = norm_angle - offset;
+        body_color = sample_gradient(t_conic);
+    }
+
+    if (material.use_texture == 1u) {
+        body_color = textureSample(texture, texture_sampler, body_uv) * body_color;
+    }
+
+    // Custom UShader background injection / replacement
+    if (material.custom_meta.w > 0.5) {
+        let shader_col = sample_custom_shader(
+            clamp(body_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+            material.size,
+            material.custom_meta.x,
+            material.custom_params,
+        );
+        let blend_mode = u32(material.custom_meta.y + 0.5);
+        let opacity = clamp(material.custom_meta.z, 0.0, 1.0);
+        let eff_alpha = clamp(shader_col.a * opacity, 0.0, 1.0);
+
+        if (blend_mode == 0u) {
+            body_color = vec4<f32>(
+                mix(body_color.rgb, shader_col.rgb, opacity),
+                mix(body_color.a, shader_col.a, opacity)
+            );
+        } else if (blend_mode == 1u) {
+            body_color = vec4<f32>(
+                mix(body_color.rgb, shader_col.rgb, eff_alpha),
+                max(body_color.a, eff_alpha)
+            );
+        } else if (blend_mode == 2u) {
+            let mult_rgb = body_color.rgb * shader_col.rgb;
+            body_color = vec4<f32>(
+                mix(body_color.rgb, mult_rgb, eff_alpha),
+                body_color.a
+            );
+        } else {
+            body_color = vec4<f32>(
+                clamp(body_color.rgb + shader_col.rgb * eff_alpha, vec3<f32>(0.0), vec3<f32>(1.0)),
+                max(body_color.a, eff_alpha)
+            );
+        }
+    }
+
+    // Holographic inner edge glow along chamfers and rounded edges
+    if (material.inner_glow_params.y > 0.5) {
+        let inner_blur = max(material.inner_glow_params.x, 0.001);
+        let dist_inward = max(-dist_body, 0.0);
+        let inner_factor = 1.0 - smoothstep(0.0, inner_blur, dist_inward);
+        let glow_alpha = inner_factor * material.inner_glow_color.a;
+        body_color = vec4<f32>(
+            mix(body_color.rgb, material.inner_glow_color.rgb, glow_alpha),
+            max(body_color.a, glow_alpha)
+        );
+    }
+
+    // Outer shadow
+    var shadow_premul = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (shadow_blur > 0.0) {
+        let p_shadow = p - vec2<f32>(shadow_offset.x, -shadow_offset.y);
+        let shadow_radius = material.radius + vec4<f32>(shadow_spread);
+        let half_size_shadow = half_size + vec2<f32>(shadow_spread);
+        var dist_shadow: f32;
+        if (material.shape_mode == 1u) {
+            dist_shadow = sd_cut_box(p_shadow, half_size_shadow, shadow_radius);
+        } else {
+            dist_shadow = sd_rounded_box(p_shadow, half_size_shadow, shadow_radius);
+        }
+        let shadow_factor = 1.0 - smoothstep(-aa_inner, shadow_blur, dist_shadow);
+        let shadow_alpha = shadow_factor * material.shadow_color.a;
+        shadow_premul = vec4<f32>(material.shadow_color.rgb * shadow_alpha, shadow_alpha);
+    }
+
+    // Shape compositing: Border + Body seamlessly combined without seam or opacity loss
+    var eff_border_color = material.border_color;
+    if (border_width > 0.0 && material.grad_params.z > 0.0 && material.border_color.a == 0.0) {
+        eff_border_color = body_color;
+    }
+    let shape_rgb = eff_border_color.rgb * (border_alpha * eff_border_color.a) + body_color.rgb * (body_alpha * body_color.a);
+    let shape_alpha = border_alpha * eff_border_color.a + body_alpha * body_color.a;
+
+    // Porter-Duff Over: Shape over Shadow
+    let comp_rgb = shape_rgb + shadow_premul.rgb * (1.0 - shape_alpha);
+    let comp_a = shape_alpha + shadow_premul.a * (1.0 - shape_alpha);
+    let straight_rgb = comp_rgb / max(comp_a, 0.0001);
+    let final_color = vec4<f32>(straight_rgb, comp_a * alpha_clip);
+
+    if (final_color.a < 0.001) {
+        discard;
+    }
+
+    return final_color;
+}
