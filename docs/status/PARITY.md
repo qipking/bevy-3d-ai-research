@@ -473,10 +473,58 @@ PLAN.md §1 的 8 行标注偏乐观（6 处 ✅ + 2 处 ⚠️），按本文�
 3. **`input.rs` 剩余语义**（M）：鼠标滚轮 3 行、拖选、`accept_completion`、`answer_inline`、`note_input_context`。
 4. **`history.rs` / `jsonl.rs` 持久化**（S/M）：输入历史还只在内存。
 5. **`view.rs` 顶层编排**（M）：`needs_redraw` / 33ms 节流、Front 协议。
-6. **渲染层读 span 样式**（S，但影响面大）：`transcript.rs::spawn_text_line` 只读 `span.style.fg`，`bg`/`Modifier`（BOLD/UNDERLINED/ITALIC/DIM）是死数据 → diff 行内底色、markdown 行内 code、picker 的 dim 都画不出来（`rich.rs` 已用前景色退化）。
+6. ~~**渲染层读 span 样式**~~ ✅ 已填（2026-11-25 深夜）：`transcript::span_style_color` 把 `Modifier`/`bg` 折成可渲染颜色——BOLD 提亮 25%、DIM 往面板底色混 45%、UNDERLINED 提亮 12%、行内底色按「与底反着来」提/降 22%、ITALIC/CROSSED_OUT 无字形仍忽略；`spawn_row_themed`/`fill_row_text_themed` 让 `panels.rs` 读 `Res<Theme>`（没有主题的测试 App 退化成默认值）。5 个测试。**仍是退化实现**：行内底色与下划线没有真画出来，要真画得给每个 span 加一层 `BackgroundColor` Node（行高与基线会变）。
 
 ### 集成时的已知冲突（要 lead 收口）
 
 - **notice 两条路**：demo 的 `NoticeLog`（应用层，`rig_harness_in_3d/src/lib.rs`）与引擎的 `TextId::Notice` 只能二选一，否则真 agent 的通知会画两遍。当前只走 `NoticeLog`（demo 没有真对话，不冲突）。
 - **`↓ new output` 标记重复**：`pane::BELOW_MARKER` 与 `transcript::MORE_BELOW` 是两份；要画 new output 得让 `window_transcript` 改用 `Below`/`BelowSeen`。
 - **主题两套**：引擎正文用 rig 默认主题，`rich::upstream_theme()` 是另一套映射，需要统一。
+
+## 6. 第二轮并行（2026-11-25 深夜，四个通道）
+
+| 缺口 | 结果 | 证据 |
+|---|---|---|
+| 缺口 2：补全 `complete.rs` | ✅ 已填 | `complete.rs` 1500 行：`CompletionSource`/`CompletionTrigger`/`Candidate`/`Completion`/`CompletionKind`、`SHOWN=50`、`match_at`/`token`/`path_items`、`/` 命令（过滤 `Disabled`）、`@` 路径（`IoTaskPool` 后台遍历 + `FileWatch` 防抖）、`CompletionState` + `follow_input` + `CompletionPlugin`；21 个测试。**简化**：`walk` 不读 `.gitignore`，只跳过 `.git`/`target`/`node_modules`/`.` 开头 |
+| 缺口 4：选字 + 剪贴板 | ✅ 已填 | `selection.rs`（grapheme 级 hit-test、拖选/双击选词/三击选行/清除、`selected_text` 行尾裁剪、`ranges_in`/`byte_ranges_in`，25 个测试）+ `clipboard.rs`（`ClipboardText` trait 便于 mock、`copy_text`/`copy_selection`/`paste_text`/`paste_from_clipboard`、`Copied N lines` + `AppStatus` 条目，16 个测试）。新增依赖 `unicode-width 0.2`；`bevy_clipboard` 打开 `system_clipboard`+`wayland` |
+| 补全的键位接线 | ✅ 已接 | `editor.rs::completion_act`：列表开着时 ↑↓ 改选中、Tab 接受、Enter（非精确）接受、Esc 关闭并记住 token；5 个测试。`CompletionState::show` / `Completion::from_items` 作为公开入口 |
+| 渲染层 span 样式 | ✅ 已填 | 见 §5 第 6 条 |
+
+测试总数：**175 全过**（本轮起点 103）。
+
+### 仍然没做
+
+1. **鼠标事件接线**（M）：`selection.rs` 的 hit-test 与 `clipboard` 都已就绪，但**没有系统**把 `feathers_in_3d` 的拾取事件接到 `Selection::press/drag/release`，也没把 `byte_ranges_in` 套到行样式上 → 拖选/双击/点击复制**还看不见效果**。这是下一轮第一件事。
+2. **`input.rs` 剩余语义**（M）：滚轮 3 行、窗口 resize 清选区、`answer_inline`、`note_input_context`。
+3. **`history.rs` / `jsonl.rs` 持久化**（S/M）：输入历史仍只在内存。
+4. **`view.rs` 顶层编排**（M）：`needs_redraw` / 33ms 节流、Front 协议。
+5. **补全面板的落点**（S）：`completion_rows` 有，但 `PanelId` 是封闭枚举，还没决定补全画在哪（输入面板尾部 / 新浮层）。
+
+## 7. 第三轮并行（2026-11-25 凌晨，五个通道）
+
+| 缺口 | 结果 | 证据 |
+|---|---|---|
+| 鼠标拾取 → 选区 → 复制 | ✅ 已接 | `selection.rs::SelectionPlugin`：`PointerPress/Move/Release` → `RowLayout` + `WorldPanel` 逆变换 → 面板局部像素 → 格子列；按下/拖动/双击选词/三击选行/点空白清除/松手复制；`panels.rs` 用 `byte_ranges_in` 切开 span 套 `REVERSED`（`span_style_color` 新增反色），hash 保证拖动重画。20 个测试 |
+| 输入历史持久化 `history.rs`/`jsonl.rs` | ✅ 已填 | `history.rs` 733 行：`PromptHistory`（JSONL、去重、坏行跳过）、`HistorySystems::{Seed, Record, Save}` + `mirror`、`Sent`；缺任何可选资源都是 no-op。12 个测试。**没加新依赖**（`typed_prompts` 走 `rig_harness::rig_tools` re-export） |
+| 应用层：通知单一路径 | ✅ 已收口 | 删掉应用层 `NoticeLog`，只留引擎 `TextId::Notice`；新增 `rig_harness_in_3d/src/notice.rs`。遗留：`batch::collect_rows` 的 `retain_text` 会清 Notice，应用层暂时回填（若把它改成保留 Notice，这段可删） |
+| 应用层：设置 `Settings` | ✅ 已接 | `settings.rs`：`RIG_HOME/settings.toml`，`[view] hide_status` 真的影响视图；`/setting` 查看与修改并写回；坏 TOML/类型错降级 + `warn!` |
+| 应用层：状态行真实化 | ✅ 已接 | `status.rs`：每帧从 `SessionPaths`/Agent/`ActiveTurn`/`Conversation`/`Running`/`LastUsage` 写 `AppStatus`，演示数字已删 |
+
+**规模**：`rig-feathers` 4943 → **15351 行 / 23 个模块**（上游 26 模块 14749 行）；
+`rig_harness_in_3d` 116 → **2350 行**。
+**测试**：`rig-feathers` **207 个**（从 40 起）、`rig_harness_in_3d` **13 + 1 doctest**。
+
+### 估算覆盖率
+
+| 维度 | 之前 | 现在 |
+|---|---|---|
+| 上游模块有对应实现 | 14/26 | **25/26**（只剩 `tests.rs` 不适用） |
+| 对位代码量 | ≈ 3558 行（25%） | **≈ 11000 行（约 75%）**（差额主要是 `view.rs` 顶层编排、`input.rs` 的鼠标/内联语义、`terminal.rs` 有意不做） |
+
+### 仍然没做（下一轮）
+
+1. **`view.rs` 顶层编排**（M）：`needs_redraw` / 33ms 节流、Front 协议、`--print` 等价物。
+2. **`input.rs` 剩余语义**（M）：滚轮 3 行、resize 清选区、`answer_inline`、`note_input_context`。
+3. **补全面板的落点**（S）：`completion_rows` 有，`PanelId` 封闭枚举需要加一块或并进输入面板。
+4. **`terminal.rs` 有意不移植**（bevy 窗口取代），`title.rs` 的 OSC 133 同理。
+5. **行内底色/下划线仍是退化实现**（要真画需 span 级 `BackgroundColor` Node）。

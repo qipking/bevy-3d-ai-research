@@ -30,10 +30,13 @@
 
 pub mod batch;
 pub mod camera_rig;
+pub mod clipboard;
+pub mod complete;
 pub mod editor;
 pub mod frame;
 pub mod front;
 pub mod hints;
+pub mod history;
 pub mod keys;
 pub mod niri;
 pub mod pane;
@@ -41,6 +44,7 @@ pub mod panels;
 pub mod picker;
 pub mod rich;
 pub mod spatial;
+pub mod selection;
 pub mod status;
 pub mod style;
 pub mod theme;
@@ -75,6 +79,17 @@ pub mod prelude {
     pub use crate::keys::{
         AppKeyBindingsExt, InputAction, KeyBinding, KeyFocus, KeyPress, KeyPressed, KeyScope,
         Keys, Modifiers, PendingInput, RefusedKeys, action_for,
+    };
+    pub use crate::complete::{
+        Candidate, Completion, CompletionKind, CompletionPlugin, CompletionSource, CompletionState,
+        CompletionTrigger, completion_rows,
+    };
+    pub use crate::history::{
+        HISTORY_FILE, HistoryPlugin, HistorySystems, PromptHistory, Sent,
+    };
+    pub use crate::selection::{ClickKind, Point, SELECTED_MODIFIER, Selection};
+    pub use crate::clipboard::{
+        ClipboardText, Copied, copy_selection, copy_text, paste_from_clipboard,
     };
     pub use crate::rich::{
         diff_rows, highlight_rows, markdown_rows, tool_result_rows, upstream_theme,
@@ -118,6 +133,12 @@ impl Plugin for FeathersViewPlugin {
                 .chain(),
         )
         .init_resource::<theme::Theme>()
+        .init_resource::<selection::Selection>()
+        .add_message::<clipboard::Copied>()
+        .add_systems(
+            Update,
+            clipboard::show_copied.in_set(FeathersSystems::Prepare),
+        )
         .add_plugins((
             frame::FramePlugin,
             panels::PanelsPlugin,
@@ -130,6 +151,9 @@ impl Plugin for FeathersViewPlugin {
             niri::TilingPlugin,
             title::TitlePlugin,
             front::FrontPlugin,
+            complete::CompletionPlugin,
+            history::HistoryPlugin::new(),
+            selection::SelectionPlugin,
             camera_rig::CameraRigPlugin,
         ));
     }

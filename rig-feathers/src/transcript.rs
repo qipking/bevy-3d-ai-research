@@ -36,6 +36,7 @@ use rig_tui::{RenderBatch, RenderKey, RenderRequest};
 
 use crate::panels::KeyedRow;
 use crate::style;
+use crate::theme::Theme;
 
 /// 一行的纯文本（选择/复制用）。
 #[derive(Component, Clone, Debug)]
@@ -108,6 +109,17 @@ impl Row {
 
 /// 在一行节点里（重新）生成文字节点与 span —— 流式更新时只换这一行的内容。
 pub fn fill_row_text(commands: &mut Commands, row_entity: Entity, row: &Row, font: &FontSource) {
+    fill_row_text_themed(commands, row_entity, row, font, &Theme::default());
+}
+
+/// [`fill_row_text`] 的带主题版本：span 的 Modifier/底色由 `theme` 折算成颜色。
+pub fn fill_row_text_themed(
+    commands: &mut Commands,
+    row_entity: Entity,
+    row: &Row,
+    font: &FontSource,
+    theme: &Theme,
+) {
     commands.entity(row_entity).despawn_children();
     let justify = match row.right.is_some() {
         true => JustifyContent::SpaceBetween,
@@ -119,9 +131,9 @@ pub fn fill_row_text(commands: &mut Commands, row_entity: Entity, row: &Row, fon
         .and_modify(move |mut node| node.justify_content = justify);
     let font = font.clone();
     commands.entity(row_entity).with_children(|parent| {
-        spawn_text_line(parent, &row.line, &font);
+        spawn_text_line(parent, &row.line, &font, theme);
         if let Some(right) = &row.right {
-            spawn_text_line(parent, right, &font);
+            spawn_text_line(parent, right, &font, theme);
         }
     });
 }
@@ -132,6 +144,16 @@ pub struct TranscriptFont(pub FontSource);
 
 /// 生成一行 UI 节点，返回该行实体（增量更新需要它）。
 pub fn spawn_row(parent: &mut ChildSpawnerCommands, row: &Row, font: &FontSource) -> Entity {
+    spawn_row_themed(parent, row, font, &Theme::default())
+}
+
+/// [`spawn_row`] 的带主题版本。
+pub fn spawn_row_themed(
+    parent: &mut ChildSpawnerCommands,
+    row: &Row,
+    font: &FontSource,
+    theme: &Theme,
+) -> Entity {
     let font = font.clone();
     let mut entity = parent.spawn(Node {
         width: percent(100.0),
@@ -171,16 +193,21 @@ pub fn spawn_row(parent: &mut ChildSpawnerCommands, row: &Row, font: &FontSource
         entity.insert(crate::picker::PickerChoice { picker, index });
     }
     entity.with_children(|parent| {
-        spawn_text_line(parent, &row.line, &font);
+        spawn_text_line(parent, &row.line, &font, theme);
         if let Some(right) = &row.right {
-            spawn_text_line(parent, right, &font);
+            spawn_text_line(parent, right, &font, theme);
         }
     });
     entity.id()
 }
 
 /// Spawns one styled line's text node (an empty `Text` with one `TextSpan` per run).
-fn spawn_text_line(parent: &mut ChildSpawnerCommands, line: &Line<'static>, font: &FontSource) {
+fn spawn_text_line(
+    parent: &mut ChildSpawnerCommands,
+    line: &Line<'static>,
+    font: &FontSource,
+    theme: &Theme,
+) {
     parent
         .spawn((
             Text::new(String::new()),
@@ -209,7 +236,7 @@ fn spawn_text_line(parent: &mut ChildSpawnerCommands, line: &Line<'static>, font
                         font_size: FontSize::Px(FONT_SIZE),
                         ..default()
                     },
-                    TextColor(color_with_alpha(style.fg.unwrap_or(RColor::Reset), 1.0)),
+                    TextColor(span_style_color(&style, theme)),
                 ));
             }
         });
@@ -221,7 +248,82 @@ pub fn spawn_rows(
     rows: &[Row],
     font: &FontSource,
 ) -> Vec<Entity> {
-    rows.iter().map(|row| spawn_row(parent, row, font)).collect()
+    let theme = Theme::default();
+    rows.iter()
+        .map(|row| spawn_row_themed(parent, row, font, &theme))
+        .collect()
+}
+
+/// 把 span 的样式折成一个**能画出来的**颜色。
+///
+/// 渲染层只有一个字形颜色：bevy_text 的 `TextSpan` 不支持字重、下划线、行内底色。
+/// 所以这里把上游 `ratatui::Style` 里表达不了的部分降级成亮度/色相：
+///
+/// | 上游样式 | 这里怎么办 |
+/// |---|---|
+/// | `Modifier::BOLD` | 往白提亮 25% |
+/// | `Modifier::DIM` | 往面板底色混 45%（picker 的 `.patch_style(dim)` 靠这条才有用） |
+/// | `Modifier::UNDERLINED` | 提亮 12%（行内 code 至少和正文区分得开） |
+/// | `Modifier::REVERSED` | 前景换成底色（`style.bg`，没设就用 `theme.band`）：选中就是"挖空" |
+/// | `Modifier::ITALIC` / `CROSSED_OUT` | 无字形，忽略（注释里写明，不再静默） |
+/// | `style.bg` | 按"和底色反着来"提/降 22%：深底提亮、浅底压暗 |
+///
+/// 这是**退化实现**，不是像素级还原：真要画行内底色/下划线，得让每个 span 自带一层
+/// 带 `BackgroundColor` 的 Node（行高与基线会变，见 `docs/status/PARITY.md` §5）。
+pub fn span_style_color(style: &rig_tui::ratatui::style::Style, theme: &Theme) -> Color {
+    use rig_tui::ratatui::style::{Modifier, Style};
+
+    let fg = style
+        .fg
+        .or(theme.fg.fg)
+        .unwrap_or(RColor::Rgb(210, 216, 228));
+    let base = style::color(Some(fg));
+    let mut srgb = base.to_srgba();
+    let band = style::color(Some(theme.band)).to_srgba();
+    let luma = |c: bevy::color::Srgba| 0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue;
+
+    // 终端画选中时把前景/背景对调（`Modifier::REVERSED`）。bevy_text 的 span
+    // 没有自己的底色，所以这里只能把前景换成"本来会画的底色"：span 自带
+    // `bg` 就换它，否则换主题底色。选中文字因此在面板上呈"挖空"状——比不
+    // 处理强，但和终端的反色块仍有差距（见本函数文档的退化说明）。
+    if style.add_modifier.contains(Modifier::REVERSED) {
+        let bg = style.bg.unwrap_or(theme.band);
+        let bg = style::color(Some(bg)).to_srgba();
+        return Color::srgb(bg.red, bg.green, bg.blue);
+    }
+
+    if style.add_modifier.contains(Modifier::DIM) {
+        let k = 0.45;
+        srgb.red = srgb.red * (1.0 - k) + band.red * k;
+        srgb.green = srgb.green * (1.0 - k) + band.green * k;
+        srgb.blue = srgb.blue * (1.0 - k) + band.blue * k;
+    }
+    if style.add_modifier.contains(Modifier::BOLD) {
+        let k = 0.25;
+        srgb.red += (1.0 - srgb.red) * k;
+        srgb.green += (1.0 - srgb.green) * k;
+        srgb.blue += (1.0 - srgb.blue) * k;
+    }
+    if style.add_modifier.contains(Modifier::UNDERLINED) {
+        let k = 0.12;
+        srgb.red += (1.0 - srgb.red) * k;
+        srgb.green += (1.0 - srgb.green) * k;
+        srgb.blue += (1.0 - srgb.blue) * k;
+    }
+    // 行内底色：画不出来，但要让文字"和没底色的文字"区分开。
+    if let Some(bg) = style.bg {
+        let bg = style::color(Some(bg)).to_srgba();
+        let k = 0.22;
+        let toward_light = luma(bg) < luma(srgb);
+        for channel in [&mut srgb.red, &mut srgb.green, &mut srgb.blue] {
+            *channel = if toward_light {
+                *channel + (1.0 - *channel) * k
+            } else {
+                *channel * (1.0 - k)
+            };
+        }
+    }
+    Color::srgb(srgb.red, srgb.green, srgb.blue)
 }
 
 fn color_with_alpha(c: RColor, a: f32) -> Color {
@@ -1048,5 +1150,114 @@ mod tests {
         .with_right(Line::from("PgDn"));
         assert_ne!(row_hash(&row), 0);
         assert!(row.right.is_some());
+    }
+}
+
+#[cfg(test)]
+mod span_style_tests {
+    use super::*;
+    use rig_tui::ratatui::style::{Modifier, Style};
+
+    fn luma(c: Color) -> f32 {
+        let c = c.to_srgba();
+        0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue
+    }
+
+    #[test]
+    fn bold_is_brighter_than_plain() {
+        let theme = Theme::default();
+        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
+        let bold = span_style_color(
+            &Style::default()
+                .fg(RColor::Gray)
+                .add_modifier(Modifier::BOLD),
+            &theme,
+        );
+        assert!(luma(bold) > luma(plain), "BOLD 应该提亮");
+    }
+
+    #[test]
+    fn dim_is_darker_than_plain() {
+        let theme = Theme::default();
+        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
+        let dim = span_style_color(
+            &Style::default()
+                .fg(RColor::Gray)
+                .add_modifier(Modifier::DIM),
+            &theme,
+        );
+        assert!(luma(dim) < luma(plain), "DIM 应该压暗（picker 的 patch_style(dim) 靠这条）");
+    }
+
+    #[test]
+    fn underlined_is_distinguishable() {
+        let theme = Theme::default();
+        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
+        let under = span_style_color(
+            &Style::default()
+                .fg(RColor::Gray)
+                .add_modifier(Modifier::UNDERLINED),
+            &theme,
+        );
+        assert_ne!(luma(plain), luma(under), "下划线画不出来，至少要能看出区别");
+    }
+
+    #[test]
+    fn span_background_shifts_away_from_itself() {
+        let theme = Theme::default();
+        // 深底 → 文字提亮；浅底 → 文字压暗。
+        let dark_bg = span_style_color(
+            &Style::default().fg(RColor::Gray).bg(RColor::Black),
+            &theme,
+        );
+        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
+        assert!(luma(dark_bg) > luma(plain));
+        let light_bg = span_style_color(
+            &Style::default().fg(RColor::Gray).bg(RColor::White),
+            &theme,
+        );
+        assert!(luma(light_bg) < luma(plain));
+    }
+
+    #[test]
+    fn a_colour_survives_verbatim_when_nothing_is_asked_for() {
+        let theme = Theme::default();
+        let c = span_style_color(&Style::default().fg(RColor::Red), &theme);
+        let want = style::color(Some(RColor::Red)).to_srgba();
+        let got = c.to_srgba();
+        assert!((want.red - got.red).abs() < 1e-4);
+        assert!((want.green - got.green).abs() < 1e-4);
+        assert!((want.blue - got.blue).abs() < 1e-4);
+    }
+
+    #[test]
+    fn reversed_swaps_the_foreground_for_the_background() {
+        let theme = Theme::default();
+        // 没有 span 底色时换成主题底色（选中就是"挖空"）。
+        let reversed = span_style_color(
+            &Style::default()
+                .fg(RColor::Red)
+                .add_modifier(Modifier::REVERSED),
+            &theme,
+        )
+        .to_srgba();
+        let band = style::color(Some(theme.band)).to_srgba();
+        assert!((band.red - reversed.red).abs() < 1e-4);
+        assert!((band.green - reversed.green).abs() < 1e-4);
+        assert!((band.blue - reversed.blue).abs() < 1e-4);
+
+        // span 自带底色时换它（终端反色换的就是这个背景）。
+        let on_blue = span_style_color(
+            &Style::default()
+                .fg(RColor::Red)
+                .bg(RColor::Blue)
+                .add_modifier(Modifier::REVERSED),
+            &theme,
+        )
+        .to_srgba();
+        let blue = style::color(Some(RColor::Blue)).to_srgba();
+        assert!((blue.red - on_blue.red).abs() < 1e-4);
+        assert!((blue.green - on_blue.green).abs() < 1e-4);
+        assert!((blue.blue - on_blue.blue).abs() < 1e-4);
     }
 }

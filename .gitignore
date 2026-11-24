@@ -26,3 +26,4 @@ experiments/rig-tui-inspect/
 
 # 巡游默认输出目录（RF_SHOT_DIR 未指定时）
 shots/
+.claude/

@@ -495,6 +495,55 @@ fn act(action: InputAction, editor: &mut Editor) -> Option<String> {
     None
 }
 
+/// 补全列表开着时先吃掉这个动作；返回 `true` 表示已处理。
+///
+/// 对应上游 `input.rs::accept_completion` 与列表导航：↑↓ 改选中项、Tab/Enter 接受、
+/// Esc 关掉（并记住这个 token，直到它变了才允许重开）。
+fn completion_act(
+    action: InputAction,
+    state: &mut crate::complete::CompletionState,
+    editor: &mut Editor,
+) -> bool {
+    use InputAction as Do;
+    match action {
+        Do::Up => {
+            if let Some(completion) = state.completion_mut() {
+                completion.select(-1);
+            }
+            true
+        }
+        Do::Down => {
+            if let Some(completion) = state.completion_mut() {
+                completion.select(1);
+            }
+            true
+        }
+        Do::Tab => {
+            if let Some(completion) = state.take() {
+                completion.accept(editor);
+            }
+            true
+        }
+        // 精确命中时 Enter 直接发送、列表关掉；否则接受候选（上游同义）。
+        Do::Send => {
+            let exact = state.completion().is_some_and(|c| c.is_exact());
+            if exact {
+                state.close();
+                return false;
+            }
+            if let Some(completion) = state.take() {
+                completion.accept(editor);
+            }
+            true
+        }
+        Do::Stop => {
+            state.dismiss();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 输入系统的键处理：走 [`crate::keys`] 的绑定表；编辑动作在这里执行，
 /// 插件绑定（没有 [`InputAction`] 的）触发 [`KeyPressed`]。
 pub fn keys(
@@ -507,6 +556,7 @@ pub fn keys(
     mut focus: ResMut<KeyFocus>,
     mut pending: ResMut<PendingInput>,
     mut commands: Commands,
+    mut completion: Option<ResMut<crate::complete::CompletionState>>,
 ) {
     let rows: Vec<BindingRef> = bindings
         .iter()
@@ -560,6 +610,12 @@ pub fn keys(
                 }
                 match row.action {
                     Some(action) => {
+                        // 补全列表开着时，↑↓/Tab/Enter/Esc 先归列表（上游 accept_completion）。
+                        if let Some(state) = completion.as_mut() {
+                            if completion_act(action, state, &mut editor) {
+                                continue;
+                            }
+                        }
                         if let Some(text) = act(action, &mut editor) {
                             prompts.0.push(text.clone());
                             submitted.write(PromptSubmitted(text));
@@ -1153,5 +1209,77 @@ mod tests {
         app.update();
         assert_eq!(text(&app), "T", "全局插件绑定遮住打字");
         assert!(app.world().resource::<SubmittedPrompts>().0.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod completion_key_tests {
+    use super::*;
+    use crate::complete::{Candidate, Completion, CompletionKind, CompletionState};
+
+    fn open_list(state: &mut CompletionState) {
+        state.show(Completion::from_items(
+            CompletionKind::Marker('#'),
+            0,
+            "",
+            vec![
+                Candidate {
+                    text: "142".into(),
+                    detail: "Crash on empty input".into(),
+                },
+                Candidate {
+                    text: "143".into(),
+                    detail: "Slow start".into(),
+                },
+            ],
+        ));
+    }
+
+    #[test]
+    fn down_moves_the_selection_and_does_not_touch_the_editor() {
+        let mut state = CompletionState::default();
+        open_list(&mut state);
+        let mut editor = Editor::default();
+        editor.insert("hello");
+        assert!(completion_act(InputAction::Down, &mut state, &mut editor));
+        assert_eq!(state.completion().unwrap().selected, 1);
+        assert_eq!(editor.text, "hello", "↑↓ 只改选中项，不动输入");
+    }
+
+    #[test]
+    fn tab_accepts_the_candidate() {
+        let mut state = CompletionState::default();
+        open_list(&mut state);
+        let mut editor = Editor::default();
+        assert!(completion_act(InputAction::Tab, &mut state, &mut editor));
+        assert!(!state.is_open(), "接受后列表关掉");
+        assert!(editor.text.contains("142"), "候选落进输入：{}", editor.text);
+    }
+
+    #[test]
+    fn escape_dismisses_and_keeps_the_token_from_reopening() {
+        let mut state = CompletionState::default();
+        open_list(&mut state);
+        let mut editor = Editor::default();
+        assert!(completion_act(InputAction::Stop, &mut state, &mut editor));
+        assert!(!state.is_open());
+        assert_eq!(editor.text, "", "Esc 不改输入");
+    }
+
+    #[test]
+    fn enter_on_an_inexact_list_accepts_instead_of_sending() {
+        let mut state = CompletionState::default();
+        open_list(&mut state);
+        let mut editor = Editor::default();
+        // 返回 true = 已吃掉这个动作，调用方不会再去 `act` 里发送。
+        assert!(completion_act(InputAction::Send, &mut state, &mut editor));
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn keys_outside_the_list_fall_through() {
+        let mut state = CompletionState::default();
+        let mut editor = Editor::default();
+        assert!(!completion_act(InputAction::Left, &mut state, &mut editor));
     }
 }

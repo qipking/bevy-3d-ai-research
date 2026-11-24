@@ -114,7 +114,11 @@ fn pane_rows(
 }
 
 /// 滚上去时占掉最后一行的标记（rig-tui `pane::draw_below` 的同一句话）。
-pub const BELOW_MARKER: &str = " \u{2193} more below (PgDn) ";
+/// 滚上去、下面还有行时的标记。
+///
+/// 只留一份定义：转写引擎的 [`crate::transcript::MORE_BELOW`]（`Below::More` 用的也是它）。
+/// 以前这里另写了一份同样的字符串，两处改一处就会漂。
+pub const BELOW_MARKER: &str = crate::transcript::MORE_BELOW;
 
 fn below_marker() -> KeyedRow {
     KeyedRow {

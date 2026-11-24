@@ -17,10 +17,12 @@
 //! Ask/Pick、启动器协议、时钟、watch、run、progress 全部来自
 //! [`rig_harness::prelude::RigHarnessPlugins`]；本 crate 额外装：
 //!
-//! * [`HarnessExtPlugin`]：`/hello` 命令样板、输入框 `/命令` 到
-//!   [`RunCommand`] 的桥、[`Notice`] 到转写行的桥；
-//! * `seed_status_items`：演示用的状态条目（真应用里由各插件自己
-//!   `StatusItems::show`）。
+//! * [`HarnessExtPlugin`]：`/hello` 与 `/setting` 命令、输入框 `/命令` 到
+//!   [`RunCommand`] 的桥、[`Notice`] 到转写引擎的桥、真实状态行、`[view]` 设置；
+//! * [`settings`]：启动时按上游路径规则读 `RIG_HOME/settings.toml` 的 `[view]`
+//!   表，坏文件降级成默认值并 `warn!`，可用 `/setting` 改并写回磁盘；
+//! * 状态条目全部来自 ECS（会话、agent 数、turn、对话消息数、后台任务、真实
+//!   token），没有演示数字。
 //!
 //! 嵌入式 harness 必须自己做、少一件就起不来的三件装配（照 `examples/harness_boot.rs`）：
 //!
@@ -33,6 +35,12 @@
 //! 3. `TranscriptFont`：视图层的行同步系统要它，必须在 `PreStartup` 插入，
 //!    否则那些系统会被参数校验跳过。
 //!
+//! ## 通知只有一条路
+//!
+//! `Notice` -> [`notice::NoticeHistory`] -> 转写引擎的 `TextId::Notice` -> `TranscriptRows`。
+//! 应用层不再自己拼行塞 `TranscriptRows`（上一轮的 `NoticeLog` 已删）：顺序、
+//! 折行、回滚都归引擎，和真对话一致。
+//!
 //! ## fork 之后你要改什么
 //!
 //! | 改什么 | 在哪 |
@@ -42,35 +50,40 @@
 //! | 面板内容（状态/输入/额外面板） | 写 `PanelRows`（见 `rig_feathers::status/editor`） |
 //! | 相机（手柄/键盘/陀螺仪） | `rig_feathers::camera_rig` |
 //! | 更多 slash 命令 | `.add_command("name", "帮助", 你的系统)` |
+//! | 更多设置 | `[view]` 之外新开一段，照 [`settings`] 的 `add_setting` 写 |
 //!
 //! ## 不要改什么
 //!
 //! `feathers_in_3d`（渲染）与 `rig_feathers`（视图）是上游跟踪层：它们的 API 与
 //! rig 上游对齐，改动会破坏"随上游升级"的承诺。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use bevy::ecs::entity_disabling::Disabled;
 use bevy::prelude::*;
 use bevy::text::FontSource;
 use feathers_in_3d::FeathersIn3dPlugin;
-use rig_ecs::prelude::{Agent, Notice, NoticeLevel};
-use rig_feathers::{editor, pane, panels, transcript};
+use rig_ecs::prelude::Notice;
+use rig_feathers::{editor, pane, transcript};
 use rig_harness::commands::{AppCommandsExt, NoArgs, RunCommand, SlashCommand};
 use rig_harness::harness_protocol::Home;
 use rig_harness::main_agent::{MainAgentQuery, main_agent};
 use rig_harness::prelude::SessionPaths;
-use rig_tui::ratatui::style::{Color as RColor, Style};
-use rig_tui::ratatui::text::{Line, Span};
 
 pub use rig_feathers::prelude::*;
 
+pub mod notice;
+pub mod settings;
+pub mod status;
+
+pub use notice::NoticeHistory;
+pub use settings::{SettingsPath, ViewSettings};
+
 /// 装好"真 harness + 视图 + 3D 渲染"的 App（不含业务工具）。
 ///
-/// 会话目录从 `RIG_HOME`（[`Home::from_env`]）来；没有可写目录时直接 panic，
-/// 并提示把 `RIG_HOME` 指到可写位置。
+/// 会话目录与设置都从 `RIG_HOME`（[`Home::from_env`]）来；没有可写目录时直接
+/// panic，并提示把 `RIG_HOME` 指到可写位置。设置文件不存在或读不了不 panic：
+/// 用默认值继续（见 [`settings`]）。
 ///
 /// ```no_run
 /// use bevy::prelude::*;
@@ -100,6 +113,12 @@ pub fn app(title: &str) -> App {
     // 系统出错按 rig-harness 的方式记成数据，而不是让 winit 停下来。
     app.set_error_handler(rig_harness::error::warn);
     app.insert_resource(SessionPaths(dir));
+    // 设置：RIG_HOME/settings.toml（上游路径规则）；缺失/坏文件在插件 build 里降级。
+    settings::install(&mut app, home.settings());
+    // 输入历史落盘：`RIG_HOME/data/tui/history.jsonl`（跨会话按 ↑ 能翻出来）。
+    // `FeathersViewPlugin` 装的是内存版插件，这里把文件路径交给它读。
+    let history_file = home.data().join(rig_feathers::history::HISTORY_FILE);
+    app.insert_resource(rig_feathers::history::PromptHistory::load(history_file));
 
     // 1. windowed() 假定 HeadlessPlugins 已经装过这几样；任务池必须最前：
     //    后面的插件在 build 阶段就会用 IoTaskPool。
@@ -126,11 +145,10 @@ pub fn app(title: &str) -> App {
     app.add_plugins(rig_harness::prelude::RigHarnessPlugins);
     // 视图层：替代 plugins/rig-tui 的 TuiViewPlugin
     app.add_plugins(rig_feathers::FeathersViewPlugin);
-    // 本模板的扩展：/hello、输入框命令桥、Notice -> 转写
+    // 本模板的扩展：/hello、/setting、输入框命令桥、Notice -> 引擎、状态行、设置
     app.add_plugins(HarnessExtPlugin);
     // 2 + 3. 会话目录宣示与视图字体（字体必须在 PreStartup，否则视图系统被跳过）
-    app.add_systems(PreStartup, (announce_session, insert_transcript_font).chain())
-        .add_systems(Startup, seed_status_items);
+    app.add_systems(PreStartup, (announce_session, insert_transcript_font).chain());
     app
 }
 
@@ -151,32 +169,17 @@ fn insert_transcript_font(mut commands: Commands, asset_server: Res<AssetServer>
     ])));
 }
 
-/// 给状态行放几个 rig 风格的条目（真应用里由插件各自 `StatusItems::show`）。
-fn seed_status_items(mut app_status: ResMut<rig_tui::AppStatus>) {
-    use rig_tui::{Side, StatusItem, Tone};
-    app_status
-        .0
-        .show(StatusItem::new("model", Side::Left, 10, 5).says("no model", Tone::Bold));
-    app_status
-        .0
-        .show(StatusItem::new("tokens", Side::Left, 20, 4).says("312 tokens", Tone::Dim));
-    app_status
-        .0
-        .show(StatusItem::new("context", Side::Right, 40, 5).says("ctx 12%", Tone::Green));
-    app_status
-        .0
-        .show(StatusItem::new("agents", Side::Right, 50, 3).says("1 agent", Tone::Dim));
-}
-
-/// harness 层的扩展点：会话与 slash 命令。
+/// harness 层的扩展点：会话、命令与设置文件。
 ///
-/// 这两个问题都直接问 [`App`] 的 world，而不是模板自己记一份：
+/// 这些都直接问 [`App`] 的 world，而不是模板自己记一份：
 /// `session_dir` 读真实的 [`SessionPaths`] 资源，`commands` 读出上游
 /// [`AppCommandsExt::add_command`] 注册在 world 里的 [`SlashCommand`] 实体。
 /// 因此业务插件后加的 `/命令` 也会出现在这里。
 pub trait HarnessExt {
     /// 会话目录（对应 rig-harness 的 session store）；没有会话时为 `None`。
     fn session_dir(&self) -> Option<PathBuf>;
+    /// `RIG_HOME/settings.toml` 的路径（本 app 保存设置写它）。
+    fn settings_file(&self) -> Option<PathBuf>;
     /// 已注册的 slash 命令名，含前导 `/`（与上游 `Name` 一致），按名字排序；
     /// 被 `Disabled` 的命令不算。
     fn commands(&self) -> Vec<String>;
@@ -187,6 +190,12 @@ impl HarnessExt for App {
         self.world()
             .get_resource::<SessionPaths>()
             .map(|paths| paths.0.path().to_path_buf())
+    }
+
+    fn settings_file(&self) -> Option<PathBuf> {
+        self.world()
+            .get_resource::<SettingsPath>()
+            .map(|path| path.0.clone())
     }
 
     fn commands(&self) -> Vec<String> {
@@ -210,108 +219,65 @@ pub fn hello(In(args): In<NoArgs>, mut notices: MessageWriter<Notice>) {
     notices.write(Notice::info(args.agent, "Hello from rig_harness_in_3d."));
 }
 
-/// 通知在转写里的历史（真实数据：每条 [`Notice`] 的文本行）。
-///
-/// 上游 `rig-tui` 把 `Notice` 长期留在转写里；这里同样保留，面板的窗口化
-/// （[`pane::TranscriptRows`] -> `PanelRows`）每帧从这段历史尾部取可见窗口。
-#[derive(Resource, Default)]
-pub struct NoticeLog {
-    rows: Vec<panels::KeyedRow>,
-    /// 下一个行 key。用高位段，和 batch 里 `DefaultHasher` 生成的 key 分开，
-    /// 增量 diff 时不会把通知行和工具行对错。
-    next_key: u64,
-}
-
-impl NoticeLog {
-    /// 行 key 的高位段（"notice" 的 ASCII 起头，便于看日志时辨认）。
-    const KEY_BASE: u64 = 0x6e6f_7469_0000_0000;
-
-    /// 历史里的行数。
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// 历史里的行（只读，测试断言用）。
-    pub fn rows(&self) -> &[panels::KeyedRow] {
-        &self.rows
-    }
-
-    /// 把一条通知按行记进历史；每种级别用上游 `notice_lines` 的同一种颜色。
-    fn remember(&mut self, notice: &Notice) {
-        let style = match notice.level {
-            NoticeLevel::Info => Style::default().fg(RColor::Magenta),
-            NoticeLevel::Warn => Style::default().fg(RColor::Yellow),
-            NoticeLevel::Error => Style::default().fg(RColor::Red),
-        };
-        let mut lines: Vec<&str> = notice.text.lines().collect();
-        if lines.is_empty() {
-            lines.push("");
-        }
-        for line in lines {
-            let row = transcript::Row::new(Line::from(Span::styled(line.to_string(), style)));
-            let hash = hash_row(&row);
-            debug_assert!(self.next_key < 1 << 32, "通知行 key 的计数器溢出低位段");
-            let key = Self::KEY_BASE | self.next_key;
-            self.next_key += 1;
-            self.rows.push(panels::KeyedRow { key, hash, row });
-        }
-    }
-}
-
-/// 行内容的 hash（和 `rig_feathers::batch` 里增量刷新用的是同一套判定：
-/// 文本 + 样式都变才算变）。
-fn hash_row(row: &transcript::Row) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for span in &row.line.spans {
-        span.content.hash(&mut hasher);
-        format!("{:?}", span.style).hash(&mut hasher);
-    }
-    for span in row.right.iter().flat_map(|right| right.spans.iter()) {
-        span.content.hash(&mut hasher);
-        format!("{:?}", span.style).hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 /// 本模板的 harness 扩展插件。
 ///
-/// * 注册 `/hello`（上游 [`AppCommandsExt`]）；
+/// * 注册 `/hello`（上游 [`AppCommandsExt`]）与 `/setting`；
 /// * 输入框里以 `/` 开头的提交 -> [`RunCommand`]（真命令链路，不伪造结果）；
-/// * [`Notice`] -> [`NoticeLog`] -> [`pane::TranscriptRows`]：形成
-///   "命令 → 通知 → 转写面板行"的链路。
+/// * [`Notice`] -> [`NoticeHistory`] -> 转写引擎（`TextId::Notice`）：形成
+///   "命令 → 通知 → 转写面板行"的链路，只有这一条；
+/// * 状态行每帧从真实 ECS 资源刷新；
+/// * `[view] hide_status` 真的隐藏状态面板。
 ///
-/// 通知行的合成放在 [`rig_feathers::FeathersSystems::Fit`]，且排在
-/// [`pane::window_transcript`] 之前：先把通知接在整段转写末尾，再由窗格按面板高度
-/// 窗口化写入 `PanelRows`。批处理插件（demo 的 `BatchPlugin`）每帧在 `Draw`
-/// 里重建 `TranscriptRows`，所以这里每帧都把完整通知历史重新接一遍，并先剥掉
-/// 上一帧接的那段（key 完全一致才剥），两种来源都不会重复。
+/// 通知回填放在 [`rig_feathers::FeathersSystems::Fit`]，排在
+/// [`rig_feathers::batch::collect_rows`] 之后、[`pane::window_transcript`] 之前：
+/// 先让引擎拿到这一帧的对话行，再把通知历史交给引擎，最后才窗口化。
 pub struct HarnessExtPlugin;
 
 impl Plugin for HarnessExtPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<NoticeLog>()
-            // 视图层通常已经由 PanePlugin 初始化；单独用本插件时也要能跑。
+        // `[view]`：路径/默认值/降级都在 settings 模块里；必须在其他系统之前。
+        settings::register(app);
+
+        app.init_resource::<NoticeHistory>()
+            // 视图层通常已经初始化；单独用本插件时也要能跑。
             .init_resource::<pane::TranscriptRows>()
+            .init_resource::<rig_feathers::panels::PanelRows>()
+            .init_resource::<transcript::Transcript>()
+            .init_resource::<rig_tui::AppStatus>()
             .add_command("hello", "Say hello", hello)
+            .add_command(
+                "setting",
+                "Show or change a view setting: /setting hide_status <true|false>",
+                settings::setting,
+            )
             .add_systems(
                 Update,
                 run_typed_prompts.run_if(resource_exists::<Messages<PromptSubmitted>>),
             )
             .add_systems(
                 Update,
-                notices_to_transcript
+                notice::notices_to_transcript
                     .in_set(rig_feathers::FeathersSystems::Fit)
+                    .after(rig_feathers::batch::collect_rows)
                     .before(pane::window_transcript),
+            )
+            .add_systems(
+                Update,
+                status::sync_status_items
+                    .in_set(rig_feathers::FeathersSystems::Prepare)
+                    .before(rig_feathers::status::status_rows),
+            )
+            .add_systems(
+                Update,
+                status::apply_view_settings
+                    .in_set(rig_feathers::FeathersSystems::Draw)
+                    .after(rig_feathers::status::status_rows),
             );
     }
 }
 
-/// 输入框提交以 `/` 开头的文本时，交给上游命令系统跑（`/hello` 就是这样到
-/// [`hello`] 的）。发给哪个 agent 用 harness 的 `main_agent` 规则。
+/// 输入框提交以 `/` 开头的文本时，交给上游命令系统跑（`/hello`、`/setting`
+/// 就是这样到的）。发给哪个 agent 用 harness 的 `main_agent` 规则。
 fn run_typed_prompts(
     mut submitted: MessageReader<editor::PromptSubmitted>,
     agents: MainAgentQuery,
@@ -332,50 +298,12 @@ fn run_typed_prompts(
     }
 }
 
-/// 收集新通知，并把完整通知历史接在转写末尾（`Fit`，窗口化之前）。
-fn notices_to_transcript(
-    mut notices: MessageReader<Notice>,
-    agents: Query<(), With<Agent>>,
-    mut log: ResMut<NoticeLog>,
-    mut transcript: ResMut<pane::TranscriptRows>,
-    // 上一帧接在 TranscriptRows 尾部的通知行 key。
-    mut appended: Local<Vec<u64>>,
-) {
-    for notice in notices.read() {
-        // 关于某个已经不在的 agent 的通知不显示（上游同样的过滤）。
-        if let Some(agent) = notice.agent
-            && !agents.contains(agent)
-        {
-            continue;
-        }
-        log.remember(notice);
-    }
-
-    // 先剥掉上一帧接的那段（只有 key 对得上才剥：批处理插件这一帧重建过转写，
-    // 尾巴就对不上，整段都是新的基础行）。
-    if !appended.is_empty() {
-        let start = transcript.0.len().saturating_sub(appended.len());
-        let is_ours = transcript.0.len() >= appended.len()
-            && transcript.0[start..]
-                .iter()
-                .map(|row| row.key)
-                .eq(appended.iter().copied());
-        if is_ours {
-            transcript.0.truncate(start);
-        }
-    }
-
-    transcript.0.extend(log.rows.iter().cloned());
-    appended.clear();
-    appended.extend(log.rows.iter().map(|row| row.key));
-}
-
 /// 业务插件都实现它，方便在 `main` 里一行装配。
 pub trait BusinessPlugin: Plugin {}
 
 /// 前端模块的再导出，业务代码只从这里拿。
 pub mod prelude {
-    pub use crate::{HarnessExt, HarnessExtPlugin, NoticeLog, hello};
+    pub use crate::{HarnessExt, HarnessExtPlugin, NoticeHistory, SettingsPath, ViewSettings, hello};
     pub use rig_feathers::{
         batch::{BatchPlugin, CompletedCalls},
         editor::{Editor, PromptSubmitted, SubmittedPrompts},
@@ -400,39 +328,58 @@ mod tests {
     //! 无窗口测试：`Minimal` 的插件集合里跑真内核 + 命令 + 通知 + 面板窗口化。
     //!
     //! 不建窗口、不渲染、不截图：断言全部落在 ECS 资源上（`Notice` 消息、
-    //! `PanelRows` 的行数/行文本），这是链路本身，而不是画面。
+    //! `TranscriptRows`/`PanelRows` 的行数/行文本、`AppStatus` 的条目），这是
+    //! 链路本身，而不是画面。
 
     use super::*;
     use bevy::app::TaskPoolPlugin;
-    use rig_ecs::prelude::{AgentId, spawn_root};
-    use rig_feathers::FeathersSystems;
+    use rig_core::conversation::Conversation as Talk;
+    use rig_core::message::{AssistantContent, AssistantMessage, Message};
+    use rig_ecs::prelude::{AgentId, Conversation, TurnOf, spawn_root};
+    use rig_feathers::batch::BatchPlugin;
+    use rig_feathers::editor::SubmittedPrompts;
     use rig_feathers::frame::{CellRect, PanelArea, PanelAreas, PanelInset, PanelRoots};
-    use rig_feathers::pane::TranscriptRows;
+    use rig_feathers::pane::PanePlugin;
     use rig_feathers::panels::{PanelId, PanelRows};
     use rig_harness::harness_protocol::SessionDir;
+    use rig_harness::main_agent::ShownAgent;
+    use rig_harness::prelude::Settings;
+    use rig_tui::{AppStatus, Side, StatusItem, Tone};
 
-    /// 内核 + 本模板扩展（含 `/hello`），不带视图/窗口。
+    /// 内核 + 本模板扩展（含 `/hello`、`/setting`），不带视图/窗口。
     fn headless_app() -> App {
         let mut app = App::new();
         app.add_plugins(TaskPoolPlugin::default());
         app.add_plugins(rig_ecs::AgentPlugin);
+        // 测试不读真实 RIG_HOME：显式给空设置和一个临时路径。
+        app.insert_resource(Settings::from_toml(""));
+        app.insert_resource(SettingsPath(
+            std::env::temp_dir().join("rig-harness-in-3d-headless-settings.toml"),
+        ));
         app.add_plugins(HarnessExtPlugin);
         app
     }
 
-    /// 内核 + 命令 + 通知 + 窗格窗口化；不要 UI/渲染/输入插件。
+    /// 内核 + 真对话引擎（`BatchPlugin`）+ 窗格 + 本模板扩展；不建窗口。
     ///
     /// 面板根与 10 行区域是手工放的：`window_transcript` 只依赖这两个资源，
-    /// 这样测试断言的是"通知 -> 转写 -> 可见面板行"的数据链，而不是布局。
-    fn transcript_app() -> App {
+    /// 这样测试断言的是"命令/通知 -> 引擎 -> 可见面板行"的数据链，而不是布局。
+    fn engine_app() -> App {
         let mut app = App::new();
         app.add_plugins(TaskPoolPlugin::default());
         app.add_plugins(rig_ecs::AgentPlugin);
-        app.add_plugins(rig_feathers::pane::PanePlugin);
+        app.add_plugins(PanePlugin);
+        // 和生产顺序一致：HarnessExtPlugin 先于 main.rs 里的 BatchPlugin。
+        app.insert_resource(Settings::from_toml(""));
+        app.insert_resource(SettingsPath(
+            std::env::temp_dir().join("rig-harness-in-3d-engine-settings.toml"),
+        ));
         app.add_plugins(HarnessExtPlugin);
-        // 窗格插件不装输入/面板插件，补它校验的这两个资源。
+        app.add_plugins(BatchPlugin);
+        // 窗格/批处理要的输入与资源；`SubmittedPrompts` 平时由 EditorPlugin 初始化。
         app.insert_resource(bevy::input::ButtonInput::<KeyCode>::default());
-        app.insert_resource(PanelRows::default());
+        app.init_resource::<PanelRows>()
+            .init_resource::<SubmittedPrompts>();
 
         let root = app.world_mut().spawn(Name::new("panel:Transcript")).id();
         let mut roots = PanelRoots::default();
@@ -464,6 +411,45 @@ mod tests {
             .to_vec()
     }
 
+    /// 引擎写出的整段转写文本（未窗口化）。
+    fn transcript_text(app: &App) -> String {
+        app.world()
+            .resource::<pane::TranscriptRows>()
+            .0
+            .iter()
+            .map(|keyed| panel_text(std::slice::from_ref(keyed)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn status_text(app: &App, name: &str) -> Option<String> {
+        app.world()
+            .resource::<AppStatus>()
+            .0
+            .iter()
+            .find(|item| item.name == name)
+            .map(|item| item.text.clone())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rig-harness-in-3d-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn settings_app(path: &std::path::Path) -> App {
+        let mut app = App::new();
+        app.add_plugins(TaskPoolPlugin::default());
+        app.add_plugins(rig_ecs::AgentPlugin);
+        settings::install(&mut app, path.to_path_buf());
+        app.add_plugins(HarnessExtPlugin);
+        app
+    }
+
     #[test]
     fn harness_ext_reads_the_real_session_and_the_upstream_command_registry() {
         let mut app = headless_app();
@@ -472,11 +458,18 @@ mod tests {
             std::process::id()
         ));
         app.insert_resource(SessionPaths(SessionDir::at(dir.clone())));
+        app.insert_resource(SettingsPath(dir.join("settings.toml")));
 
-        assert_eq!(app.session_dir(), Some(dir));
+        assert_eq!(app.session_dir(), Some(dir.clone()));
+        assert_eq!(app.settings_file(), Some(dir.join("settings.toml")));
         assert!(
             app.commands().iter().any(|name| name == "/hello"),
             "commands() 应该读出 add_command 注册的 /hello，实际 {:?}",
+            app.commands()
+        );
+        assert!(
+            app.commands().iter().any(|name| name == "/setting"),
+            "commands() 应该读出 add_command 注册的 /setting，实际 {:?}",
             app.commands()
         );
     }
@@ -498,7 +491,7 @@ mod tests {
             .collect();
         assert!(
             notices.iter().any(|notice| notice.agent == Some(agent)
-                && notice.level == NoticeLevel::Info
+                && notice.level == rig_ecs::prelude::NoticeLevel::Info
                 && notice.text.contains("Hello")),
             "命令应写出 info Notice，实际 {notices:?}"
         );
@@ -506,7 +499,7 @@ mod tests {
 
     #[test]
     fn a_command_reaches_the_transcript_panel_as_a_notice_row() {
-        let mut app = transcript_app();
+        let mut app = engine_app();
         let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
         app.update();
         assert!(
@@ -514,7 +507,7 @@ mod tests {
             "还没有通知时转写面板应为空"
         );
 
-        // 真命令：RunCommand -> /hello -> Notice -> NoticeLog -> TranscriptRows -> PanelRows
+        // 真命令：RunCommand -> /hello -> Notice -> 引擎 TextId::Notice -> 面板行
         app.world_mut().trigger(RunCommand::new(agent, "hello"));
         app.update();
 
@@ -522,22 +515,63 @@ mod tests {
         assert!(!rows.is_empty(), "命令后转写面板应该有通知行");
         let text = panel_text(&rows);
         assert!(text.contains("Hello"), "面板行里应有通知文本，实际 {text:?}");
-        let shown = rows.len();
+        assert_eq!(
+            text.matches("Hello from rig_harness_in_3d.").count(),
+            1,
+            "通知只应出现一次，实际 {text:?}"
+        );
+        assert_eq!(app.world().resource::<NoticeHistory>().len(), 1);
 
         // 通知历史不是每帧重新追加的假数据：再跑两帧行数不变。
         app.update();
         app.update();
+        let text = panel_text(&transcript_rows(&app));
         assert_eq!(
-            transcript_rows(&app).len(),
-            shown,
-            "通知行不能每帧重复追加"
+            text.matches("Hello from rig_harness_in_3d.").count(),
+            1,
+            "通知不能每帧重复追加，实际 {text:?}"
         );
-        assert_eq!(app.world().resource::<NoticeLog>().len(), shown);
+        assert_eq!(app.world().resource::<NoticeHistory>().len(), 1);
+    }
+
+    #[test]
+    fn a_notice_is_drawn_once_and_after_the_conversation_it_follows() {
+        let mut app = engine_app();
+        let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
+        let mut talk = Talk::new();
+        talk.push(Message::user("question from the conversation"));
+        talk.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("reply from the conversation"),
+        ])));
+        app.world_mut()
+            .entity_mut(agent)
+            .insert(Conversation(talk));
+        app.insert_resource(ShownAgent(Some(agent)));
+        app.update();
+
+        app.world_mut()
+            .write_message(Notice::info(Some(agent), "notice from the harness"));
+        for _ in 0..3 {
+            app.update();
+            let text = transcript_text(&app);
+            assert_eq!(
+                text.matches("notice from the harness").count(),
+                1,
+                "构造的 Notice 只能出现一次，实际 {text:?}"
+            );
+            assert!(
+                text.find("reply from the conversation")
+                    .zip(text.find("notice from the harness"))
+                    .is_some_and(|(reply, notice)| reply < notice),
+                "通知应排在它跟随的对话之后，实际 {text:?}"
+            );
+        }
+        assert_eq!(app.world().resource::<NoticeHistory>().len(), 1);
     }
 
     #[test]
     fn a_slash_prompt_from_the_editor_runs_the_command_and_reaches_the_panel() {
-        let mut app = transcript_app();
+        let mut app = engine_app();
         // 输入面板（EditorPlugin）会在 build 里注册这条消息；这里只测桥本身，
         // 所以直接注册并写一条"用户提交了 /hello"的消息。
         app.add_message::<editor::PromptSubmitted>();
@@ -557,35 +591,207 @@ mod tests {
             "输入框 /hello 应经命令系统落到转写面板，实际 {:?}",
             panel_text(&rows)
         );
+        assert_eq!(panel_text(&rows).matches("Hello").count(), 1);
     }
 
     #[test]
-    fn a_rebuilt_transcript_keeps_the_notice_history() {
-        // 模拟 demo 的 BatchPlugin：它每帧在 Draw 里把 TranscriptRows 整个重建。
-        fn rebuild_like_batch(mut transcript: ResMut<TranscriptRows>) {
-            transcript.0 = Vec::new();
-        }
+    fn a_missing_settings_file_uses_defaults() {
+        let dir = temp_dir("settings-missing");
+        let app = settings_app(&dir.join("settings.toml"));
+        assert!(!app.world().resource::<ViewSettings>().hide_status);
+        assert!(
+            app.world().resource::<Settings>().problems().is_empty(),
+            "缺失文件是空设置，不是错误"
+        );
+    }
 
-        let mut app = transcript_app();
-        // 没有 FeathersViewPlugin 时自己把 Draw -> Fit 的顺序配上；
-        // 生产环境里这条链由 FeathersViewPlugin 配。
-        app.configure_sets(
-            Update,
-            (FeathersSystems::Draw, FeathersSystems::Fit).chain(),
-        )
-        .add_systems(Update, rebuild_like_batch.in_set(FeathersSystems::Draw));
+    #[test]
+    fn a_bad_settings_file_degrades_to_defaults_without_a_problem() {
+        let dir = temp_dir("settings-bad");
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "this is not = [ toml").unwrap();
+        let app = settings_app(&path);
+        assert!(
+            !app.world().resource::<ViewSettings>().hide_status,
+            "坏文件应降级为默认值"
+        );
+        assert!(
+            app.world().resource::<Settings>().problems().is_empty(),
+            "降级后不能把 problems 留给 launcher 去拒绝启动"
+        );
+    }
 
+    #[test]
+    fn a_mistyped_view_table_degrades_to_defaults() {
+        let dir = temp_dir("settings-typo");
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "[view]\nhide_status = \"maybe\"\n").unwrap();
+        let app = settings_app(&path);
+        assert!(
+            !app.world().resource::<ViewSettings>().hide_status,
+            "[view] 类型错应降级为默认值"
+        );
+        assert!(
+            app.world().resource::<Settings>().problems().is_empty(),
+            "降级后不能把 problems 留给 launcher"
+        );
+    }
+
+    #[test]
+    fn the_setting_command_changes_and_saves_the_file() {
+        let dir = temp_dir("settings-command");
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "[view]\nhide_status = false\n").unwrap();
+        let mut app = settings_app(&path);
         let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
         app.update();
-        app.world_mut().trigger(RunCommand::new(agent, "hello"));
-        for _ in 0..3 {
-            app.update();
-            let text = panel_text(&transcript_rows(&app));
-            assert!(
-                text.contains("Hello"),
-                "重建转写后通知行仍在（实际 {text:?}）"
-            );
+
+        app.world_mut()
+            .trigger(RunCommand::new(agent, "setting hide_status true"));
+        app.update();
+
+        assert!(
+            app.world().resource::<ViewSettings>().hide_status,
+            "/setting 应改内存里的设置"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("hide_status = true"),
+            "设置应写回磁盘，实际 {text:?}"
+        );
+        let loaded = Settings::read(&path);
+        assert!(
+            loaded
+                .get::<ViewSettings>("view")
+                .expect("[view] 应能读回")
+                .hide_status,
+            "重新读文件应得到 true"
+        );
+    }
+
+    #[test]
+    fn saving_view_settings_preserves_other_tables() {
+        let dir = temp_dir("settings-save");
+        let path = dir.join("settings.toml");
+        std::fs::write(
+            &path,
+            "[colour]\nname = \"x\"\n\n[view]\nhide_status = false\n\n[tail]\nn = 1\n",
+        )
+        .unwrap();
+
+        settings::save(&path, &ViewSettings { hide_status: true }).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[colour]\nname = \"x\""), "其他表要保留：{text:?}");
+        assert!(text.contains("[tail]\nn = 1"), "后面的表要保留：{text:?}");
+        assert_eq!(text.matches("[view]").count(), 1, "不能写两份 [view]：{text:?}");
+        assert!(text.contains("hide_status = true"));
+        assert!(!text.contains("hide_status = false"));
+
+        let loaded = Settings::read(&path);
+        assert!(loaded.problems().is_empty(), "保存后的文件应是合法 TOML");
+        assert!(loaded.get::<ViewSettings>("view").unwrap().hide_status);
+    }
+
+    #[test]
+    fn saving_settings_creates_a_missing_file() {
+        let dir = temp_dir("settings-create");
+        let path = dir.join("settings.toml");
+        assert!(!path.exists());
+
+        settings::save(&path, &ViewSettings { hide_status: true }).unwrap();
+
+        let loaded = Settings::read(&path);
+        assert!(loaded.problems().is_empty(), "新建的文件应是合法 TOML");
+        assert!(loaded.get::<ViewSettings>("view").unwrap().hide_status);
+    }
+
+    #[test]
+    fn hide_status_setting_really_hides_the_status_panel() {
+        let dir = temp_dir("settings-hide-status");
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, "[view]\nhide_status = true\n").unwrap();
+        let mut app = settings_app(&path);
+        app.add_plugins(rig_feathers::status::StatusPlugin);
+        app.init_resource::<PanelRows>()
+            .init_resource::<PanelAreas>()
+            .init_resource::<PanelRoots>();
+        spawn_root(app.world_mut(), AgentId("main".into()));
+
+        app.update();
+        assert!(
+            app.world()
+                .resource::<PanelRows>()
+                .get(PanelId::Status)
+                .is_empty(),
+            "hide_status = true 时状态面板应为空"
+        );
+
+        app.world_mut()
+            .resource_mut::<ViewSettings>()
+            .hide_status = false;
+        app.update();
+        assert!(
+            !app.world()
+                .resource::<PanelRows>()
+                .get(PanelId::Status)
+                .is_empty(),
+            "hide_status = false 时状态面板应重新出现"
+        );
+    }
+
+    #[test]
+    fn status_items_come_from_real_ecs_resources() {
+        let mut app = headless_app();
+        let dir = temp_dir("status").join("1700000000-42");
+        app.insert_resource(SessionPaths(SessionDir::at(dir)));
+        let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
+
+        let mut talk = Talk::new();
+        talk.push(Message::user("one"));
+        talk.push(Message::user("two"));
+        app.world_mut()
+            .entity_mut(agent)
+            .insert(Conversation(talk));
+        // 真 `TurnOf`：关系目标 `ActiveTurn` 会插到 agent 上。
+        app.world_mut().spawn(TurnOf(agent));
+        // 别的插件已有的条目不能被状态同步覆盖。
+        app.world_mut().resource_mut::<AppStatus>().0.show(
+            StatusItem::new("other", Side::Right, 99, 10).says("other plugin", Tone::Plain),
+        );
+
+        app.update();
+
+        let session = status_text(&app, "session").expect("session 条目");
+        assert!(session.contains("1700000000-42"), "会话 id 来自 SessionPaths：{session:?}");
+        assert_eq!(status_text(&app, "agents").as_deref(), Some("1 agent"));
+        assert_eq!(status_text(&app, "turn").as_deref(), Some("turn running"));
+        assert_eq!(
+            status_text(&app, "conversation").as_deref(),
+            Some("2 msgs")
+        );
+        assert_eq!(status_text(&app, "tasks").as_deref(), Some("0 tasks"));
+        assert_eq!(
+            status_text(&app, "tokens"),
+            None,
+            "没有模型的真实 token 时不画假数字"
+        );
+        assert_eq!(
+            status_text(&app, "other").as_deref(),
+            Some("other plugin"),
+            "别的插件的 AppStatus 条目不能被覆盖"
+        );
+
+        let all: String = app
+            .world()
+            .resource::<AppStatus>()
+            .0
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for fake in ["312 tokens", "ctx 12%", "no model"] {
+            assert!(!all.contains(fake), "演示数据 `{fake}` 不能再出现：{all:?}");
         }
-        assert_eq!(app.world().resource::<NoticeLog>().len(), 1);
     }
 }

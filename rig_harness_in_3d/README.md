@@ -33,7 +33,7 @@ cp -r rig_harness_in_3d my_app && cd my_app
 ```sh
 ../tools/fetch_cjk_font.sh        # 字体（3.2 MB 子集）
 CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home cargo build
-BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/my_app ./target/debug/my_app
+BEVY_ASSET_ROOT=$PWD RIG_HOME=/path/to/rig-home RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 ```
 
 - `BEVY_ASSET_ROOT` 必须是本 crate（dev 期 Bevy 不去 `target/debug/assets` 找）；
@@ -43,11 +43,39 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 
 | 位置 | 作用 |
 |---|---|
-| `app(title)` | 装**真 harness**：`windowed(DefaultPlugins)` + `RigHarnessPlugins` + `feathers_in_3d` + `rig_feathers`；会话由 `Home::new_session()` 建，路径来自 `RIG_HOME` |
+| `app(title)` | 装**真 harness**：`windowed(DefaultPlugins)` + `RigHarnessPlugins` + `feathers_in_3d` + `rig_feathers`；会话由 `Home::new_session()` 建，路径来自 `RIG_HOME`；`RIG_HOME/settings.toml` 在启动时读 |
 | `KernelPlugin`（demo） | 注册工具（`add_tool`）、闸门（`Stage::Gate`）、spawn agent 与示例调用 |
-| `HarnessExt`（trait） | harness 服务的读取口：`session_dir()` 读真实 `SessionPaths`，`commands()` 扫上游注册的 `SlashCommand` 实体 |
-| `HarnessExtPlugin` | 把 `/hello` 注册成样板命令，并把 `Notice` 桥进转写面板（命令 → 通知 → 行，真链路） |
+| `HarnessExt`（trait） | harness 服务的读取口：`session_dir()` 读真实 `SessionPaths`，`settings_file()` 读真实 `SettingsPath`，`commands()` 扫上游注册的 `SlashCommand` 实体 |
+| `HarnessExtPlugin` | `/hello`、`/setting`、输入框 `/命令` 桥、`Notice` → 转写引擎、真实状态行、`[view]` 设置 |
 | `prelude` | 业务只用这里的类型（含 rig-tui 的 look 契约，不用直接依赖 rig-tui） |
+
+## 设置（`RIG_HOME/settings.toml`）
+
+路径规则用上游的 `Home::settings()`：只读 `RIG_HOME`，项目目录没有 rig 设置。
+本模板读 `[view]` 一段：
+
+```toml
+[view]
+hide_status = false
+```
+
+- `hide_status = true` 会让状态面板整行消失；
+- 在输入框里 `/setting hide_status true` 改内存并写回同一个文件（文件里其他表保留）；
+- 文件不存在：用默认值；文件读不了 / 不是 TOML / `[view]` 键错：`warn!` 后用默认值继续，
+  不 panic，也不会让上游 launcher 的 `Settings::problems` 拒绝启动。
+
+## 通知只有一条路
+
+`Notice` → `NoticeHistory` → 转写引擎的 `TextId::Notice` → `TranscriptRows` → 面板行。
+应用层不再自己拼行（上一轮的 `NoticeLog` 已删），所以真 agent 的通知不会画两遍；
+顺序、折行、和对话一起回滚都归 `rig_feathers::transcript::Transcript` 管。
+
+## 状态行
+
+条目每帧从真实 ECS 资源刷新：`session`（`SessionPaths`）、`agents`、`turn`
+（`ActiveTurn`）、`conversation`（消息条数）、`tasks`（`Running`）、`tokens`
+（只有 `LastUsage` 真报过才画）。没有 `no model / 312 tokens / ctx 12%` 之类的
+演示数字；其他插件放进 `AppStatus` 的条目不被覆盖。
 
 ## 示例业务（可整段删掉）
 
@@ -58,6 +86,8 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 ## 已知限制
 
 - 模型未接：调用由 `ToolRequest` 注入，不是模型发起（没有 API key）；接缝是 `rig_feathers::batch::ReplyStream`；
-- 设置（`Settings`）与 `/resume` 会话恢复还没接线；`Notice` 目前只进转写，还没进状态行；
+- `rig-feathers` 的 `collect_rows` 目前会 `retain_text` 掉 `TextId::Notice`，所以本模板在
+  `Fit` 里把通知历史重新交给引擎（见 `src/notice.rs`）；上游保留 Notice 后这段回填可删；
+- `/resume` 会话恢复还没接线；`Notice` 目前只进转写，还没进状态行；
 - 文字是位图图集，~6× 放大发糊；裁剪只到面板边界；
 - 相机只有键盘路径验证过（无实体手柄）。
