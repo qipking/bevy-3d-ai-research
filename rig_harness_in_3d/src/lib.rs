@@ -101,13 +101,32 @@ pub use settings::{SettingsPath, ViewSettings};
 /// ```
 pub fn app(title: &str) -> App {
     // 会话目录：SessionPlugin 只读不建（正常由 launcher 建），嵌入时自己开一个。
-    let home = Home::from_env();
-    let (_id, dir) = home.new_session().unwrap_or_else(|failure| {
-        panic!(
-            "cannot create a session in {}: {failure}（把 RIG_HOME 指向可写目录再跑）",
-            home.root().display()
-        )
-    });
+    //
+    // 不 panic：`~/.rig` 在只读环境里（沙箱、容器、只读家目录）建不出会话，
+    // 这时退到 `./.rig-home`——否则程序一启动就退出，看起来就是"窗口什么都没出现"。
+    let (home, dir) = match Home::from_env().new_session() {
+        Ok((_id, dir)) => (Home::from_env(), dir),
+        Err(failure) => {
+            let fallback = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".rig-home");
+            warn!(
+                "[session] 默认 RIG_HOME 建不出会话（{failure}），改用 {}",
+                fallback.display()
+            );
+            std::fs::create_dir_all(&fallback).ok();
+            let home = Home::at(fallback);
+            match home.new_session() {
+                Ok((_id, dir)) => (home, dir),
+                Err(failure) => {
+                    error!(
+                        "两条路都建不出会话（{failure}）：把 RIG_HOME 指向一个可写目录再跑"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
 
     let mut app = App::new();
     // 系统出错按 rig-harness 的方式记成数据，而不是让 winit 停下来。
