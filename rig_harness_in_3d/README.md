@@ -8,12 +8,12 @@
 |---|---|---|
 | `rig-ecs`（kernel，无界面） | 直接依赖，不改 | agent / turn / call / Gate / Ask |
 | `rig-harness`（粘合层：会话、命令、设置、工作区、插件） | **本 crate** | 装配 + 扩展点，面向 3D app 而不是 coding CLI |
-| `rig-tui`（终端视图） | `rig-feathers` | 另一个前端实现（feathers + 3D） |
+| `rig-tui`（终端视图） | `rig_niri` | 另一个前端实现（feathers + 3D） |
 | —（终端设备） | `feathers_in_3d` | route B 渲染：SDF 几何 / 字形 / 排序 / 裁剪 / 拾取 |
 
 ```
 rig_harness_in_3d（本 crate：装配 + 扩展点）
-   ├── rig-feathers（视图：RenderBatch+look、多面板、状态、输入、picker、Front）
+   ├── rig_niri（视图：RenderBatch+look、多面板、状态、输入、picker、Front）
    │        └── feathers_in_3d（渲染）
    └── rig-ecs（内核）+ rig-harness（Ask/Pick 服务）
 ```
@@ -37,13 +37,13 @@ BEVY_ASSET_ROOT=$PWD RIG_HOME=/path/to/rig-home RF_SHOT_DIR=../render/my_app ./t
 ```
 
 - `BEVY_ASSET_ROOT` 必须是本 crate（dev 期 Bevy 不去 `target/debug/assets` 找）；
-- `assets/` 现在是指向 `../rig-feathers/assets` 的符号链接（字体等共享资源）；fork 出去后换成自己的。
+- `assets/` 现在是指向 `../rig_niri/assets` 的符号链接（字体等共享资源）；fork 出去后换成自己的。
 
 ## 代码里的扩展点
 
 | 位置 | 作用 |
 |---|---|
-| `app(title)` | 装**真 harness**：`windowed(DefaultPlugins)` + `RigHarnessPlugins` + `feathers_in_3d` + `rig_feathers`；会话由 `Home::new_session()` 建，路径来自 `RIG_HOME`；`RIG_HOME/settings.toml` 在启动时读 |
+| `app(title)` | 装**真 harness**：`windowed(DefaultPlugins)` + `RigHarnessPlugins` + `feathers_in_3d` + `rig_niri`；会话由 `Home::new_session()` 建，路径来自 `RIG_HOME`；`RIG_HOME/settings.toml` 在启动时读 |
 | `KernelPlugin`（demo） | 注册工具（`add_tool`）、闸门（`Stage::Gate`）、spawn agent 与示例调用 |
 | `HarnessExt`（trait） | harness 服务的读取口：`session_dir()` 读真实 `SessionPaths`，`settings_file()` 读真实 `SettingsPath`，`commands()` 扫上游注册的 `SlashCommand` 实体 |
 | `HarnessExtPlugin` | `/hello`、`/setting`、输入框 `/命令` 桥、`Notice` → 转写引擎、真实状态行、`[view]` 设置 |
@@ -68,7 +68,7 @@ hide_status = false
 
 `Notice` → `NoticeHistory` → 转写引擎的 `TextId::Notice` → `TranscriptRows` → 面板行。
 应用层不再自己拼行（上一轮的 `NoticeLog` 已删），所以真 agent 的通知不会画两遍；
-顺序、折行、和对话一起回滚都归 `rig_feathers::transcript::Transcript` 管。
+顺序、折行、和对话一起回滚都归 `rig_niri::transcript::Transcript` 管。
 
 ## 状态行
 
@@ -85,8 +85,8 @@ hide_status = false
 
 ## 已知限制
 
-- 模型未接：调用由 `ToolRequest` 注入，不是模型发起（没有 API key）；接缝是 `rig_feathers::batch::ReplyStream`；
-- `rig-feathers` 的 `collect_rows` 目前会 `retain_text` 掉 `TextId::Notice`，所以本模板在
+- 模型未接：调用由 `ToolRequest` 注入，不是模型发起（没有 API key）；接缝是 `rig_niri::batch::ReplyStream`；
+- `rig_niri` 的 `collect_rows` 目前会 `retain_text` 掉 `TextId::Notice`，所以本模板在
   `Fit` 里把通知历史重新交给引擎（见 `src/notice.rs`）；上游保留 Notice 后这段回填可删；
 - `/resume` 会话恢复还没接线；`Notice` 目前只进转写，还没进状态行；
 - 文字是位图图集，~6× 放大发糊；裁剪只到面板边界；

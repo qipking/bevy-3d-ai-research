@@ -26,9 +26,11 @@
 //! | 双击 | [`Selection::press_kind`]（或用 [`Selection::press`] 自动数） | 选中当前词 |
 //! | 三击 | 同上 | 选中整行 |
 //! | 点空白 | 行越界，或 [`Selection::clear`] | 清除选区 |
+//! | 滚轮 | [`crate::pane::pane_wheel`] | 滚走的内容收起选区（滚动本身在 `pane.rs`） |
+//! | 窗口/面板尺寸变化 | [`clear_selection_on_resize`] | 清除选区（上游 `Event::Resize`） |
 //!
 //! 上游 0.47 本身只有拖选，没有双击/三击；这里按任务要求补齐终端惯例。
-//! 滚轮和键盘 Shift+方向不在本模块范围内。
+//! 键盘 Shift+方向不在本模块范围内。
 
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -37,6 +39,7 @@ use bevy::picking::events::{PointerMove, PointerPress, PointerRelease};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 use bevy::ui::ComputedNode;
+use bevy::window::WindowResized;
 use feathers_in_3d::WorldPanel;
 use rig_tui::AppStatus;
 use rig_tui::ratatui::style::{Modifier, Style};
@@ -45,7 +48,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::clipboard::{self, Copied, MemoryClipboard};
-use crate::panels::{PanelId, PanelRows, RowLayout};
+use crate::panels::{PanelId, PanelRoots, PanelRows, RowLayout};
 use crate::transcript::Row;
 
 /// 上游给选中格子加的样式：反色。调用方把选中区间套上它即可。
@@ -663,6 +666,81 @@ fn copy_released(
     }
 }
 
+/// 上一次看到的面板尺寸：`(面板根实体, UI 物理像素尺寸)`。
+///
+/// 只用来发现 [`clear_selection_on_resize`] 要处理的"面板尺寸变了"；没有选区
+/// 或面板查不到时是 `None`（不计 resize）。
+#[derive(Resource, Default, Debug)]
+pub struct PanelSizeSeen(Option<(Entity, Vec2)>);
+
+/// 面板尺寸变化多少物理像素才算 resize：f32 布局的抖动不算。
+const RESIZE_EPSILON: f32 = 0.5;
+
+/// resize 时清选区：上游 `input.rs` 的 `Event::Resize(width, height)` 分支
+/// （`view.selection = None`）。
+///
+/// 两种变化都算 resize：
+///
+/// - **窗口尺寸**：`WindowResized`（拖大拖小、换显示器）。上游收到终端 resize
+///   就先清选区，不等布局算完；
+/// - **面板尺寸**：选区所在面板的 [`ComputedNode`] 尺寸变了——帧布局/分裂树
+///   重排、编辑器面板长高把转写挤矮，都可能是窗口没动而面板动了。
+///
+/// 这里只清选区，不动滚动：行的窗口化在 [`crate::pane::window_transcript`] 里
+/// 每帧按当前区域重算（上游 resize 也只重排、清选区，不动滚动位置）。
+///
+/// 第一次看到一块面板的尺寸只记基准、不算 resize：否则选区刚落好就被自己清了。
+/// 面板尺寸资源缺失（没有面板/没有 UI 布局的测试 App）时退化成只看窗口 resize。
+pub fn clear_selection_on_resize(
+    mut resized: MessageReader<WindowResized>,
+    mut seen: ResMut<PanelSizeSeen>,
+    roots: Option<Res<PanelRoots>>,
+    nodes: Query<&ComputedNode>,
+    mut selection: ResMut<Selection>,
+) {
+    // 一帧里可能来好几条：读干净，只看有没有。
+    let window_resized = resized.read().count() > 0;
+
+    let panel_size = selection
+        .panel()
+        .and_then(|id| roots.as_deref().and_then(|roots| roots.entity(id)))
+        .and_then(|entity| {
+            let node = nodes.get(entity).ok()?;
+            Some((entity, node.size))
+        });
+
+    if window_resized {
+        if selection.panel().is_some() {
+            selection.clear();
+        }
+        // 布局这一帧还没按新窗口算完：下一帧重新记基准。
+        *seen = PanelSizeSeen(None);
+        return;
+    }
+
+    let Some((entity, size)) = panel_size else {
+        *seen = PanelSizeSeen(None);
+        return;
+    };
+
+    match seen.0 {
+        Some((seen_entity, seen_size)) if seen_entity == entity => {
+            if seen_size.abs_diff_eq(size, RESIZE_EPSILON) {
+                return;
+            }
+            // 同一块面板尺寸变了：行会按新尺寸重新窗口化，旧的选区下标不再
+            // 对应同一段内容（上游 resize 也清选区）。
+            selection.clear();
+            *seen = PanelSizeSeen(Some((entity, size)));
+        }
+        // 第一次看到这块面板（或选区换到了别的面板）：只记基准，按 resize 处理
+        // 会把刚拖好的选区立刻清掉。
+        _ => {
+            *seen = PanelSizeSeen(Some((entity, size)));
+        }
+    }
+}
+
 /// 鼠标 -> 选区：按下、拖动、松开；松手时把选中的文字写进剪贴板。
 ///
 /// 系统参数全都可以缺省（`Option<Res<...>>`），所以没有窗口/剪贴板/状态行
@@ -837,11 +915,13 @@ pub fn paint_hash(hash: u64, ranges: &[(usize, usize)]) -> u64 {
     hash ^ hasher.finish().rotate_left(1)
 }
 
-/// 选区接线的插件：注册 [`Selection`]、指针消息和 [`pointer_selection`]。
+/// 选区接线的插件：注册 [`Selection`]、指针消息、[`pointer_selection`] 和
+/// resize 清选区的 [`clear_selection_on_resize`]。
 ///
-/// 它需要 [`crate::panels::PanelsPlugin`]（`PanelRows`/`PanelRoots`/行实体上的
-/// [`RowLayout`]）和 `feathers_in_3d` 的 3D 拾取；没有这些资源时系统会被
-/// 跳过，不会 panic。系统放进 [`crate::FeathersSystems::Prepare`]：先处理鼠标，
+/// 它需要 [`crate::panels::PanelsPlugin`]（`PanelRows`/行实体上的 [`RowLayout`]）
+/// 和 `feathers_in_3d` 的 3D 拾取；没有这些资源时系统会被跳过，不会 panic。
+/// `PanelRoots` 缺失时 resize 只看窗口消息（面板尺寸那一半退化成 no-op）。
+/// 系统放进 [`crate::FeathersSystems::Prepare`]：先清 resize、再处理鼠标，
 /// 同一帧的 `Render` 就能画出新的高亮。
 ///
 /// 剪贴板：本插件**不**注册 `bevy_clipboard::ClipboardPlugin`（避免和
@@ -854,13 +934,20 @@ pub struct SelectionPlugin;
 impl Plugin for SelectionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Selection>()
+            .init_resource::<PanelSizeSeen>()
             .add_message::<Copied>()
+            // 生产里 `WindowPlugin` 已经注册了它；不建窗口的测试 App / 只加
+            // 本插件的 App 由这里补上（`add_message` 幂等）。
+            .add_message::<WindowResized>()
             .add_message::<PointerPress>()
             .add_message::<PointerMove>()
             .add_message::<PointerRelease>()
+            // resize 先清（清的是上一帧的旧选区），同一帧的按下/拖动再落新选区。
             .add_systems(
                 Update,
-                pointer_selection.in_set(crate::FeathersSystems::Prepare),
+                (clear_selection_on_resize, pointer_selection)
+                    .chain()
+                    .in_set(crate::FeathersSystems::Prepare),
             );
     }
 }
@@ -1383,6 +1470,7 @@ mod wiring_tests {
         let mut app = App::new();
         app.add_plugins(SelectionPlugin)
             .init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
             .init_resource::<MemoryClipboard>();
         let panel = app
             .world_mut()
@@ -1398,6 +1486,10 @@ mod wiring_tests {
                 },
             ))
             .id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Transcript, panel);
         let values: Vec<Row> = lines.iter().map(|line| text_row(line)).collect();
         {
             let mut panel_rows = app.world_mut().resource_mut::<PanelRows>();
@@ -1809,5 +1901,71 @@ mod wiring_tests {
         });
         fixture.app.update();
         assert_eq!(selection(&fixture).panel(), None, "右键不碰选区");
+    }
+
+    // ---- resize 清选区（上游 input.rs 的 Event::Resize） ----
+
+    /// 拖一段选区出来，返回还活着的 fixture。
+    fn fixture_with_a_selection() -> Fixture {
+        let mut fixture = fixture(&["hello world"]);
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        drag(&mut fixture, 0, 5);
+        fixture.app.update();
+        assert!(selection(&fixture).has_selection());
+        fixture
+    }
+
+    #[test]
+    fn resizing_the_window_clears_the_selection() {
+        let mut fixture = fixture_with_a_selection();
+        fixture.app.world_mut().write_message(WindowResized {
+            window: Entity::PLACEHOLDER,
+            width: 1024.0,
+            height: 640.0,
+        });
+        fixture.app.update();
+        assert_eq!(
+            selection(&fixture).panel(),
+            None,
+            "窗口 resize 清选区（上游 Event::Resize）"
+        );
+        assert!(!selection(&fixture).has_selection());
+        assert!(!selection(&fixture).is_dragging());
+    }
+
+    #[test]
+    fn a_panel_size_change_clears_the_selection() {
+        let mut fixture = fixture_with_a_selection();
+        // 先跑一帧让 resize 系统记下基准尺寸：第一次只是记，不清。
+        fixture.app.update();
+        assert!(
+            selection(&fixture).has_selection(),
+            "尺寸没变（或第一次看到）不清选区"
+        );
+
+        fixture
+            .app
+            .world_mut()
+            .get_mut::<ComputedNode>(fixture.panel)
+            .expect("面板的 ComputedNode")
+            .size = Vec2::new(640.0, 320.0);
+        fixture.app.update();
+        assert_eq!(
+            selection(&fixture).panel(),
+            None,
+            "面板尺寸变化也清选区"
+        );
+        assert!(!selection(&fixture).has_selection());
+    }
+
+    #[test]
+    fn a_reflow_that_keeps_the_panel_size_keeps_the_selection() {
+        let mut fixture = fixture_with_a_selection();
+        // 尺寸没变的帧（浮层开/关这类重排只要不动这块面板）不该误清选区。
+        fixture.app.update();
+        fixture.app.update();
+        assert!(selection(&fixture).has_selection());
+        assert_eq!(selection(&fixture).end(), Point::new(0, 5));
     }
 }

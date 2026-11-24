@@ -1,6 +1,6 @@
 # 跟进 rig 上游（rig-tui / rig-ecs / rig-core）
 
-**目标**：rig-feathers 是 rig-tui 的并行前端，必须能随上游升级。原则是——
+**目标**：rig_niri 是 rig-tui 的并行前端，必须能随上游升级。原则是——
 **只依赖公开 API，不 fork**；上游改了内部（`renderers::add` 那种），我们自己补那一层。
 
 ## 当前锁定

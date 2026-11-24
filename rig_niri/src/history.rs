@@ -1,7 +1,7 @@
 //! 提示词历史：跨会话保存，对应上游 rig-tui 0.47 的 `history.rs` 与 `jsonl.rs`。
 //!
 //! 上游把历史放进项目级 `PluginData` 的 `tui/history.jsonl`，用 `Files` 抽象
-//! 读写。rig-feathers 是纯前端，这里换成普通文件路径：[`PromptHistory::file`]
+//! 读写。rig_niri 是纯前端，这里换成普通文件路径：[`PromptHistory::file`]
 //! 是 `Option<PathBuf>`，由装配层给出（测试里是临时目录），`None` 表示只在内存
 //! 里、永不落盘。文件格式仍是"一行一个 JSON 字符串"，坏行跳过并 `warn!`，不
 //! panic。
@@ -361,7 +361,7 @@ fn seed_shown(
 ///
 /// ```no_run
 /// use bevy::prelude::*;
-/// use rig_feathers::history::{HISTORY_FILE, HistoryPlugin};
+/// use rig_niri::history::{HISTORY_FILE, HistoryPlugin};
 ///
 /// let mut app = App::new();
 /// app.add_plugins(HistoryPlugin::at(
@@ -446,7 +446,7 @@ mod tests {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let at = NEXT.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "rig-feathers-history-{name}-{}-{at}",
+                "rig_niri-history-{name}-{}-{at}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).unwrap();

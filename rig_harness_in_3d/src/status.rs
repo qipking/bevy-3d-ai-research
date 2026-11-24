@@ -16,7 +16,7 @@
 
 use bevy::prelude::*;
 use rig_ecs::prelude::{ActiveTurn, Agent, Conversation, LastUsage, Running};
-use rig_feathers::panels::{PanelId, PanelRows};
+use rig_niri::panels::{PanelId, PanelRows};
 use rig_harness::prelude::SessionPaths;
 use rig_tui::{AppStatus, Side, StatusItem, Tone};
 

@@ -266,7 +266,7 @@ fn answer_to_decision(
 /// 前端：把用户点的选项写进 `Decision`（先到先得）。
 fn answer_ask(
     click: On<bevy::picking::events::PointerClick>,
-    choices: Query<&rig_feathers::transcript::AskChoice>,
+    choices: Query<&rig_niri::transcript::AskChoice>,
     parents: Query<&ChildOf>,
     mut decisions: Query<&mut Decision>,
 ) {

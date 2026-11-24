@@ -1,4 +1,4 @@
-//! rig_harness_in_3d 的示例应用：rig-ecs 内核 + rig-feathers 视图 + feathers_in_3d 渲染。
+//! rig_harness_in_3d 的示例应用：rig-ecs 内核 + rig_niri 视图 + feathers_in_3d 渲染。
 //!
 //! 这个 binary 是**通用 app 模板的样板**：一个 echo 工具 + 一个需要确认的写工具，
 //! 加上自动巡游截图。换业务时只改 `kernel.rs`（工具 + 闸门）与这里的少量装配。
@@ -9,7 +9,7 @@
 //! real 3D text.
 
 // 这个 binary 是**示例业务**：只放工具/闸门/巡游。
-// 前端能力全部来自 `rig_feathers`（lib）。
+// 前端能力全部来自 `rig_niri`（lib）。
 
 mod kernel;
 
@@ -25,17 +25,17 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::window::{PrimaryWindow, WindowRef};
 
 use crate::kernel::KernelPlugin;
-use rig_feathers::batch::{BatchPlugin, CompletedCalls};
-use rig_feathers::camera_rig::RigCamera;
-use rig_feathers::frame::{
+use rig_niri::batch::{BatchPlugin, CompletedCalls};
+use rig_niri::camera_rig::RigCamera;
+use rig_niri::frame::{
     Extent, FramePanel, Look, PanelAreas, PanelRoots, Placement, spawn_panel,
 };
-use rig_feathers::pane::{PaneScroll, TranscriptRows};
+use rig_niri::pane::{PaneScroll, TranscriptRows};
 use rig_harness::pick::{PickItem, PickPreview};
 use rig_harness::prelude::{Highlighted, Picker};
-use rig_feathers::panels::{PanelId, PanelRows};
-use rig_feathers::theme::Theme;
-use rig_feathers::transcript::{RowText, TranscriptFont};
+use rig_niri::panels::{PanelId, PanelRows};
+use rig_niri::theme::Theme;
+use rig_niri::transcript::{RowText, TranscriptFont};
 use feathers_in_3d::{MirrorRoot, WorldPanel};
 
 #[derive(Component)]
@@ -65,7 +65,7 @@ fn main() {
     let dir = std::env::var("RF_SHOT_DIR").unwrap_or_else(|_| "shots".to_string());
     std::fs::create_dir_all(&dir).ok();
 
-    let mut app = rig_harness_in_3d::app("rig-feathers: rig-tui looks in feathers + 3D");
+    let mut app = rig_harness_in_3d::app("rig_niri: rig-tui looks in feathers + 3D");
     app.add_plugins(KernelPlugin)
         .add_plugins(BatchPlugin)
         .insert_resource(Runner {
@@ -222,13 +222,13 @@ fn spawn_overlay(mut commands: Commands, mut roots: ResMut<PanelRoots>, mut rows
     );
     roots.0.insert(PanelId::Overlay, entity);
     let line = |text: &str, style: rig_tui::ratatui::style::Style| {
-        rig_feathers::transcript::Row::new(rig_tui::ratatui::text::Line::from(
+        rig_niri::transcript::Row::new(rig_tui::ratatui::text::Line::from(
             rig_tui::ratatui::text::Span::styled(text.to_string(), style),
         ))
     };
     use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
     let rows_out = vec![
-        rig_feathers::panels::KeyedRow {
+        rig_niri::panels::KeyedRow {
             key: 1,
             hash: 1,
             row: line(
@@ -236,7 +236,7 @@ fn spawn_overlay(mut commands: Commands, mut roots: ResMut<PanelRoots>, mut rows
                 Style::default().fg(RColor::LightYellow).add_modifier(Modifier::BOLD),
             ),
         },
-        rig_feathers::panels::KeyedRow {
+        rig_niri::panels::KeyedRow {
             key: 2,
             hash: 2,
             row: line(
@@ -244,7 +244,7 @@ fn spawn_overlay(mut commands: Commands, mut roots: ResMut<PanelRoots>, mut rows
                 Style::default().fg(RColor::Rgb(200, 206, 220)),
             ),
         },
-        rig_feathers::panels::KeyedRow {
+        rig_niri::panels::KeyedRow {
             key: 3,
             hash: 3,
             row: line(
@@ -426,8 +426,8 @@ fn copy_selection(
         }
     }
     match clipboard.set_text(text.clone()) {
-        Ok(()) => info!("[rig-feathers] copied {} bytes: {}", text.len(), text.lines().next().unwrap_or("")),
-        Err(error) => warn!("[rig-feathers] clipboard failed: {error:?}"),
+        Ok(()) => info!("[rig_niri] copied {} bytes: {}", text.len(), text.lines().next().unwrap_or("")),
+        Err(error) => warn!("[rig_niri] clipboard failed: {error:?}"),
     }
 }
 
@@ -729,7 +729,7 @@ fn run_tour(
         }
         52 if sub == 0 => shoot(&mut runner, &mut commands, "13_tree_closed"),
         54 if sub == 0 => {
-            info!("[rig-feathers] tour done: {:?}", runner.shots);
+            info!("[rig_niri] tour done: {:?}", runner.shots);
             exit.write(AppExit::Success);
         }
         _ => {}

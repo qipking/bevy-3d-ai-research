@@ -14,7 +14,7 @@ feathers_in_3d
   └─ pick     射线 → 面板平面 → 节点矩形 → bevy_picking 事件
 ```
 
-能力与实测结果见 `../docs/design/RIG_FEATHERS_MOBILE_PLAN.md`。
+能力与实测结果见 `../docs/design/RIG_NIRI_MOBILE_PLAN.md`。
 
 ---
 
@@ -125,15 +125,15 @@ item.sorting_info = TransparentSortingInfo3d::Sorted {
 
 ---
 
-## 运行示例（本仓库的 `rig-feathers`）
+## 运行示例（本仓库的 `rig_niri`）
 
 ```sh
 # 1) CJK 字体：Bevy 只认 .ttf/.otf，系统里是 .ttc，需要抽一个 face
 ./tools/fetch_cjk_font.sh
 
-cd rig-feathers
+cd rig_niri
 CARGO_HOME=../.cargo-home cargo build
-BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig-feathers
+BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig_niri
 ```
 
 产出：`01_overview` / `02_near` / `03a_mild_oblique` / `03b_oblique45` / `04_text_zoom`
@@ -154,7 +154,7 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig-feathers
 | 暂无 rig-tui 的 `RenderBatch` 接入 | 现在由应用层把 `LookLine::colored()` 转成 feathers 节点；直接吃 `RenderBatch` 需要构造 `ToolCall`
 （`CallId`/`ToolName`）并驱动 `TranscriptRender` 调度 |
 | 每个字形网格是独立 draw call | 每面板每图集 1 次已够用；面板很多时可再跨面板合批 |
-| 与不透明场景几何的遮挡 | ✅ 已定位：**不是本 crate 的问题**。是应用层的 `PointerOut` 冒泡（见 `../occlusion_report.md`）把面板根的 `BackgroundColor` 写成 alpha=0，SDF body 全部 discard，背后的立方体才"透"出来。修复在 `rig-feathers` |
+| 与不透明场景几何的遮挡 | ✅ 已定位：**不是本 crate 的问题**。是应用层的 `PointerOut` 冒泡（见 `../occlusion_report.md`）把面板根的 `BackgroundColor` 写成 alpha=0，SDF body 全部 discard，背后的立方体才"透"出来。修复在 `rig_niri` |
 
 ## 性能（llvmpipe 上无参考价值）
 

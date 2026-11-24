@@ -37,6 +37,14 @@ pub enum PanelId {
     List,
     /// 浮层里的一列（picker 的 preview）。
     Preview,
+    /// 第二个转写窗格：拆窗（`Alt+S`，见 [`crate::frame::split_transcript`]）后
+    /// 出现，每帧显示与 [`PanelId::Transcript`] 完全相同的可见行。
+    Pane2,
+    /// 输入框上方的补全 tile：关着时在分裂树里是 0 高度，打开时占 6 行。
+    ///
+    /// 行由 [`crate::complete`] 产（候选 + 官方提示行），这里只当普通面板走
+    /// [`PanelRows`] / [`PanelRoots`]，不写特殊情况。
+    Complete,
 }
 
 /// 行实体在它所属面板里的位置：行是从 0 数的**可见行下标**（滚动后按窗口顶算）。
@@ -109,6 +117,21 @@ impl PanelSpawned {
     pub fn forget(&mut self, id: PanelId) {
         self.0.remove(&id);
     }
+}
+
+/// 把主转写的可见行复制给第二个转写窗格（拆窗后才存在）。
+///
+/// 转写的窗口化/滚动只在 [`crate::pane`] 里对 [`PanelId::Transcript`] 做一次；
+/// 拆出来的 [`PanelId::Pane2`] 只是同一份内容的第二个视口，所以每帧抄一份。
+/// 这是普通的面板行同步，`sync_panels` 不需要为它写特殊情况。
+fn mirror_transcript_rows(roots: Res<PanelRoots>, mut rows: ResMut<PanelRows>) {
+    if roots.entity(PanelId::Pane2).is_none() {
+        return;
+    }
+    let Some(source) = rows.0.get(&PanelId::Transcript).cloned() else {
+        return;
+    };
+    rows.0.insert(PanelId::Pane2, source);
 }
 
 fn row_plain(row: &Row) -> String {
@@ -228,7 +251,9 @@ impl Plugin for PanelsPlugin {
             .init_resource::<PanelSpawned>()
             .add_systems(
                 Update,
-                sync_panels.in_set(crate::FeathersSystems::Render),
+                (mirror_transcript_rows, sync_panels)
+                    .chain()
+                    .in_set(crate::FeathersSystems::Render),
             );
     }
 }
@@ -269,6 +294,83 @@ mod tests {
             .get::<Children>(root)
             .map(|children| children.iter().collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn pane2_mirrors_the_transcript_rows() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.init_resource::<PanelRows>();
+        world.init_resource::<PanelRoots>();
+        let pane2 = world.spawn_empty().id();
+        world
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Pane2, pane2);
+        world.resource_mut::<PanelRows>().set(
+            PanelId::Transcript,
+            vec![keyed(10, "one"), keyed(20, "two")],
+        );
+
+        world.run_system_once(mirror_transcript_rows).unwrap();
+        let rows = world.resource::<PanelRows>();
+        let mirrored = rows.get(PanelId::Pane2);
+        assert_eq!(mirrored.len(), 2);
+        assert_eq!(mirrored[0].key, 10);
+        assert_eq!(mirrored[1].key, 20);
+        let text: String = mirrored[1]
+            .row
+            .line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "two");
+
+        // 没有 Pane2 根实体时（还没拆窗）不建行槽，也不 panic。
+        let mut world = World::new();
+        world.init_resource::<PanelRows>();
+        world.init_resource::<PanelRoots>();
+        world
+            .resource_mut::<PanelRows>()
+            .set(PanelId::Transcript, vec![keyed(10, "one")]);
+        world.run_system_once(mirror_transcript_rows).unwrap();
+        assert!(!world.resource::<PanelRows>().0.contains_key(&PanelId::Pane2));
+    }
+
+    /// 新加的 `Pane2` / `Complete` 和普通面板走同一条 diff 路，不需要特例。
+    #[test]
+    fn the_new_panel_ids_sync_like_any_other_panel() {
+        let mut app = App::new();
+        app.add_plugins(PanelsPlugin)
+            .insert_resource(TranscriptFont(FontSource::default()));
+        let complete = app.world_mut().spawn_empty().id();
+        let pane2 = app.world_mut().spawn_empty().id();
+        {
+            let roots = &mut app.world_mut().resource_mut::<PanelRoots>().0;
+            roots.insert(PanelId::Complete, complete);
+            roots.insert(PanelId::Pane2, pane2);
+        }
+        app.world_mut()
+            .resource_mut::<PanelRows>()
+            .set(PanelId::Complete, vec![keyed(1, "Tab or Enter completes")]);
+        app.world_mut()
+            .resource_mut::<PanelRows>()
+            .set(PanelId::Pane2, vec![keyed(1, "transcript line")]);
+        app.update();
+
+        for (root, panel) in [(complete, PanelId::Complete), (pane2, PanelId::Pane2)] {
+            let rows = row_entities(&app, root);
+            assert_eq!(rows.len(), 1, "{panel:?} 的行要生成");
+            let layout = app
+                .world()
+                .get::<RowLayout>(rows[0])
+                .expect("行要有 RowLayout");
+            assert_eq!(layout.panel, panel);
+            assert_eq!(layout.panel_entity, root);
+            assert_eq!(layout.index, 0);
+        }
     }
 
     #[test]

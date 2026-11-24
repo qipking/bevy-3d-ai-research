@@ -1,4 +1,4 @@
-//! `rig-feathers`: rig-tui 的另一个**完整前端**（feathers + 3D 空间），同时是一个可 fork 的通用 app 模板。
+//! `rig_niri`: rig-tui 的另一个**完整前端**（feathers + 3D 空间），同时是一个可 fork 的通用 app 模板。
 //!
 //! 分层（详见 `../docs/design/AGENT_3D_PATTERN.md`）：
 //!
@@ -77,6 +77,7 @@ pub mod prelude {
         CellRect, Extent, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
     };
     pub use crate::frame::FrameTree;
+    pub use crate::frame::{add_split_key, split_binding, split_transcript};
     pub use crate::layout::{Child, Node, Size, Split, default_tree};
     pub use crate::pane::{PanePlugin, PaneScroll, TranscriptRows};
     pub use crate::keys::{
@@ -85,7 +86,8 @@ pub mod prelude {
     };
     pub use crate::complete::{
         Candidate, Completion, CompletionKind, CompletionPlugin, CompletionSource, CompletionState,
-        CompletionTrigger, completion_rows,
+        CompletionTrigger, COMPLETION_HINT, TILE_ROWS, completion_hint_rows, completion_rows,
+        completion_tile_height, completion_tile_rows, draw_completion, sync_completion_tile,
     };
     pub use crate::history::{
         HISTORY_FILE, HistoryPlugin, HistorySystems, PromptHistory, Sent,

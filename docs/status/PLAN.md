@@ -25,15 +25,15 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 **结论**：要"把 rig-harness 换成 3D UI"，正确做法是写一个**与 plugins/rig-tui 同构的插件**
 （同样只用 rig-harness 公开 API），而不是另起一个 app。我们现有的三个 crate 对应关系不变，
-但 `rig-feathers` 必须按"插件"的形态组织：一个 `FeathersViewPlugin`，注册 Front、消费
+但 `rig_niri` 必须按"插件"的形态组织：一个 `FeathersViewPlugin`，注册 Front、消费
 `Ask`/`Picker`/`StatusItems`/`Notice`/`RenderBatch`，把自己的绘制系统挂进 `App`。
 
-## 1. 插件对照表（plugins/rig-tui → rig-feathers）
+## 1. 插件对照表（plugins/rig-tui → rig_niri）
 
 > 2026-11-25 按 [`PARITY.md`](PARITY.md) 的逐行审计修正过：原先 6 处 ✅ 属于乐观估计。
 > 真实对位移植覆盖率 ≈ 25%（对位 3558 / 上游 14749 行），公开名字 104 个里 80 个没有对应物。
 
-| rig-tui 模块 | 作用 | rig-feathers 现状 | 下一步 |
+| rig-tui 模块 | 作用 | rig_niri 现状 | 下一步 |
 |---|---|---|---|
 | `lib.rs` (`TuiViewPlugin`, `Front="tui"`) | 插件入口 + Front | ✅ `FeathersViewPlugin`（同形：build + finish 注册 `StatusItems`）+ `front.rs` | — |
 | `panel.rs` (`TuiPanel`, `Placement`, `lay_out`) | 可放置面板（四边、尺寸、浮层、剩余区、列） | ✅ `frame.rs`：`Placement`/`Extent`/`CellRect`/`lay_out`（逐条照抄，附 7 个单测） | `fits`（编辑器按内容收行）接上 |
@@ -69,7 +69,7 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 ## 3. 实施顺序（每步都出对照截图）
 
-1. ✅ **插件化**：`rig-feathers` 暴露 `FeathersViewPlugin`（与 `TuiViewPlugin` 同形），
+1. ✅ **插件化**：`rig_niri` 暴露 `FeathersViewPlugin`（与 `TuiViewPlugin` 同形），
    `rig_harness_in_3d::app()` 只做装配；
 2. ✅ **帧布局**：`Placement` + 面板区 + 剩余区，替换 3 块固定面板
    （`frame.rs` + `pane.rs`，见 §5 的验收截图）；
@@ -88,9 +88,9 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 ## 5. 第 2 步做到了什么（2026-11-24）
 
-**帧模型**（`rig-feathers/src/frame.rs`）：
+**帧模型**（`rig_niri/src/frame.rs`）：
 
-| rig-tui | rig-feathers | 备注 |
+| rig-tui | rig_niri | 备注 |
 |---|---|---|
 | `TerminalSize` | `FrameSize { cols, rows }` | 默认 96×28，`RF_FRAME=96x16` 可改 |
 | `Placement::{Top,Bottom,Left,Right,BelowInput,Over,Rest,Within}` | 同名同义 | `ratatui::Constraint` 收窄成 `Extent::{Cells,Percent,Rest}` |
@@ -123,9 +123,9 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 ## 6. 第 3 步做到哪了：picker 浮层（2026-11-24）
 
-`rig-feathers/src/picker.rs`，用帧布局的 `Placement::Over` 画 rig-harness 的 `Picker`：
+`rig_niri/src/picker.rs`，用帧布局的 `Placement::Over` 画 rig-harness 的 `Picker`：
 
-| rig-tui `pick.rs` | rig-feathers | 状态 |
+| rig-tui `pick.rs` | rig_niri | 状态 |
 |---|---|---|
 | 浮层占整屏（终端里没别的地方） | 居中浮层 `Over { Percent(84), Percent(74) }` | ✅（3D 里是一块对话框） |
 | 标题 + 说明 + 列表 | 同左，标题 `▌` + 黄色粗体 | ✅ |
@@ -159,7 +159,7 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 ## 7. 第 5 步（部分）：状态行裁剪 / 滚动标记 / 窗口标题（2026-11-24 晚）
 
-| rig-tui | rig-feathers | 做法 |
+| rig-tui | rig_niri | 做法 |
 |---|---|---|
 | `status::line(items, width)`（公开函数，按 `keep` 丢、按 `min_width` 缩成 `…`） | `status.rs` **直接调用它** | 不重写规则：状态行行为与终端逐字一致 |
 | 左一条、右一条分两个区域画 | `Row::with_right(line)` | bevy_ui 的 `SpaceBetween` 负责右对齐（不算空格，CJK 也不会错位） |
@@ -218,11 +218,11 @@ Preview  Within { panel: Overlay, part: 1, of: 2 }  预览列（插件挂 PickPr
 
 ## 9. Niri 窗口逻辑：仅作布局参考（2026-11-25 归档环/总览线）
 
-> **范围收窄**：`niri` 只用于 `rig-feathers` 移植 `rig-tui` 时组件/窗口的**布局位置设计**参考
+> **范围收窄**：`niri` 只用于 `rig_niri` 移植 `rig-tui` 时组件/窗口的**布局位置设计**参考
 > （源码 `reference/niri/niri-main`）。环模式、圆柱体总览、两级视角不再推进；原设计已归档 →
 > [`GEOMETRY_HISTORY.md`](../archive/GEOMETRY_HISTORY.md)。
 
-**代码现状（保留，不再扩线）**（`rig-feathers/src/niri.rs`，40 个单测，语义照 niri，独立实现）：
+**代码现状（保留，不再扩线）**（`rig_niri/src/niri.rs`，40 个单测，语义照 niri，独立实现）：
 
 - 列宽预设 / 前缀和 / `view_offset` 居中且夹取 / 列内竖分 / 指数平滑滚动；（布局参考）
 - `Tiling::ring`：总览把各层贴到圆柱内壁（半径 = 最长带鱼屏/2π，短的不绕圈）；**（已归档，不推进）**

@@ -1,10 +1,10 @@
 [package]
-name = "rig-feathers"
+name = "rig_niri"
 version = "0.1.0"
 edition = "2024"
 description = "Another complete front end for rig-tui: feathers UI rendered in world-space 3D."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/<you>/rig-feathers"
+repository = "https://github.com/<you>/rig_niri"
 keywords = ["bevy", "rig", "llm", "ui"]
 categories = ["gui"]
 
@@ -43,5 +43,5 @@ feathers_in_3d = { path = "../feathers_in_3d" }
 bevy_clipboard = { version = "=0.20.1", features = ["system_clipboard", "wayland"] }
 
 [lib]
-name = "rig_feathers"
+name = "rig_niri"
 path = "src/lib.rs"

@@ -3,7 +3,7 @@
 > **状态：历史。以下为 2026-11-25 之前的设计线，已归档，不再推进。** 这里保留原文与当时的结论、参数、试跑记录，
 > 只作决策历史，不要照着实现。
 >
-> 当前范围：`niri` 只用于 `rig-feathers` 移植 `rig-tui` 时组件/窗口的**布局位置设计**参考
+> 当前范围：`niri` 只用于 `rig_niri` 移植 `rig-tui` 时组件/窗口的**布局位置设计**参考
 > （`reference/niri/niri-main`）。斗兽场漏斗、土楼/圆柱体总览、两级视角、环（ring）排列全部不再推进。
 > 当前纲领见 [`../design/SPATIAL_UI.md`](../design/SPATIAL_UI.md) §1–§10。
 >
@@ -280,7 +280,7 @@ enum Mode { Overview, Planet(Entity) }                  // 两级视角
 
 # 15. P1 原型：斗兽场跑起来了（2026-11-25）
 
-代码：`rig-feathers/src/spatial.rs`（`Funnel` / `Card` / `SpatialFocus` / `billboard` / `spawn_card`，
+代码：`rig_niri/src/spatial.rs`（`Funnel` / `Card` / `SpatialFocus` / `billboard` / `spawn_card`，
 26 个单测）+ `rig_harness_in_3d/examples/spatial.rs`（三层 × 2–3 张卡的可视原型）。
 截图：`render/rf_funnel/{01_layer0,02_layer1,03_funnel}.png`。
 
@@ -334,7 +334,7 @@ enum Mode { Overview, Planet(Entity) }                  // 两级视角
 进入 agent：LayerFocus = Some(L)，其它层藏到视野外
 ```
 
-`rig-feathers/src/niri.rs`（32 个单测）——**独立实现 niri 的语义**（GPL-3.0，只读源码不复制）：
+`rig_niri/src/niri.rs`（32 个单测）——**独立实现 niri 的语义**（GPL-3.0，只读源码不复制）：
 
 | niri | 这里 |
 |---|---|

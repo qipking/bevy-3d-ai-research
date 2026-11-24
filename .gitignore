@@ -13,7 +13,7 @@
 render/rf_shots/crop_*.png
 
 # 生成的 CJK 字体（用 tools/fetch_cjk_font.sh 重新生成）
-rig-feathers/assets/fonts/*.otf
+rig_niri/assets/fonts/*.otf
 
 # Python 依赖（fonttools，用于字体子集化）
 tools/pylib/

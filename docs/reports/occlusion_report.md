@@ -1,12 +1,12 @@
 # 面板本体被清空后"立方体浮到前面"——遮挡排查报告
 
-**结论**：库里没问题。是 `rig-feathers` 的 `unhover_row` 观察者缺少"这实体是不是一行"的判断，把**面板根实体**的背景色写成了 alpha=0；`feathers_in_3d` 忠实把这个颜色同步进 `UNodeMaterial3d`，SDF 的 body 因此全被 discard（边框仍画），背后的不透明立方体就从"洞"里露出来。看起来像立方体跑到前面，实际是面板本体消失了。与深度测试、透明排序、clip uniform、面板网格尺寸都无关。
+**结论**：库里没问题。是 `rig_niri` 的 `unhover_row` 观察者缺少"这实体是不是一行"的判断，把**面板根实体**的背景色写成了 alpha=0；`feathers_in_3d` 忠实把这个颜色同步进 `UNodeMaterial3d`，SDF 的 body 因此全被 discard（边框仍画），背后的不透明立方体就从"洞"里露出来。看起来像立方体跑到前面，实际是面板本体消失了。与深度测试、透明排序、clip uniform、面板网格尺寸都无关。
 
-复现：用 06:42 构建的 `rig-feathers/target/debug/rig-feathers` 可 100% 复现 → `render/probe/parent_repro/05_scrolled.png`（本体像素=清屏色，立方体像素=橙色）。把拷贝 `occlusion_probe/rig_dbg` 的 `PANEL_H` 改成 300 后，跑出的 `render/probe/repro300_bug/05_scrolled.png` 与报告的 300px 描述完全一致（面板深色底整块消失，橙色立方体出现在面板内、盖在内容上）；同一拷贝加一行 `rows` guard 后 `repro300_fix/05_scrolled.png` 恢复正常遮挡。
+复现：用 06:42 构建的 `rig_niri/target/debug/rig_niri` 可 100% 复现 → `render/probe/parent_repro/05_scrolled.png`（本体像素=清屏色，立方体像素=橙色）。把拷贝 `occlusion_probe/rig_dbg` 的 `PANEL_H` 改成 300 后，跑出的 `render/probe/repro300_bug/05_scrolled.png` 与报告的 300px 描述完全一致（面板深色底整块消失，橙色立方体出现在面板内、盖在内容上）；同一拷贝加一行 `rows` guard 后 `repro300_fix/05_scrolled.png` 恢复正常遮挡。
 
 ## 1. 复现步骤
 
-### 1.1 最小 probe（新建 crate，未改 rig-feathers）
+### 1.1 最小 probe（新建 crate，未改 rig_niri）
 
 `occlusion_probe/`：Camera3d + 不透明立方体 `(0.68,-0.18,-0.28)` + `WorldPanel/MirrorRoot` 面板（780×`PROBE_PANEL_H`，`Overflow::scroll_y`，默认字体、无 CJK）。
 
@@ -27,19 +27,19 @@ BEVY_ASSET_ROOT=$PWD PROBE_PANEL_H=300 PROBE_SCROLL=40 PROBE_CLOBBER_BG=1 \
 ### 1.2 现有二进制（就是 06:42 出问题那版）
 
 ```bash
-cd research/rig-feathers
+cd research/rig_niri
 BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=$PWD/../render/probe/parent_repro \
-  timeout 120 ./target/debug/rig-feathers
+  timeout 120 ./target/debug/rig_niri
 ```
 
 ### 1.3 带日志的拷贝（只改拷贝）
 
-`occlusion_probe/rig_dbg/` = rig-feathers 源码 + `watch_panel_bg` / `PointerOver/Out` / `PointerHits` / pick index 日志；`Cargo.toml` 改名 `rig_dbg`、依赖路径改为 `../../feathers_in_3d`，target 用 btrfs reflink 复制所以不用重编依赖。**`rig-feathers/` 本身没有任何改动。**
+`occlusion_probe/rig_dbg/` = rig_niri 源码 + `watch_panel_bg` / `PointerOver/Out` / `PointerHits` / pick index 日志；`Cargo.toml` 改名 `rig_dbg`、依赖路径改为 `../../feathers_in_3d`，target 用 btrfs reflink 复制所以不用重编依赖。**`rig_niri/` 本身没有任何改动。**
 
 ```bash
 cd research/occlusion_probe/rig_dbg
 CARGO_HOME=… cargo build
-BEVY_ASSET_ROOT=/var/home/lichi/桌面/research/rig-feathers \
+BEVY_ASSET_ROOT=/var/home/lichi/桌面/research/rig_niri \
   RF_SHOT_DIR=$PWD/../../render/probe/dbg_tour timeout 120 ./target/debug/rig_dbg
 # 300px A/B（拷贝里 PANEL_H=300；guard 用环境变量开关，便于同一二进制对照）
 unset RIG_UNHOVER_GUARD   # 复现
@@ -88,7 +88,7 @@ BEVY_ASSET_ROOT=… RF_SHOT_DIR=$PWD/../../render/probe/repro300_fix ./target/de
 
 - `bevy_picking` 0.20 的 `PointerOut` 定义就是会冒泡：`bevy_picking-0.20.1/src/events.rs:246-265`，`#[entity_event(propagate = PointerTraversal, auto_propagate)]`，文档写明 "Unlike `PointerLeave` … bubbles up to all of the target entity's ancestors"。
 - 面板根**不是**被点中的：`render/probe/dbg_tour2/log.txt` 显示 `has_pickable=false`、`panel itself in PanelPickIndex=false`（14 个 rect 全是行）。所以事件只能来自子实体冒泡。
-- 写入者是 `rig-feathers/src/main.rs:321-333` 的 `unhover_row`：它只查 `selected`，**没有** `rows.contains(entity)`；对比 `hover_row`（`main.rs:305-319`）就有这个 guard。于是 `PointerOut` 冒泡到面板根时，面板根的 `BackgroundColor` 被写成 `srgba(0.10,0.14,0.22,0.0)`。
+- 写入者是 `rig_niri/src/main.rs:321-333` 的 `unhover_row`：它只查 `selected`，**没有** `rows.contains(entity)`；对比 `hover_row`（`main.rs:305-319`）就有这个 guard。于是 `PointerOut` 冒泡到面板根时，面板根的 `BackgroundColor` 被写成 `srgba(0.10,0.14,0.22,0.0)`。
 - `feathers_in_3d` 侧只是如实镜像：`world3d.rs:168-173` 从 `BackgroundColor` 取 `base_color`，`world3d.rs:211` 写 `mat.color`；clobber 后日志为 `node 330v0 … color=Vec4(0.0100,0.0174,0.0397, 0.0)`（`render/probe/clobber300/log.txt:89`）。
 - shader 里 body 和 border 共用一次输出：`unode_3d.wesl:277-281` 的 `body_alpha`、`:366-369` 的 `shape_alpha`、`:415-419` 的 `discard`。`color.a=0` 时 body 贡献为 0，border 仍按 `border_color.a` 画出来——正好是截图里的"只有蓝色边框、没有深色底"。
 
@@ -106,7 +106,7 @@ BEVY_ASSET_ROOT=… RF_SHOT_DIR=$PWD/../../render/probe/repro300_fix ./target/de
 ```
 行实体 PointerOut（鼠标/合成指针/相机移动都可能让它离开 hover）
   └─ bevy_picking 按 PointerTraversal 自动冒泡到所有祖先
-       └─ rig-feathers::unhover_row 没判 rows → 对面板根也执行
+       └─ rig_niri::unhover_row 没判 rows → 对面板根也执行
             └─ 面板根 BackgroundColor = srgba(…, alpha=0)
                  └─ world3d::sync_mirror 写 UNodeMaterial3d.color（alpha=0）
                       └─ SDF：body_alpha=0、border 照画 → 面板本体片元被 discard
@@ -117,7 +117,7 @@ BEVY_ASSET_ROOT=… RF_SHOT_DIR=$PWD/../../render/probe/repro300_fix ./target/de
 
 ## 4. 修复 / 建议
 
-**改 `rig-feathers`（本次不允许动，交给并行修改的同学）**，一行：
+**改 `rig_niri`（本次不允许动，交给并行修改的同学）**，一行：
 
 ```rust
 fn unhover_row(
@@ -139,7 +139,7 @@ fn unhover_row(
 
 （另建议：unhover 时恢复该行的原始 band 色而不是 alpha=0；否则 hover 一次后 band 永久消失。`select_row` 的清理也有同样问题。补丁示意在 `occlusion_probe/unhover_row_fix.patch`。）
 
-**已验证**：把该 guard 加到 `occlusion_probe/rig_dbg`（rig-feathers 拷贝）后重跑同一 tour：
+**已验证**：把该 guard 加到 `occlusion_probe/rig_dbg`（rig_niri 拷贝）后重跑同一 tour：
 - `render/probe/fix_tour/01_overview.png`、`03a`、`04`、`05_scrolled`、`06_selected` 面板本体都在；
 - `05_scrolled` 的立方体像素 `(1020,505)=(13,16,23)`=面板背景（仍被遮住）；
 - `render/probe/fix_tour/log.txt:62-76` 仍有 `PointerOut entity=457v0 is_row=false`，但**不再有** `BackgroundColor 457v0 -> alpha 0` 的日志。
@@ -147,12 +147,12 @@ fn unhover_row(
 **`feathers_in_3d` 未改**：本轮排查未发现库内 bug；world3d/sort/text3d/pick 的行为均符合预期。如果在库里"防御性"忽略面板根的透明背景，会掩盖合法的透明面板，不应改。
 
 ### 下一步
-- 在真正的 `rig-feathers/src/main.rs` 应用上面的 guard（拷贝里已验证），用 300px+滚动+原来 15 行内容再跑一次 tour，确认 05/06 不再露立方体；顺便观察行 band 是否还在。
+- 在真正的 `rig_niri/src/main.rs` 应用上面的 guard（拷贝里已验证），用 300px+滚动+原来 15 行内容再跑一次 tour，确认 05/06 不再露立方体；顺便观察行 band 是否还在。
 - 给行加"band 原始色"组件，unhover 时恢复，避免 hover 一次后 band 永久丢失这一类副作用。
 
 ## 5. 产物
 
 - `render/probe/compare_artifact.png`、`compare_fix.png`、`compare_300.png`：对比图。
 - `occlusion_probe/`：独立 probe（env：`PROBE_PANEL_H`、`PROBE_SCROLL`、`PROBE_CLOBBER_BG`、`PROBE_FRONT_CUBE`、`PROBE_TOUR_CAM`、`PROBE_SHOT_DIR`）。
-- `occlusion_probe/rig_dbg/`：rig-feathers 的带日志拷贝（原目录未改动），用于定位与验证修复。
+- `occlusion_probe/rig_dbg/`：rig_niri 的带日志拷贝（原目录未改动），用于定位与验证修复。
 - `render/probe/`：`parent_repro/`（父二进制原样复现）、`dbg_tour/`、`dbg_tour2/`、`dbg_tour3/`（定位日志）、`fix_tour/`（修复验证）、`run300_0/`、`run300_40/`、`run380*/`（probe 对照组）、`clobber300b/`（最小复现）、`repro300_bug/`、`repro300_fix/`（300px 原始现象 A/B）、`legacy/`（06:42 快照旧图）、`run380_0/log2.txt`（渲染队列 dump）。

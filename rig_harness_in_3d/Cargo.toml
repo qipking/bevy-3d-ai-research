@@ -2,7 +2,7 @@
 name = "rig_harness_in_3d"
 version = "0.1.0"
 edition = "2024"
-description = "A rig harness for 3D apps: rig-ecs kernel + rig-feathers view + feathers_in_3d renderer, as a fork template."
+description = "A rig harness for 3D apps: rig-ecs kernel + rig_niri view + feathers_in_3d renderer, as a fork template."
 
 [dependencies]
 bevy = { version = "=0.20.1", default-features = false, features = [
@@ -29,4 +29,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 feathers_in_3d = { path = "../feathers_in_3d" }
-rig-feathers = { path = "../rig-feathers" }
+rig_niri = { path = "../rig_niri" }

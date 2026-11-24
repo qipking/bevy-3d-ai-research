@@ -1,6 +1,6 @@
 # 文档索引
 
-> **niri 的唯一用途**：`rig-feathers` 移植 `rig-tui` 时，组件/窗口的**布局位置设计**参考
+> **niri 的唯一用途**：`rig_niri` 移植 `rig-tui` 时，组件/窗口的**布局位置设计**参考
 > `reference/niri/niri-main`。除此之外（斗兽场、圆柱体总览、环、两级视角）全部不再推进；
 > 相关设计已归档到 [`archive/`](archive/)，只有历史价值，不要照着做。
 >
@@ -30,7 +30,7 @@
 |---|---|
 | [`SPATIAL_UI.md`](design/SPATIAL_UI.md) | 设计纲领 §1–§10：§1 是"3D 赢面"判断表、该丢什么、ECS 理由、HIG 清单、验收检查表（§11 起的几何已归档） |
 | [`AGENT_3D_PATTERN.md`](design/AGENT_3D_PATTERN.md) | 分层范式：内核 / 视图 / 渲染 / 应用各管什么，扩展点在哪 |
-| [`RIG_FEATHERS_MOBILE_PLAN.md`](design/RIG_FEATHERS_MOBILE_PLAN.md) | 移动端方案（陀螺仪相机，无 VR） |
+| [`RIG_NIRI_MOBILE_PLAN.md`](design/RIG_NIRI_MOBILE_PLAN.md) | 移动端方案（陀螺仪相机，无 VR） |
 | [`VR_ASSISTANT_STACK.md`](design/VR_ASSISTANT_STACK.md) | 技术栈研究：feathers + rig + 路线 B 的可行性 |
 
 ## archive/ —— 历史记录
@@ -68,7 +68,7 @@ research/
 │   ├── reports/           一次性结论：VERIFICATION_REPORT、occlusion_report、PUBLISH
 │   └── archive/           历史：GEOMETRY_HISTORY（旧几何）、WATCHWALL（S1 监看墙，已暂缓）
 ├── rig_harness_in_3d/   应用层（= plugins/rig-tui 的位置）
-├── rig-feathers/        视图层（= rig-tui 这个 crate 的位置）
+├── rig_niri/        视图层（= rig-tui 这个 crate 的位置）
 ├── feathers_in_3d/      渲染层
 ├── bevy_luma/           上游 SDF 材料（vendored）
 ├── experiments/         一次性探针：spike、occlusion_probe、rig-tui-inspect

@@ -36,11 +36,10 @@
 //!   `@"my notes.md"`）；这里有一份语义相同的本地实现
 //!   （[`reference_typing`] / [`reference_format`]），规则逐条照抄，只是位置在
 //!   本模块里。
-//! - **候选列表的浮层**：上游 `render::draw_completion` 画 8 行浮层；我们的行是值，
-//!   [`completion_rows`] 只产行，窗口化交给 `pane`（所以这里不截断到 8 行）。
-//!
-//! 还没接的（要改我们没拥有的文件）：`keys.rs` 的 Tab / ↑↓ / Esc 到
-//! `CompletionState` 的动作，`lib.rs` 注册 [`CompletionPlugin`] 与 prelude 导出。
+//! - **列表落点**：上游 `render::draw_completion` 画 8 行浮层；这里按用户要求
+//!   做成输入框上方的 tile —— 分裂树里右列的一个叶子（[`PanelId::Complete`]），
+//!   关着时 `Fixed(0)`，打开时 `Fixed(6 行)`，由 [`sync_completion_tile`] 改树、
+//!   [`draw_completion`] 产行。候选 + 官方提示行都在这个 tile 里，不是浮层。
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -61,6 +60,8 @@ use rig_harness::watch::{FileChanges, FileWatch};
 use rig_tui::ratatui::text::{Line, Span};
 
 use crate::editor::Editor;
+use crate::frame::{FrameTree, PanelAreas};
+use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots};
 use crate::theme::Theme;
 use crate::transcript::Row;
 
@@ -546,7 +547,7 @@ impl FileIndex {
         }
         if self.watch.is_none() {
             let watch = (
-                Name::new("rig-feathers: @ 路径"),
+                Name::new("rig_niri: @ 路径"),
                 FileWatch::tree(root.clone()),
             );
             self.watch = Some(commands.spawn(watch).id());
@@ -570,7 +571,7 @@ impl FileIndex {
         };
         let pool = IoTaskPool::get_or_init(TaskPool::default);
         let walking = Running::spawn_into::<WalkedPaths, _>(pool, wake, task);
-        commands.spawn((Name::new("rig-feathers: @ 路径遍历"), walking));
+        commands.spawn((Name::new("rig_niri: @ 路径遍历"), walking));
         // 从这以后看到的变化都让这趟遍历过期。
         (self.walking, self.fresh) = (true, true);
     }
@@ -991,12 +992,11 @@ pub(crate) fn receive_paths(
     }
 }
 
-/// 补全的插件：资源、文件索引的收尾（`PreUpdate`）与输入后的更新（`Layout`）。
+/// 补全的插件：资源、文件索引的收尾（`PreUpdate`）、输入后的更新（`Layout`），
+/// 以及输入框上方补全 tile 的开合（`Layout`）与产行（`Draw`）。
 ///
-/// 要接三样东西（`lib.rs` 由 lead 加，见移植回报）：
-/// 1. `app.add_plugins(complete::CompletionPlugin)`；
-/// 2. `keys.rs` 把 Tab / ↑↓ / Esc 接到 [`CompletionState`]；
-/// 3. 在 `Draw` 里用 [`completion_rows`] 给补全列表产行（需要新面板）。
+/// 接线由 [`FeathersViewPlugin`](crate::FeathersViewPlugin) 注册；按键（Tab /
+/// ↑↓ / Esc）在 `editor.rs` 的 `completion_act` 里接到 [`CompletionState`]。
 pub struct CompletionPlugin;
 
 impl Plugin for CompletionPlugin {
@@ -1012,6 +1012,19 @@ impl Plugin for CompletionPlugin {
             .add_systems(
                 Update,
                 follow_input.in_set(crate::FeathersSystems::Layout),
+            )
+            // 补全状态这一帧先更新（`follow_input`），再按开合改树的高度；
+            // 排 `lay_out_frame` 之前，补全打开的同一帧输入就让出 6 行。
+            .add_systems(
+                Update,
+                sync_completion_tile
+                    .after(follow_input)
+                    .before(crate::frame::lay_out_frame)
+                    .in_set(crate::FeathersSystems::Layout),
+            )
+            .add_systems(
+                Update,
+                draw_completion.in_set(crate::FeathersSystems::Draw),
             );
     }
 }
@@ -1023,8 +1036,8 @@ impl Plugin for CompletionPlugin {
 /// 把补全列表变成行：每项一行，选中项用 `> ` 打头、强调色，说明用 dim，
 /// 宽度按上游 [`rig_tui::wrap::wrap_all`] 折（长命令名/路径不越界）。
 ///
-/// 上游 `render::draw_completion` 是 8 行浮层；我们的行是值，窗口化交给
-/// 面板，所以这里把 [`Completion::items`] 全列出来（`@` 的路径已经在
+/// 上游 `render::draw_completion` 是 8 行浮层；我们的行是值，高度由
+/// [`completion_tile_rows`] 按补全 tile 的可见行数截断（`@` 的路径已经在
 /// [`path_items`] 里截到 [`SHOWN`]）。
 pub fn completion_rows(completion: &Completion, width: usize, theme: &Theme) -> Vec<Row> {
     let width = width.max(1);
@@ -1051,12 +1064,162 @@ pub fn completion_rows(completion: &Completion, width: usize, theme: &Theme) -> 
 }
 
 // ---------------------------------------------------------------------------
+// 输入框上方的补全 tile
+// ---------------------------------------------------------------------------
+
+/// 补全打开时 tile 占几行。
+pub const TILE_ROWS: f32 = 6.0;
+
+/// 官方补全提示行，逐字照抄（`docs/reports/official-tui.md`）。
+pub const COMPLETION_HINT: &str = "Tab or Enter completes · Esc closes";
+
+/// 补全 tile 的高度（UI 像素）：开 6 行，关 0。
+///
+/// 6 行 = `6 * ROW_HEIGHT`（108 px）。tile 是右列的一个固定高度叶子：
+/// 打开时输入（比例子）自然让出这 6 行，右列总高不变。
+pub fn completion_tile_height(open: bool) -> f32 {
+    match open {
+        true => TILE_ROWS * crate::transcript::ROW_HEIGHT,
+        false => 0.0,
+    }
+}
+
+/// 补全打开/关闭时改 [`FrameTree`] 里 `Complete` 叶子的高度。
+///
+/// 关着时保留叶子、只把尺寸设成 `Fixed(0.0)`（不摘除）：右列 gap 是
+/// [`NO_GAP`](crate::layout::NO_GAP)，0 高度不会多出缝；保留叶子还能让
+/// `place_panels` 每帧把它写成 0 高度，重新打开时不用改树的结构。
+/// 树里没有 `Complete` 叶子（业务换了整棵树）时什么也不做。
+pub fn sync_completion_tile(
+    state: Res<CompletionState>,
+    tree: Option<ResMut<FrameTree>>,
+) {
+    let Some(mut tree) = tree else {
+        // 只装了 `CompletionPlugin` 的测试 App 没有帧树：没有 tile 可改。
+        return;
+    };
+    let want = crate::layout::Size::Fixed(completion_tile_height(state.is_open()));
+    if tree.0.leaf_size(PanelId::Complete) == Some(want) {
+        return;
+    }
+    tree.0.set_leaf_size(PanelId::Complete, want);
+}
+
+/// tile 的提示行（官方逐字），按 tile 宽度折行。
+pub fn completion_hint_rows(width: usize, theme: &Theme) -> Vec<Row> {
+    let width = width.max(1);
+    rig_tui::wrap::wrap_all(
+        &[Line::from(Span::styled(COMPLETION_HINT, theme.dim))],
+        width,
+    )
+    .into_iter()
+    .map(Row::new)
+    .collect()
+}
+
+/// 补全 tile 这一帧显示的行：候选在前（最多占 `visible_rows - 提示行`），
+/// **官方提示行永远在最后**，总行数不超过 `visible_rows`。
+pub fn completion_tile_rows(
+    completion: Option<&Completion>,
+    width: usize,
+    visible_rows: usize,
+    theme: &Theme,
+) -> Vec<Row> {
+    let width = width.max(1);
+    if visible_rows == 0 {
+        return Vec::new();
+    }
+    let hint = completion_hint_rows(width, theme);
+    let mut rows = Vec::new();
+    if let Some(completion) = completion {
+        let budget = visible_rows.saturating_sub(hint.len());
+        rows.extend(completion_rows(completion, width, theme).into_iter().take(budget));
+    }
+    // 候选少时提示行仍然紧跟在候选下面（官方也是这个顺序）。
+    let left = visible_rows.saturating_sub(rows.len());
+    rows.extend(hint.into_iter().take(left));
+    rows.truncate(visible_rows);
+    rows
+}
+
+/// 行内容的增量 diff hash（和 `status.rs` 同一做法：样式行 + 右段）。
+fn row_hash(row: &Row) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", row.line).hash(&mut hasher);
+    if let Some(right) = &row.right {
+        format!("{right:?}").hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// 给 tile 的行编上稳定的 key（可见行下标）与内容 hash。
+fn keyed_rows(rows: Vec<Row>) -> Vec<KeyedRow> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| KeyedRow {
+            key: index as u64 + 1,
+            hash: row_hash(&row),
+            row,
+        })
+        .collect()
+}
+
+/// 每帧把补全状态落到 `Complete` 面板：开着就写候选 + 提示行，关了就清空。
+///
+/// 宽度/高度取 [`PanelAreas`] 里这块面板的区域（右列宽度，见
+/// [`crate::frame::lay_out_frame`]）；面板还不存在（例如 niri 模式）就跳过。
+pub fn draw_completion(
+    panels: Option<ResMut<PanelRows>>,
+    state: Res<CompletionState>,
+    areas: Option<Res<PanelAreas>>,
+    roots: Option<Res<PanelRoots>>,
+    theme: Option<Res<Theme>>,
+) {
+    let (Some(mut panels), Some(areas), Some(roots)) = (panels, areas, roots) else {
+        // 没有面板系统（只装了 `CompletionPlugin` 的测试 App）：只更新状态。
+        return;
+    };
+    let Some(root) = roots.entity(PanelId::Complete) else {
+        return;
+    };
+    let Some(area) = areas.get(root) else {
+        return;
+    };
+    if !state.is_open() {
+        panels.set(PanelId::Complete, Vec::new());
+        return;
+    }
+    let theme = theme.map(|theme| *theme.as_ref()).unwrap_or_default();
+    let rows = completion_tile_rows(
+        state.completion(),
+        usize::from(area.cols),
+        usize::from(area.rows),
+        &theme,
+    );
+    panels.set(PanelId::Complete, keyed_rows(rows));
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::PanelArea;
+    use crate::layout::Size;
+    use crate::niri::TileRect;
+    use bevy::ecs::system::RunSystemOnce;
+
+    /// 一行纯文本（提示行断言用）。
+    fn row_text(row: &Row) -> String {
+        row.line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     /// 一个只有选中项固定的 [`Completion`]。
     fn completion(kind: CompletionKind, text: &str, start: usize, query: &str) -> Completion {
@@ -1080,7 +1243,7 @@ mod tests {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let at = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "rig-feathers-complete-{name}-{}-{at}",
+            "rig_niri-complete-{name}-{}-{at}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1446,7 +1609,7 @@ mod tests {
 
     #[test]
     fn walking_a_missing_root_fails() {
-        let missing = std::env::temp_dir().join("rig-feathers-complete-no-such-dir");
+        let missing = std::env::temp_dir().join("rig_niri-complete-no-such-dir");
         assert!(walk(&missing).is_err());
     }
 
@@ -1498,6 +1661,198 @@ mod tests {
         let open = state.completion().expect("#14 应打开标记列表");
         assert_eq!(open.kind, CompletionKind::Marker('#'));
         assert_eq!(open.items[0].text, "142");
+    }
+
+    #[test]
+    fn the_completion_hint_is_the_official_line() {
+        assert_eq!(COMPLETION_HINT, "Tab or Enter completes · Esc closes");
+        let theme = Theme::default();
+        let rows = completion_hint_rows(80, &theme);
+        assert_eq!(rows.len(), 1, "80 列里提示行不折");
+        assert_eq!(row_text(&rows[0]), COMPLETION_HINT);
+        // 窄面板会折行，但整句仍然都在（“closes” 是最后一行的一部分）。
+        let narrow = completion_hint_rows(20, &theme);
+        assert!(narrow.len() > 1);
+        assert!(narrow.iter().any(|row| row_text(row).contains("closes")));
+    }
+
+    /// 补全关/开：tile 高度 0 -> 6 行 -> 0。
+    #[test]
+    fn the_completion_tile_opens_to_six_rows_and_closes_to_zero() {
+        let mut app = App::new();
+        app.init_resource::<CompletionState>()
+            .init_resource::<FrameTree>();
+        app.world_mut()
+            .run_system_once(sync_completion_tile)
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .resource::<FrameTree>()
+                .0
+                .leaf_size(PanelId::Complete),
+            Some(Size::Fixed(0.0)),
+            "关着时 0 高度"
+        );
+
+        app.world_mut()
+            .resource_mut::<CompletionState>()
+            .show(completion(CompletionKind::Command, "help", 0, "he"));
+        app.world_mut()
+            .run_system_once(sync_completion_tile)
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .resource::<FrameTree>()
+                .0
+                .leaf_size(PanelId::Complete),
+            Some(Size::Fixed(completion_tile_height(true)))
+        );
+        assert_eq!(
+            completion_tile_height(true),
+            6.0 * crate::transcript::ROW_HEIGHT,
+            "6 行 = 6 * 18px"
+        );
+
+        app.world_mut().resource_mut::<CompletionState>().close();
+        app.world_mut()
+            .run_system_once(sync_completion_tile)
+            .unwrap();
+        assert_eq!(
+            app.world()
+                .resource::<FrameTree>()
+                .0
+                .leaf_size(PanelId::Complete),
+            Some(Size::Fixed(0.0)),
+            "关回去又是 0"
+        );
+    }
+
+    /// tile 打开 6 行几何：Input 上边下移 6 行、右列总高不变、叶子仍铺满。
+    #[test]
+    fn opening_the_tile_moves_the_input_down_without_changing_the_height() {
+        use bevy::prelude::Vec2;
+
+        let area = TileRect {
+            center: Vec2::new(0.7, -0.3),
+            size: Vec2::new(1.2, 0.8),
+        };
+        let mut tree = crate::layout::default_tree();
+        let closed = tree.rects(area);
+        let input_closed = closed.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+
+        assert!(tree.set_leaf_size(
+            PanelId::Complete,
+            Size::Fixed(completion_tile_height(true))
+        ));
+        let open = tree.rects(area);
+        let complete = open.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
+        let input = open.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let status = open.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+        let six_rows = completion_tile_height(true) * crate::layout::PX_TO_METERS;
+
+        assert!((complete.size.y - six_rows).abs() < 1e-6);
+        assert!((input.size.y - (input_closed.size.y - six_rows)).abs() < 1e-5);
+        assert!(
+            ((input.center.y + input.size.y * 0.5)
+                - (input_closed.center.y + input_closed.size.y * 0.5 - six_rows))
+                .abs()
+                < 1e-5,
+            "输入整体下移 6 行"
+        );
+        assert!((input.center.y - input.size.y * 0.5 - (status.center.y + status.size.y * 0.5)).abs() < 1e-5);
+        assert!(
+            (complete.size.y + input.size.y + status.size.y - area.size.y).abs() < 1e-5,
+            "右列总高不变"
+        );
+        let leaves: f32 = open.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
+        assert!((leaves - area.size.x * area.size.y).abs() < 1e-5, "叶子仍铺满");
+    }
+
+    /// 补全 tile 的行槽：候选 + 官方提示行写进 `PanelRows[Complete]`。
+    #[test]
+    fn completion_rows_are_written_into_the_complete_panel() {
+        let mut app = tile_app();
+        let mut open = completion(CompletionKind::Command, "help", 0, "he");
+        open.items.push(Candidate {
+            text: "hello".into(),
+            detail: "打招呼".into(),
+        });
+        open.selected = 1;
+        app.world_mut()
+            .resource_mut::<CompletionState>()
+            .show(open);
+        app.world_mut().run_system_once(draw_completion).unwrap();
+
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Complete);
+        assert_eq!(rows.len(), 3, "两个候选 + 一行提示");
+        let texts: Vec<String> = rows.iter().map(|row| row_text(&row.row)).collect();
+        assert!(texts[0].contains("help"));
+        assert!(texts[1].starts_with("> /hello"), "选中项带 > 前缀：{}", texts[1]);
+        assert_eq!(texts.last().unwrap(), COMPLETION_HINT, "提示行在最后、逐字");
+        assert_eq!(rows[0].key, 1, "行 key 从 1 开始，增量 diff 用");
+    }
+
+    /// 行数不超过 tile 的可见行数，提示行永远留着（候选多时截断候选）。
+    #[test]
+    fn the_tile_keeps_the_hint_within_its_visible_rows() {
+        let theme = Theme::default();
+        let mut open = completion(CompletionKind::Command, "cmd0", 0, "c");
+        open.items = (0..10)
+            .map(|index| Candidate {
+                text: format!("cmd{index}"),
+                detail: String::new(),
+            })
+            .collect();
+        let rows = completion_tile_rows(Some(&open), 20, 4, &theme);
+        assert_eq!(rows.len(), 4, "最多 4 行");
+        assert!(
+            row_text(rows.last().unwrap()).contains("closes"),
+            "最后一行是官方的 closes"
+        );
+        assert!(completion_tile_rows(Some(&open), 20, 0, &theme).is_empty());
+    }
+
+    /// 关掉补全：`PanelRows[Complete]` 清空（tile 高度由另一个系统归零）。
+    #[test]
+    fn closing_the_completion_clears_the_tile_rows() {
+        let mut app = tile_app();
+        app.world_mut()
+            .resource_mut::<CompletionState>()
+            .show(completion(CompletionKind::Command, "help", 0, "he"));
+        app.world_mut().run_system_once(draw_completion).unwrap();
+        assert!(!app.world().resource::<PanelRows>().get(PanelId::Complete).is_empty());
+
+        app.world_mut().resource_mut::<CompletionState>().close();
+        app.world_mut().run_system_once(draw_completion).unwrap();
+        assert!(app
+            .world()
+            .resource::<PanelRows>()
+            .get(PanelId::Complete)
+            .is_empty());
+    }
+
+    /// 补全面板的最小 App：有补全状态、行/根/区域三件套，`Complete` 面板
+    /// 给 40 列 × 6 行（96×28 默认帧的右列近似）。
+    fn tile_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelAreas>()
+            .init_resource::<CompletionState>();
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Complete, root);
+        app.world_mut().resource_mut::<PanelAreas>().0.insert(
+            root,
+            PanelArea {
+                cols: 40,
+                rows: 6,
+                ..Default::default()
+            },
+        );
+        app
     }
 
     #[test]

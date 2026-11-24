@@ -25,7 +25,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ rig-feathers（fork 自 rig-tui 0.47，MIT）                       │
+│ rig_niri（fork 自 rig-tui 0.47，MIT）                       │
 │                                                              │
 │  保留：renderers / view / pane / transcript / editor / keys    │
 │        input / pick / status / history / complete             │
@@ -380,7 +380,7 @@ fn gyro_camera(
 
 ## 10. 建议的下一步（按依赖顺序）
 
-1. **fork + 去终端**（M0 的前半）：`rig-feathers` crate，删 `terminal/screen`，把 `TuiPlugin` 的终端装配换成 `DefaultPlugins`。
+1. **fork + 去终端**（M0 的前半）：`rig_niri` crate，删 `terminal/screen`，把 `TuiPlugin` 的终端装配换成 `DefaultPlugins`。
 2. **`LookLine → feathers` 画一条 mock 会话**：先不做工具，验证文本/颜色/等宽/滚动。
 3. **接 6 个工具（mock 后端）+ 3 个 look**：不调模型，用手工构造的 `ToolCall` 事件驱动。
 4. **Gate + Ask 模态**：同上，手工构造 `create_order` effect，验证按住→确认→执行。
@@ -393,9 +393,9 @@ fn gyro_camera(
 
 # 实施进展（2026-11-23）
 
-## A. `rig-feathers` 依赖树已验证（重要修正）
+## A. `rig_niri` 依赖树已验证（重要修正）
 
-我建了 `research/rig-feathers/` 骨架并**编译通过**（2m52s）：
+我建了 `research/rig_niri/` 骨架并**编译通过**（2m52s）：
 
 ```toml
 bevy = "=0.20.1"          # ← 不是 0.20.0
@@ -468,7 +468,7 @@ bevy_luma = { path = "../bevy_luma" }
 
 # 进展二：feathers 适配层跑通（rig-tui look → feathers 节点 → 3D 面板）
 
-`research/rig-feathers/` 现在是一个**可运行的适配层**（4 个模块，编译通过）：
+`research/rig_niri/` 现在是一个**可运行的适配层**（4 个模块，编译通过）：
 
 ```
 src/transcript.rs  rig-tui LookLine::colored() -> feathers Node/Text/TextSpan
@@ -527,7 +527,7 @@ feathers_in_3d/    3D 渲染（独立 crate）
   src/lib.rs       FeathersIn3dPlugin（挂 UnivisRenderPlugin + 两个镜像系统）
   src/world3d.rs   路线B：每个节点落位 + 有填充的加 SDF mesh/material
   src/text3d.rs    bevy_text 字形 -> 3D 四边形（逐 section 着色）
-rig-feathers/      适配层 + 应用
+rig_niri/      适配层 + 应用
   src/transcript.rs  LookLine::colored() -> feathers Node/Text/TextSpan
   src/style.rs       ratatui Style/Color -> bevy Color
   src/main.rs        mock 转写 + 相机巡游 + 截图
@@ -644,7 +644,7 @@ Bevy 的字体加载器只认 `.ttf`/`.otf`（`bevy_text/src/font_loader.rs:38`�
 
 ```sh
 python3 tools/ttc_extract.py <font.ttc> out.otf --list     # 列出 face
-./tools/fetch_cjk_font.sh                                   # 抽 SC face 到 rig-feathers/assets/fonts/
+./tools/fetch_cjk_font.sh                                   # 抽 SC face 到 rig_niri/assets/fonts/
 #  faces=[JP, KR, SC, TC, HK] -> picking 2 (Noto Sans CJK SC)
 ```
 

@@ -1,7 +1,7 @@
 //! 帧布局：把 [`crate::layout`] 的分裂树落到每块面板的 `Node` 尺寸与 3D 锚点上。
 //!
 //! rig-tui 用"绝对位置槽"拼屏幕（`Placement::Bottom(4)`、`Rest`……）。3D 版
-//! **不照搬**：窗口是分裂树上的叶子，位置和大小都由 [`Node::rects`] 递归推导。
+//! **不照搬**：窗口是分裂树上的叶子，位置和大小都由 [`LayoutNode::rects`] 递归推导。
 //! 一块面板能拿到的矩形只取决于树，跟"离底边几行"无关。
 //!
 //! ```text
@@ -38,7 +38,7 @@ pub const CELL: Vec2 = Vec2::new(7.8, crate::transcript::ROW_HEIGHT);
 pub const PANEL_PADDING: f32 = 8.0;
 pub const PANEL_BORDER: f32 = 2.0;
 
-/// UI 像素 → 世界米的换算（与 rig-feathers 里各面板一致）。
+/// UI 像素 → 世界米的换算（与 rig_niri 里各面板一致）。
 pub const UNITS_TO_WORLD: f32 = 0.0018;
 
 /// rig-tui `panel::MIN_TRANSCRIPT`：旧槽位布局里面板不能把转写挤到比这更小。
@@ -562,8 +562,8 @@ pub fn place_panels(
     }
 }
 
-/// 装默认屏幕（rig-tui `screen.rs`）：输入在最下面、状态行在它上面、
-/// 转写占剩下的。顺序就是 rig 的 spawn 顺序，`order` 小的先占位。
+/// 装默认屏幕（rig-tui `screen.rs` 的布局在分裂树里重排）：左列转写，右列从上
+/// 到下是补全 tile / 输入 / 状态行。四块面板都是 `layout::default_tree` 的叶子。
 fn spawn_default_screen(
     mut commands: Commands,
     mut roots: ResMut<PanelRoots>,
@@ -574,9 +574,9 @@ fn spawn_default_screen(
     if std::env::var("RF_NIRI_LAYOUT").is_ok() {
         return;
     }
-    // 三块面板都是分裂树 `layout::default_tree` 的叶子：区域由树推导，
+    // 四块面板都是分裂树 `layout::default_tree` 的叶子：区域由树推导，
     // 不再是 `Bottom(4)/Bottom(2)/Rest` 这种绝对槽位。
-    // 输入：右列主区域；树里写的固定 4 格是"提示行 + 键位提示行 + 面板装饰"。
+    // 输入：右列的比例子，吃掉补全 tile 和状态行之外的全部高度。
     let input = spawn_panel(
         &mut commands,
         PanelId::Input,
@@ -604,16 +604,30 @@ fn spawn_default_screen(
         &mut commands,
         PanelId::Transcript,
         FramePanel::tree(),
+        transcript_look(),
+    );
+    // 补全 tile：右列、输入框上方；关着时树里是 0 高度（不占地方），打开时
+    // `complete` 把它改成 6 行并把候选 + 官方提示行写进 `PanelRows`。
+    let complete = spawn_panel(
+        &mut commands,
+        PanelId::Complete,
+        FramePanel::tree().inset(PanelInset::THIN),
         Look::new(
-            Color::srgb(0.045, 0.055, 0.08),
-            Color::srgb(0.25, 0.62, 0.95),
-            14.0,
+            Color::srgb(0.05, 0.07, 0.10),
+            Color::srgb(0.35, 0.45, 0.60),
+            8.0,
         ),
     );
     roots.0.insert(PanelId::Input, input);
     roots.0.insert(PanelId::Status, status);
     roots.0.insert(PanelId::Transcript, transcript);
-    for id in [PanelId::Input, PanelId::Status, PanelId::Transcript] {
+    roots.0.insert(PanelId::Complete, complete);
+    for id in [
+        PanelId::Input,
+        PanelId::Status,
+        PanelId::Transcript,
+        PanelId::Complete,
+    ] {
         rows.0.entry(id).or_default();
     }
     screen.transcript = Some(transcript);
@@ -680,6 +694,81 @@ pub fn spawn_panel(
         .id()
 }
 
+/// 转写类面板的观感（主转写和拆出来的第二个窗格用同一套）。
+fn transcript_look() -> Look {
+    Look::new(
+        Color::srgb(0.045, 0.055, 0.08),
+        Color::srgb(0.25, 0.62, 0.95),
+        14.0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 拆窗：把转写叶子拆成并排的两个转写
+// ---------------------------------------------------------------------------
+
+/// 拆窗动作：把 [`PanelId::Transcript`] 叶子横向拆成"转写 + [`PanelId::Pane2`]"。
+///
+/// 这是 niri 分裂树上的最小拆窗操作，**只由用户按键触发**，不自动拆：
+/// 1. [`FrameTree`] 里拆叶子（真实几何由 [`crate::layout::Node::rects`] 推导）；
+/// 2. 给 `Pane2` spawn 一块同样的树面板，登记进 [`PanelRoots`]；
+/// 3. 给 [`PanelRows`] 建好 `Pane2` 的行槽（内容由 `panels` 每帧从转写镜像）。
+///
+/// 已经拆过（`Pane2` 已经在树上或已经登记）时返回 `false`，不改树，也不多
+/// spawn 面板；`Transcript` 找不到时同样返回 `false`。
+pub fn split_transcript(
+    commands: &mut Commands,
+    tree: &mut FrameTree,
+    roots: &mut PanelRoots,
+    rows: &mut PanelRows,
+) -> bool {
+    if roots.entity(PanelId::Pane2).is_some() {
+        return false;
+    }
+    if !tree
+        .0
+        .split_leaf(PanelId::Transcript, crate::layout::Split::Horizontal, PanelId::Pane2)
+    {
+        return false;
+    }
+    let pane2 = spawn_panel(commands, PanelId::Pane2, FramePanel::tree(), transcript_look());
+    roots.0.insert(PanelId::Pane2, pane2);
+    rows.0.entry(PanelId::Pane2).or_default();
+    true
+}
+
+/// `Alt+S` 的绑定：拆转写窗格。
+///
+/// 它不带 [`crate::keys::InputAction`]：按键系统只执行它认识的内置动作
+/// （`editor.rs` 的 `act` 走的是穷尽 match，本模块不改那个文件），插件绑定
+/// 走 [`KeyPressed`](crate::keys::KeyPressed) 观察者，和 `editor.rs` 的测试
+/// `a_plugins_binding_receives_key_pressed` 是同一条路。
+pub fn split_binding() -> crate::keys::KeyBinding {
+    use crate::keys::{KeyBinding, KeyPress, KeyScope};
+    KeyBinding::new(KeyPress::alt('s'), "Split the transcript").in_scope(KeyScope::Global)
+}
+
+/// 按下 `Alt+S`：拆一次（重复按是安全的空操作）。
+fn split_pressed(
+    _pressed: On<crate::keys::KeyPressed>,
+    mut commands: Commands,
+    tree: Option<ResMut<FrameTree>>,
+    roots: Option<ResMut<PanelRoots>>,
+    rows: Option<ResMut<PanelRows>>,
+) {
+    let (Some(mut tree), Some(mut roots), Some(mut rows)) = (tree, roots, rows) else {
+        // 只装了 `FramePlugin` 的最小 App 没有面板资源：按键什么也不做。
+        return;
+    };
+    split_transcript(&mut commands, &mut tree, &mut roots, &mut rows);
+}
+
+/// 注册 `Alt+S` 拆窗绑定。`FramePlugin` 自己调用；业务想重新绑定时可以复用。
+pub fn add_split_key(app: &mut App) {
+    use crate::keys::AppKeyBindingsExt;
+    let _ = app.add_key_binding(split_binding(), split_pressed);
+}
+
 /// 帧布局插件：默认屏幕 + 每帧布局。
 pub struct FramePlugin;
 
@@ -697,6 +786,7 @@ impl Plugin for FramePlugin {
                     .chain()
                     .in_set(crate::FeathersSystems::Layout),
             );
+        add_split_key(app);
     }
 }
 
@@ -988,10 +1078,15 @@ mod tests {
         let roots = app.world().resource::<PanelRoots>();
         let transcript = roots.entity(PanelId::Transcript).expect("转写面板");
         let status = roots.entity(PanelId::Status).expect("状态面板");
+        let complete = roots.entity(PanelId::Complete).expect("补全面板");
         let areas = app.world().resource::<PanelAreas>();
-        assert_eq!(areas.0.len(), 3, "三块面板都由树放好");
+        assert_eq!(areas.0.len(), 4, "四块面板都由树放好");
         assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 28));
         assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(64, 26, 32, 2));
+        // 补全 tile 关着：0 高度，但仍然有区域（这样每帧都能把它写成 0 高）。
+        let closed = areas.get(complete).expect("补全区域");
+        assert_eq!(closed.rect, CellRect::new(64, 0, 32, 0));
+        assert!(closed.is_empty());
 
         // `Node` 尺寸 = 树给的精确像素；3D 锚点 = 树给的精确中心（不是格子中心）。
         let node = app.world().get::<Node>(transcript).expect("Node");
@@ -1010,6 +1105,157 @@ mod tests {
             world.anchor.translation.x
         );
         assert_eq!(world.anchor.translation.y, 0.0);
+    }
+
+    /// 默认树里补全 tile 关着：0 行高度，输入仍从右列顶部开始。
+    #[test]
+    fn the_closed_complete_tile_takes_no_rows() {
+        let (input, status, transcript, complete) =
+            (entity(0), entity(1), entity(2), entity(3));
+        let roots = roots(&[
+            (PanelId::Input, input),
+            (PanelId::Status, status),
+            (PanelId::Transcript, transcript),
+            (PanelId::Complete, complete),
+        ]);
+        let areas = laid_out(
+            (96, 28),
+            &layout::default_tree(),
+            vec![
+                tree_panel(input, PanelInset::DEFAULT),
+                tree_panel(status, PanelInset::THIN),
+                tree_panel(transcript, PanelInset::DEFAULT),
+                tree_panel(complete, PanelInset::THIN),
+            ],
+            &roots,
+        );
+        let tile = areas[&complete.index_u32()];
+        assert_eq!(tile.rect, CellRect::new(64, 0, 32, 0));
+        assert!(tile.is_empty(), "0 高度的 tile 这一帧没有文字区");
+        assert_eq!(
+            areas[&input.index_u32()].rect,
+            CellRect::new(64, 0, 32, 26),
+            "关着的 tile 不挤输入"
+        );
+    }
+
+    /// 拆窗 App：只需要树与面板三件套，不建窗口。
+    fn split_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<FrameTree>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>();
+        app
+    }
+
+    fn split_once(
+        mut commands: Commands,
+        mut tree: ResMut<FrameTree>,
+        mut roots: ResMut<PanelRoots>,
+        mut rows: ResMut<PanelRows>,
+    ) -> bool {
+        split_transcript(&mut commands, &mut tree, &mut roots, &mut rows)
+    }
+
+    /// 拆窗动作真的 spawn 了 `Pane2`（树面板）并登记；重复拆是空操作。
+    #[test]
+    fn split_transcript_spawns_and_registers_pane2() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut app = split_app();
+        assert!(app.world_mut().run_system_once(split_once).unwrap());
+
+        let pane2 = app
+            .world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Pane2)
+            .expect("Pane2 要登记进 PanelRoots");
+        let panel = app.world().get::<FramePanel>(pane2).expect("Pane2 是树面板");
+        assert_eq!(panel.placement, Placement::Tree);
+        assert!(app.world().get::<Node>(pane2).is_some());
+        assert_eq!(
+            app.world().get::<Name>(pane2).map(|name| name.as_str().to_owned()),
+            Some("panel:Pane2".to_owned())
+        );
+        assert!(
+            app.world()
+                .resource::<PanelRows>()
+                .0
+                .contains_key(&PanelId::Pane2),
+            "Pane2 的行槽要建好"
+        );
+        let leaves = app.world().resource::<FrameTree>().0.leaves();
+        assert_eq!(leaves.len(), 5, "默认树 4 叶子 + 新拆的 Pane2");
+        assert!(leaves.contains(&PanelId::Pane2));
+
+        // 第二次：返回 false，树不变，也不会多一个 Pane2 实体。
+        let tree = app.world().resource::<FrameTree>().0.clone();
+        assert!(!app.world_mut().run_system_once(split_once).unwrap());
+        assert_eq!(app.world().resource::<FrameTree>().0, tree);
+        let mut query = app.world_mut().query::<&PanelId>();
+        let pane2_count = query
+            .iter(app.world())
+            .filter(|id| **id == PanelId::Pane2)
+            .count();
+        assert_eq!(pane2_count, 1, "重复拆不 spawn 第二块");
+    }
+
+    /// `Alt+S` 走插件绑定 -> `KeyPressed` -> 拆窗；不会往输入里打字符。
+    #[test]
+    fn alt_s_splits_the_transcript_and_types_nothing() {
+        use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
+        use bevy::input::ButtonState;
+
+        fn key_app() -> App {
+            let mut app = split_app();
+            app.add_message::<KeyboardInput>()
+                .add_message::<crate::editor::PromptSubmitted>()
+                .init_resource::<bevy::input::ButtonInput<KeyCode>>()
+                .init_resource::<crate::editor::Editor>()
+                .init_resource::<crate::editor::SubmittedPrompts>()
+                .init_resource::<crate::keys::KeyFocus>()
+                .init_resource::<crate::keys::PendingInput>();
+            crate::keys::add_built_in(&mut app);
+            add_split_key(&mut app);
+            app.add_systems(Update, crate::editor::keys);
+            app
+        }
+
+        fn press_alt_s(app: &mut App) {
+            app.world_mut()
+                .resource_mut::<bevy::input::ButtonInput<KeyCode>>()
+                .press(KeyCode::AltLeft);
+            app.world_mut().write_message(KeyboardInput {
+                key_code: KeyCode::KeyS,
+                logical_key: Key::Character("s".into()),
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+            app.update();
+        }
+
+        let mut app = key_app();
+        press_alt_s(&mut app);
+        let pane2 = app
+            .world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Pane2)
+            .expect("Alt+S 要拆出 Pane2");
+        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 5);
+        assert_eq!(
+            app.world().resource::<crate::editor::Editor>().text(),
+            "",
+            "Alt+S 不打字符"
+        );
+
+        // 再按一次：还是同一块面板。
+        press_alt_s(&mut app);
+        assert_eq!(
+            app.world().resource::<PanelRoots>().entity(PanelId::Pane2),
+            Some(pane2)
+        );
     }
 
     /// 格子换算：一帧 96×28 的像素尺寸。

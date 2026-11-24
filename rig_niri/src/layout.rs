@@ -16,8 +16,9 @@
 //!   所以叶子之间既不重叠也不留缝（和 `niri.rs::column_edges` 同一做法）。
 //!
 //! 一个 split 若没有比例子，剩余空间给**第一个子**（主区域）。这条规则让
-//! `default_tree` 的右列（输入 Fixed 4 格 + 状态 Fixed 2 格）仍然铺满整屏：
-//! 输入是主区域，状态保持 2 格贴在底部。
+//! 只有固定子的列也能铺满：第一个子吃掉剩余，后面的固定子保持精确。
+//! `default_tree` 的右列则把输入写成比例子（补全 tile 的 0/6 行是固定子，
+//! 输入拿剩下的），所以补全打开/关闭时右列总高都精确不变。
 //!
 //! 3D 坐标：区域用 [`TileRect`]（米，原点在帧中心，y 朝上）。第一块子区域在
 //! 上/左，第二块在下/右。
@@ -316,9 +317,15 @@ impl Node {
 
     /// 把一个叶子换成"原叶子 + 新叶子"的 split。这是"窗口能拆分"的最小操作。
     ///
-    /// 方向由调用方定；新 split 用 [`DEFAULT_GAP`] 留缝。找到 `panel` 返回
-    /// `true`（即使 `new_panel` 和 `panel` 相同，也照拆），找不到返回 `false`。
+    /// 方向由调用方定；新 split 用 [`DEFAULT_GAP`] 留缝。找到 `panel` 且
+    /// `new_panel` 还不在树上时返回 `true`；找不到、或者新面板已经存在时返回
+    /// `false`（同一块面板出现两次的话 [`crate::frame::PanelRoots`] 没法把两个
+    /// 叶子映到各自的实体，所以不允许重复）。
     pub fn split_leaf(&mut self, panel: PanelId, direction: Split, new_panel: PanelId) -> bool {
+        // 重复触发（已经拆过）要安全地什么也不做：树保持原样。
+        if new_panel == panel || self.leaves().contains(&new_panel) {
+            return false;
+        }
         match self {
             Self::Leaf { panel: found } if *found == panel => {
                 let original = *found;
@@ -337,6 +344,51 @@ impl Node {
                 .iter_mut()
                 .any(|child| child.node.split_leaf(panel, direction, new_panel)),
         }
+    }
+
+    /// `panel` 这个叶子的尺寸约束，找不到返回 `None`。
+    ///
+    /// 尺寸挂在父 [`Child`] 上（叶子自身没有尺寸），所以从根开始找"装着这个
+    /// 叶子的那个子"。根正好是叶子时返回 `None`（根没有父，也就没有尺寸）。
+    pub fn leaf_size(&self, panel: PanelId) -> Option<Size> {
+        let Self::Split { children, .. } = self else {
+            return None;
+        };
+        for child in children {
+            if let Self::Leaf { panel: found } = &child.node {
+                if *found == panel {
+                    return Some(child.size);
+                }
+            }
+            if let Some(size) = child.node.leaf_size(panel) {
+                return Some(size);
+            }
+        }
+        None
+    }
+
+    /// 改 `panel` 这个叶子的尺寸约束；找到并真的改了返回 `true`。
+    ///
+    /// 补全 tile 的开合就走这里：关着时 `Fixed(0.0)`（不占高度），打开时
+    /// `Fixed(6 行)`。尺寸没变时不写，免得每帧都把 [`crate::frame::FrameTree`]
+    /// 标脏。
+    pub fn set_leaf_size(&mut self, panel: PanelId, size: Size) -> bool {
+        let Self::Split { children, .. } = self else {
+            return false;
+        };
+        for child in children.iter_mut() {
+            if matches!(&child.node, Self::Leaf { panel: found } if *found == panel) {
+                if child.size == size {
+                    return false;
+                }
+                child.size = size;
+                return true;
+            }
+            if child.node.set_leaf_size(panel, size) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -363,16 +415,20 @@ impl Sanitized for f32 {
 /// Horizontal
 /// ├─ Transcript   Proportion 2   ← 左 2/3
 /// └─ Vertical                   ← 右 1/3
-///    ├─ Input      Fixed 4 格   ← 提示行 + 键位提示行 + 面板装饰
+///    ├─ Complete   Fixed 0 格   ← 补全 tile：关着 0，打开 6 格
+///    ├─ Input      Proportion 1  ← 提示行 + 键位提示行 + 面板装饰，吃掉右列剩余
 ///    └─ Status     Fixed 2 格   ← 细条里居中一行
 /// ```
 ///
 /// 数值理由：
 /// * 转写是主区域，给 2 份；输入列 1 份，和 niri 的预设列宽 2/3 + 1/3 对齐。
-/// * 输入 4 格 = [`crate::transcript::ROW_HEIGHT`] × 4：两行文字（提示 + 键位
-///   提示）加内边距/边框；状态 2 格：一行字在细条里居中。
-/// * 右列没有比例子，按 [`Node::rects`] 的规则由第一个子（输入）吃掉剩余高度，
-///   状态固定保持 2 格贴底。
+/// * 输入是右列的比例子，剩余高度全归它；`28` 行的默认帧里就是 26 行
+///   （原来的 `Fixed 4 格` 靠"第一个子吃剩余"得到同样的几何）。
+/// * 状态 2 格：一行字在细条里居中，固定贴底。
+/// * 补全 tile 初始 `Fixed(0.0)`：不占高度。打开时 [`crate::complete`] 把它改成
+///   `Fixed(6 * ROW_HEIGHT)`，输入按比例自然缩短，总高度仍然精确等于右列高度。
+///   这里**保留** 0 高度叶子（不摘除）：右列 gap = [`NO_GAP`]，0 高度不会多出缝；
+///   而保留叶子让 `place_panels` 每帧都能把它写成 0 高度，重新打开时不用重建树。
 /// * 树里 gap = [`NO_GAP`]：面板自己有边框和内边距，默认屏幕不需要额外缝，
 ///   叶子面积正好铺满整屏。
 pub fn default_tree() -> Node {
@@ -389,7 +445,10 @@ pub fn default_tree() -> Node {
                     Split::Vertical,
                     NO_GAP,
                     vec![
-                        Child::fixed(4.0 * ROW_HEIGHT, Node::leaf(PanelId::Input)),
+                        // 补全 tile 在输入框上方：关着时 0 高度（不占位）。
+                        Child::fixed(0.0, Node::leaf(PanelId::Complete)),
+                        // 输入是比例子：补全打开时它让出 6 行，其余高度仍归它。
+                        Child::proportion(1.0, Node::leaf(PanelId::Input)),
                         Child::fixed(2.0 * ROW_HEIGHT, Node::leaf(PanelId::Status)),
                     ],
                 ),
@@ -720,17 +779,22 @@ mod tests {
         assert!(close(top(&input), top(&area())));
     }
 
-    // 13. 默认树铺满整屏（叶子面积之和 = 区域面积）。
+    // 13. 默认树铺满整屏（叶子面积之和 = 区域面积），补全 tile 关着不占高度。
     #[test]
     fn the_default_tree_covers_the_screen() {
         let node = default_tree();
         let found = node.rects(area());
-        assert_eq!(found.len(), 3);
+        assert_eq!(found.len(), 4, "转写 / 补全 / 输入 / 状态");
         let mut ids: Vec<PanelId> = found.iter().map(|(id, _)| *id).collect();
         ids.sort_by_key(|id| format!("{id:?}"));
         assert_eq!(
             ids,
-            vec![PanelId::Input, PanelId::Status, PanelId::Transcript]
+            vec![
+                PanelId::Complete,
+                PanelId::Input,
+                PanelId::Status,
+                PanelId::Transcript
+            ]
         );
         let leaves: f32 = found
             .iter()
@@ -745,10 +809,16 @@ mod tests {
         let transcript = found.iter().find(|(id, _)| *id == PanelId::Transcript).unwrap().1;
         let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
         let status = found.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+        let complete = found.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
         assert!(close(transcript.size.x, area().size.x * 2.0 / 3.0));
         assert!(close(status.size.y, 2.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS));
         assert!(close(bottom(&status), bottom(&area())));
         assert!(close(bottom(&input), top(&status)));
+        // 补全 tile 关着：高度 0，贴右列顶部，不占输入的地方。
+        assert_eq!(complete.size.y, 0.0);
+        assert!(close(top(&complete), top(&area())));
+        assert!(close(top(&input), top(&complete)), "0 高度不挤输入");
+        assert_eq!(node.leaf_size(PanelId::Complete), Some(Size::Fixed(0.0)));
     }
 
     // 14. 固定子总和超过区域时整体缩小，仍然不越界、不重叠。
@@ -786,5 +856,165 @@ mod tests {
         assert!(close(left(&found[0].1), left(&area())));
         assert!(close(found[1].1.size.x, area().size.x), "比例子拿到全部宽度");
         assert!(close(right(&found[1].1), right(&area())));
+    }
+
+    // 16. 补全打开：tile 占 6 行，输入让出同样的高度，右列总高不变。
+    #[test]
+    fn opening_the_complete_tile_moves_the_input_down() {
+        let mut node = default_tree();
+        let closed = rects(&node);
+        let input_closed = closed.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let complete_closed = closed.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
+        assert_eq!(complete_closed.size.y, 0.0);
+
+        let row = crate::transcript::ROW_HEIGHT;
+        assert!(node.set_leaf_size(PanelId::Complete, Size::Fixed(6.0 * row)));
+        assert!(!node.set_leaf_size(PanelId::Complete, Size::Fixed(6.0 * row)), "尺寸没变不写");
+
+        let open = rects(&node);
+        let complete = open.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
+        let input = open.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let status = open.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+
+        assert!(close(complete.size.y, 6.0 * row * PX_TO_METERS), "tile 正好 6 行");
+        assert!(close(top(&complete), top(&area())));
+        assert!(
+            close(top(&input), top(&area()) - 6.0 * row * PX_TO_METERS),
+            "输入的上边下移 6 行"
+        );
+        assert!(close(bottom(&input), bottom(&input_closed)), "输入底边不动");
+        assert!(close(bottom(&input), top(&status)));
+        assert!(
+            close(complete.size.y + input.size.y + status.size.y, area().size.y),
+            "右列高度仍然精确等于区域"
+        );
+        let leaves: f32 = open.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
+        assert!(close(leaves, area().size.x * area().size.y), "叶子面积仍然铺满");
+
+        // 关回去：tile 回到 0，输入恢复原来的几何。
+        assert!(node.set_leaf_size(PanelId::Complete, Size::Fixed(0.0)));
+        let again = rects(&node);
+        let input_again = again.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        assert!(close(top(&input_again), top(&input_closed)));
+        assert!(close(input_again.size.y, input_closed.size.y));
+        assert_eq!(node.leaf_size(PanelId::Complete), Some(Size::Fixed(0.0)));
+    }
+
+    // 17. 尺寸读写：根就是叶子时没有尺寸可读，也改不动。
+    #[test]
+    fn a_root_leaf_has_no_size_to_read_or_write() {
+        let mut node = leaf(PanelId::Transcript);
+        assert_eq!(node.leaf_size(PanelId::Transcript), None);
+        assert!(!node.set_leaf_size(PanelId::Transcript, Size::Fixed(18.0)));
+        assert_eq!(node, leaf(PanelId::Transcript));
+        // 不存在的叶子：读不到，也改不动。
+        let mut tree = default_tree();
+        assert_eq!(tree.leaf_size(PanelId::Preview), None);
+        assert!(!tree.set_leaf_size(PanelId::Preview, Size::Fixed(18.0)));
+    }
+
+    /// 补全 tile 加入之前的 3 叶子树（转写 + 输入 + 状态），拆窗测试用。
+    fn three_leaf_tree() -> Node {
+        use crate::transcript::ROW_HEIGHT;
+        Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::proportion(2.0, leaf(PanelId::Transcript)),
+                Child::new(
+                    Size::Proportion(1.0),
+                    Node::split(
+                        Split::Vertical,
+                        NO_GAP,
+                        vec![
+                            Child::fixed(4.0 * ROW_HEIGHT, leaf(PanelId::Input)),
+                            Child::fixed(2.0 * ROW_HEIGHT, leaf(PanelId::Status)),
+                        ],
+                    ),
+                ),
+            ],
+        )
+    }
+
+    // 18. 拆窗：3 叶子 -> 4 叶子，两个转写并排，缝隙精确、面积仍然铺满。
+    #[test]
+    fn split_turns_the_transcript_into_two_side_by_side_panes() {
+        let mut node = three_leaf_tree();
+        assert_eq!(node.leaves().len(), 3, "初始 3 叶子");
+        let before = rects(&node);
+        let input_before = before.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let status_before = before.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+        let transcript_before = before.iter().find(|(id, _)| *id == PanelId::Transcript).unwrap().1;
+
+        assert!(node.split_leaf(PanelId::Transcript, Split::Horizontal, PanelId::Pane2));
+        assert_eq!(node.leaves().len(), 4, "拆完 4 叶子");
+
+        let found = rects(&node);
+        assert_eq!(found.len(), 4);
+        let transcript = found.iter().find(|(id, _)| *id == PanelId::Transcript).unwrap().1;
+        let pane2 = found.iter().find(|(id, _)| *id == PanelId::Pane2).unwrap().1;
+        let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let status = found.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+
+        // 两个转写并排：同高、同一条水平线，中间恰好 DEFAULT_GAP。
+        assert!(close(transcript.size.y, pane2.size.y));
+        assert!(close(top(&transcript), top(&pane2)));
+        assert!(close(bottom(&transcript), bottom(&pane2)));
+        assert!(close(transcript.size.x, pane2.size.x), "两半等宽");
+        assert!(close(
+            left(&pane2) - right(&transcript),
+            DEFAULT_GAP * PX_TO_METERS
+        ));
+        // 仍然占住原来的左列：左边界、右边界与拆前一致。
+        assert!(close(left(&transcript), left(&transcript_before)));
+        assert!(close(right(&pane2), right(&transcript_before)));
+        // 右列两块完全没动。
+        assert_eq!(input, input_before);
+        assert_eq!(status, status_before);
+        // 铺满：叶子面积 + 新加的缝 = 整屏面积。
+        let leaves: f32 = found.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
+        let gap_area = DEFAULT_GAP * PX_TO_METERS * area().size.y;
+        assert!(close(leaves + gap_area, area().size.x * area().size.y));
+    }
+
+    // 19. 已经拆过再拆：返回 false，树一个字节都不变。
+    #[test]
+    fn splitting_the_transcript_twice_is_a_no_op() {
+        let mut node = three_leaf_tree();
+        assert!(node.split_leaf(PanelId::Transcript, Split::Horizontal, PanelId::Pane2));
+        let after_first = node.clone();
+        assert!(!node.split_leaf(PanelId::Transcript, Split::Horizontal, PanelId::Pane2));
+        assert_eq!(node, after_first, "重复拆不动树");
+        assert_eq!(node.leaves().len(), 4);
+    }
+
+    // 20. 0 高度的兄弟不占地方，也不夺走比例子的剩余高度。
+    #[test]
+    fn a_zero_height_sibling_takes_no_room() {
+        let node = Node::split(
+            Split::Vertical,
+            NO_GAP,
+            vec![
+                Child::fixed(0.0, leaf(PanelId::Complete)),
+                Child::proportion(1.0, leaf(PanelId::Input)),
+                Child::fixed(2.0 * crate::transcript::ROW_HEIGHT, leaf(PanelId::Status)),
+            ],
+        );
+        let found = rects(&node);
+        let complete = found.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
+        let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let status = found.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+        assert_eq!(complete.size.y, 0.0);
+        assert!(close(top(&complete), top(&area())));
+        assert!(close(top(&input), top(&complete)), "输入从 tile 底部开始");
+        assert!(
+            close(
+                input.size.y,
+                area().size.y - 2.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS
+            ),
+            "比例子拿到除固定行外的全部高度"
+        );
+        assert!(close(bottom(&input), top(&status)));
+        assert!(close(bottom(&status), bottom(&area())));
     }
 }

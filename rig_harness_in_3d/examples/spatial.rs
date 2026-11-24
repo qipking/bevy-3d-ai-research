@@ -15,10 +15,10 @@
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::text::FontSource;
-use rig_feathers::camera_rig::RigCamera;
-use rig_feathers::niri::{Column, Layer, LayerFocus, PresetSize, Tile, Tiling};
-use rig_feathers::spatial::{CardContent, CardLook, FreeLook, spawn_card_sized};
-use rig_feathers::transcript::{Row, TranscriptFont};
+use rig_niri::camera_rig::RigCamera;
+use rig_niri::niri::{Column, Layer, LayerFocus, PresetSize, Tile, Tiling};
+use rig_niri::spatial::{CardContent, CardLook, FreeLook, spawn_card_sized};
+use rig_niri::transcript::{Row, TranscriptFont};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
@@ -48,8 +48,8 @@ fn main() {
         }))
         .add_plugins(bevy_feathers::FeathersPlugins)
         .add_plugins(feathers_in_3d::FeathersIn3dPlugin)
-        .add_plugins(rig_feathers::niri::TilingPlugin)
-        .add_plugins(rig_feathers::spatial::SpatialPlugin)
+        .add_plugins(rig_niri::niri::TilingPlugin)
+        .add_plugins(rig_niri::spatial::SpatialPlugin)
         .insert_resource(Tour { frame: 0, dir })
         .add_systems(Startup, (setup, spawn_rings, spawn_cards).chain())
         .add_systems(Update, tour)

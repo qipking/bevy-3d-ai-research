@@ -14,15 +14,15 @@
 //! `collect_rows` 追加在引擎行之后的 Ask 行原样接回去（按"引擎行数"切，而不是
 //! 靠 key 猜）。
 //!
-//! 如果 `rig-feathers` 以后让 `collect_rows` 保留 `TextId::Notice(_)`，本系统的
+//! 如果 `rig_niri` 以后让 `collect_rows` 保留 `TextId::Notice(_)`，本系统的
 //! 回填就可以去掉，只留"收到 Notice 时 set_text + place"。
 
 use bevy::prelude::*;
 use rig_ecs::prelude::{Agent, Notice, NoticeLevel};
-use rig_feathers::frame::{PanelAreas, PanelRoots};
-use rig_feathers::pane::TranscriptRows;
-use rig_feathers::panels::PanelId;
-use rig_feathers::transcript::{TextId, Transcript};
+use rig_niri::frame::{PanelAreas, PanelRoots};
+use rig_niri::pane::TranscriptRows;
+use rig_niri::panels::PanelId;
+use rig_niri::transcript::{TextId, Transcript};
 use rig_tui::RenderBatch;
 use rig_tui::ratatui::style::{Color as RColor, Style};
 use rig_tui::ratatui::text::Line;

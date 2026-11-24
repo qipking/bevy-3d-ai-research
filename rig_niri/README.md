@@ -1,4 +1,4 @@
-# rig-feathers
+# rig_niri
 
 **rig-tui 的另一个完整前端**：同样的内核（rig-ecs / rig-core）、同样的 look 管线（`RenderBatch` + `RenderSystems::Render`），
 但把"终端格子"换成 **feathers UI + 世界空间 3D 面板**。同时，它本身就是**通用 app 的 fork 模板**。
@@ -9,7 +9,7 @@
               └───────────────┬──────────────────────────┘
                               │  同一个 bevy world（rig-ecs 是 bevy 0.20.1 插件）
         ┌─────────────────────▼──────────────────────┐
-        │ rig-feathers（本 crate，lib）              │
+        │ rig_niri（本 crate，lib）              │
         │  batch   : 效应 -> RenderBatch -> look     │
         │  transcript : LookLine -> feathers 行      │
         │  frame   : Placement 帧布局（rig 的算法）  │
@@ -23,7 +23,7 @@
 
 ## 定位：它是"另一个前端"，不是业务 app
 
-| | rig-tui | rig-feathers |
+| | rig-tui | rig_niri |
 |---|---|---|
 | 前端身份 | `Front::new("tui")` | `Front::new("feathers")` |
 | 设备 | 终端（crossterm/ratatui） | 窗口 + 3D 世界（feathers/bevy） |
@@ -38,7 +38,7 @@
 
 ## 和 rig-tui 的功能对照（`UPSTREAM.md` 有完整表）
 
-| rig-tui | rig-feathers | 状态 |
+| rig-tui | rig_niri | 状态 |
 |---|---|---|
 | `panel.rs`（`TuiPanel`/`Placement`/`lay_out`） | `frame.rs`（同名同义的 `Placement`/`lay_out`，格子版算法） | ✅ |
 | `render.rs` 的帧布局（面板 → 面板区 → 剩余区） | `frame.rs` 的 `lay_out_frame` + `place_panels` | ✅ |

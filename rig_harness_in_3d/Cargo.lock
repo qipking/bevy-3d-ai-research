@@ -6181,30 +6181,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rig-feathers"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_clipboard",
- "bevy_feathers",
- "bevy_text",
- "bevy_ui",
- "bevy_ui_render",
- "bevy_ui_widgets",
- "bevy_window",
- "bevy_winit",
- "feathers_in_3d",
- "rig-core",
- "rig-ecs",
- "rig-harness",
- "rig-tui",
- "serde",
- "serde_json",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "rig-harness"
 version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6384,11 +6360,35 @@ dependencies = [
  "feathers_in_3d",
  "rig-core",
  "rig-ecs",
- "rig-feathers",
+ "rig-harness",
+ "rig-tui",
+ "rig_niri",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rig_niri"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_clipboard",
+ "bevy_feathers",
+ "bevy_text",
+ "bevy_ui",
+ "bevy_ui_render",
+ "bevy_ui_widgets",
+ "bevy_window",
+ "bevy_winit",
+ "feathers_in_3d",
+ "rig-core",
+ "rig-ecs",
  "rig-harness",
  "rig-tui",
  "serde",
  "serde_json",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

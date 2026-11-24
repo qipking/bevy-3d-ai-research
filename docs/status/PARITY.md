@@ -1,8 +1,8 @@
-# rig-feathers ↔ rig-tui 移植缺口清单
+# rig_niri ↔ rig-tui 移植缺口清单
 
 > **性质**：只读审计。本文档是唯一新增文件，没有改动任何 `.rs`，没有动 git/jj 状态。
 > **基准**：`rig-tui = 0.47.0`（`/var/home/lichi/桌面/research/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rig-tui-0.47.0/src/`）
-> 对 `rig-feathers 0.1.0`（`/var/home/lichi/桌面/research/rig-feathers/src/`）。
+> 对 `rig_niri 0.1.0`（`/var/home/lichi/桌面/research/rig_niri/src/`）。
 > **方法**：逐文件读两边源码；每条"部分/缺什么"都指到上游函数名或行号。
 > **口径**：`已移植` = 该模块对外的职责已完整落地（可以换实现）；`部分` = 主路径在，但公开能力有明确缺口；`未开始` = 上游模块没有任何对应物；`有意替换` = 纯终端管道，用 bevy 窗口/渲染取代，不该移植。
 
@@ -10,7 +10,7 @@
 
 ## 0. 先看数字
 
-| 指标 | rig-tui | rig-feathers |
+| 指标 | rig-tui | rig_niri |
 |---|---|---|
 | `.rs` 文件 | **26**（含 `tests.rs` 集成测试 433 行） | **17** |
 | 总行数 | **14749** | **4943** |
@@ -510,9 +510,9 @@ PLAN.md §1 的 8 行标注偏乐观（6 处 ✅ + 2 处 ⚠️），按本文�
 | 应用层：设置 `Settings` | ✅ 已接 | `settings.rs`：`RIG_HOME/settings.toml`，`[view] hide_status` 真的影响视图；`/setting` 查看与修改并写回；坏 TOML/类型错降级 + `warn!` |
 | 应用层：状态行真实化 | ✅ 已接 | `status.rs`：每帧从 `SessionPaths`/Agent/`ActiveTurn`/`Conversation`/`Running`/`LastUsage` 写 `AppStatus`，演示数字已删 |
 
-**规模**：`rig-feathers` 4943 → **15351 行 / 23 个模块**（上游 26 模块 14749 行）；
+**规模**：`rig_niri` 4943 → **15351 行 / 23 个模块**（上游 26 模块 14749 行）；
 `rig_harness_in_3d` 116 → **2350 行**。
-**测试**：`rig-feathers` **207 个**（从 40 起）、`rig_harness_in_3d` **13 + 1 doctest**。
+**测试**：`rig_niri` **207 个**（从 40 起）、`rig_harness_in_3d` **13 + 1 doctest**。
 
 ### 估算覆盖率
 

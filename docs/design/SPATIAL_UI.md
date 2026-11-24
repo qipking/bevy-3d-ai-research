@@ -1,6 +1,6 @@
 # 空间 UI 设计纲领（会议记录 + 决策）
 
-> **niri 的唯一用途**：`rig-feathers` 移植 `rig-tui` 时，组件/窗口的**布局位置设计**参考
+> **niri 的唯一用途**：`rig_niri` 移植 `rig-tui` 时，组件/窗口的**布局位置设计**参考
 > `reference/niri/niri-main`。除此之外（斗兽场、圆柱体总览、环、两级视角）全部不再推进。
 >
 > 本文件保留 §1–§10（另含开头 §0 结论）：3D 相对终端的赢面判断、该丢什么、为什么用 Bevy ECS、
@@ -163,7 +163,7 @@ Bevy 侧的同构物（我们已经在用）：
 ```text
 rig-ecs           内核（agent/turn/call/gate/ask）         不变
 rig-harness       服务（session/commands/settings/Ask/Pick）不变
-rig-feathers      空间视图层：
+rig_niri      空间视图层：
                     content/  转写、composer、chooser 的内容（复用现有 transcript/pane/look）
                     card/     卡片 = 内容 + 姿态 + chrome + ornament
                     space/    卡片放在哪（前弧、墙、桌）、沉浸分级
@@ -171,7 +171,7 @@ rig-feathers      空间视图层：
 feathers_in_3d    渲染（Mirror + 文字 + 排序 + 裁剪 + 拾取）  不变
 ```
 
-模块计划（都放 `rig-feathers`，不新开 crate）：
+模块计划（都放 `rig_niri`，不新开 crate）：
 
 | 模块 | 职责 | 复用 |
 |---|---|---|

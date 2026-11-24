@@ -1,4 +1,4 @@
-# 交接文档：rig-feathers / feathers_in_3d
+# 交接文档：rig_niri / feathers_in_3d
 
 > 写于 2026-11-23，目的是**上下文超限时也能接着干**。先读这一页，再按需展开其它文档。
 > 工作区：`/var/home/lichi/桌面/research`（jj 仓库）
@@ -34,7 +34,7 @@ jj evolog -r @            # 工作区 commit 的历次版本
 ## 0.1 一页速览
 
 **目标**：用 **feathers 做前端 + rig 做内核**，做一个带 3D 空间界面的助手（先桌面，后移动端陀螺仪相机）。
-**当前原则（2026-11-25 重定）**：`niri` 只用于 `rig-feathers` 移植 `rig-tui` 时组件/窗口的
+**当前原则（2026-11-25 重定）**：`niri` 只用于 `rig_niri` 移植 `rig-tui` 时组件/窗口的
 **布局位置设计**参考（源码 `reference/niri/niri-main`）。斗兽场漏斗、圆柱体总览、环、两级视角
 全部不再推进，相关设计已归档 → [`GEOMETRY_HISTORY.md`](../archive/GEOMETRY_HISTORY.md)、
 [`WATCHWALL.md`](../archive/WATCHWALL.md)。当前推进的仍是功能面（会话、命令、设置、闸门、picker，
@@ -43,13 +43,13 @@ jj evolog -r @            # 工作区 commit 的历次版本
 | 目录 | 是什么 | 状态 |
 |---|---|---|
 | `feathers_in_3d/` | 把 bevy_ui/feathers 子树渲染成世界空间 3D 面板（路线 B）：几何/文字/排序/裁剪/拾取 | ✅ 可用，有 README |
-| `rig-feathers/` | **rig-tui 的另一个完整前端**（纯 lib，视图层） | ✅ 见 `README.md` / `UPSTREAM.md` |
+| `rig_niri/` | **rig-tui 的另一个完整前端**（纯 lib，视图层） | ✅ 见 `README.md` / `UPSTREAM.md` |
 | `rig_harness_in_3d/` | **通用 app 的 fork 模板**（harness 层：装配 + 扩展点 + 示例业务） | ✅ 见 `README.md` |
 | `bevy_luma/` | 上游源码（git main，0.20）+ 1 处本地改动（alpha_mode 固定 Premultiplied） | 依赖 |
 | `spike/` | 最早的路线 B 验证工程（0.20.0 树），留作证据 | 归档 |
 | `occlusion_probe/` | 遮挡异常的复现/对照工具（子代理产物） | 归档 |
 | `render/rf_shots/`、`render/rf_300/`、`render/probe/` | 截图证据 | 证据 |
-| `VERIFICATION_REPORT.md` / `RIG_FEATHERS_MOBILE_PLAN.md` / `VR_ASSISTANT_STACK.md` | 早期调研与验证 | 参考 |
+| `VERIFICATION_REPORT.md` / `RIG_NIRI_MOBILE_PLAN.md` / `VR_ASSISTANT_STACK.md` | 早期调研与验证 | 参考 |
 | `occlusion_report.md` | 遮挡异常结案报告 | 参考 |
 
 ---
@@ -68,9 +68,9 @@ jj evolog -r @            # 工作区 commit 的历次版本
 cd research
 
 # 中文字体（Bevy 只认 .ttf/.otf，系统里是 .ttc 集合）
-./tools/fetch_cjk_font.sh            # -> rig-feathers/assets/fonts/NotoSansCJKsc-Regular.otf
+./tools/fetch_cjk_font.sh            # -> rig_niri/assets/fonts/NotoSansCJKsc-Regular.otf
 
-cd rig_harness_in_3d          # 装配层；rig-feathers 是纯 lib
+cd rig_harness_in_3d          # 装配层；rig_niri 是纯 lib
 export CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home   # 本机 ~/.cargo 只读
 cargo build
 BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig_harness_in_3d
@@ -103,14 +103,14 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig_harness_i
 
 ## 2.5 定位（2026-11-23 调整）
 
-`rig-feathers` 不再当"业务 app"，而是：
+`rig_niri` 不再当"业务 app"，而是：
 
 1. **rig-tui 的并行前端**（同样吃 `RenderBatch`/look，前端身份 `Front::new("feathers")`）；
 2. **通用 app 的 fork 模板**：业务只改「工具 / look / 面板行来源」三处；
-3. **紧跟上游**：只依赖公开 API，升级检查清单见 `rig-feathers/UPSTREAM.md`。
+3. **紧跟上游**：只依赖公开 API，升级检查清单见 `rig_niri/UPSTREAM.md`。
 
 三个 crate 对齐 rig 官方分层：`rig-ecs`（上游内核）→ `rig_harness_in_3d`（harness/模板，含示例业务）
-→ `rig-feathers`（视图）→ `feathers_in_3d`（3D 渲染）。
+→ `rig_niri`（视图）→ `feathers_in_3d`（3D 渲染）。
 
 ## 3. 架构与数据流
 
@@ -118,10 +118,10 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig_harness_i
 rig-ecs（agent / turn / 工具调用 effect）
    │  事件与组件
    ▼
-rig-feathers/src/batch.rs     ← 从 effect 读取状态，构造 rig-tui 的 RenderBatch
+rig_niri/src/batch.rs     ← 从 effect 读取状态，构造 rig-tui 的 RenderBatch
    │  RenderSystems::Render 上的 look：fn(&ToolRender) -> Vec<LookLine>
    ▼
-rig-feathers/src/transcript.rs  LookLine::colored() -> Row -> feathers Node/Text/TextSpan
+rig_niri/src/transcript.rs  LookLine::colored() -> Row -> feathers Node/Text/TextSpan
    │  （行带 RowText + Pickable）
    ▼
 feathers_in_3d
@@ -146,12 +146,12 @@ feathers_in_3d
 
 | 能力 | 位置 | 状态 |
 |---|---|---|
-| LookLine → feathers 行 | `rig-feathers/src/transcript.rs` | ✅ |
-| rig-tui look（`RenderSystems::Render`） | `rig-feathers/src/batch.rs` | ✅ 两个示例 look |
-| **RenderBatch 驱动** | `rig-feathers/src/batch.rs` | ✅ 手工构造 `RenderBatch`（因为 `renderers::add` 是 `pub(crate)`） |
+| LookLine → feathers 行 | `rig_niri/src/transcript.rs` | ✅ |
+| rig-tui look（`RenderSystems::Render`） | `rig_niri/src/batch.rs` | ✅ 两个示例 look |
+| **RenderBatch 驱动** | `rig_niri/src/batch.rs` | ✅ 手工构造 `RenderBatch`（因为 `renderers::add` 是 `pub(crate)`） |
 | 滚动 | `main.rs::scroll_panel` + `Overflow::scroll_y` | ✅ |
 | 射线拾取 / 悬停 / 选择 / 复制 | `feathers_in_3d/src/pick.rs` + `main.rs` observers | ✅ |
-| **rig-ecs 真实 agent/turn 数据** | `rig-feathers/src/kernel.rs` + `batch.rs` | ✅ |
+| **rig-ecs 真实 agent/turn 数据** | `rig_niri/src/kernel.rs` + `batch.rs` | ✅ |
 | **真实闸门（Ask/Decision）** | `kernel.rs::payment_gate` + `answer_to_decision`/`answer_ask` | ✅ |
 | **增量刷新 / 流式** | `batch.rs::Transcript`(keyed) + `main.rs::sync_rows` | ✅ 前缀原地改、只重建后缀 |
 | **相机操作架（手柄模拟移动端）** | `camera_rig.rs`（`RF_RIG=1`） | ✅ 手柄+键盘，无实体手柄待真机验证 |

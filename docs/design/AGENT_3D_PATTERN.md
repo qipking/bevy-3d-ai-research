@@ -1,10 +1,10 @@
-# agent + 3D 程序设计开发范（rig-feathers 模板）
+# agent + 3D 程序设计开发范（rig_niri 模板）
 
-> 定位：`rig-feathers` = **rig-tui 的另一个完整前端**（视图层）；
+> 定位：`rig_niri` = **rig-tui 的另一个完整前端**（视图层）；
 > `rig_harness_in_3d` = **通用 app 的 fork 模板**（harness 层：装配 + 扩展点）。
-> 上游跟进策略见 `rig-feathers/UPSTREAM.md`；本文讲"怎么用它搭一个新 app"。
+> 上游跟进策略见 `rig_niri/UPSTREAM.md`；本文讲"怎么用它搭一个新 app"。
 
-> 这份文档把 `rig-feathers` 从"一个业务 demo"提炼成**可复制的模板**：
+> 这份文档把 `rig_niri` 从"一个业务 demo"提炼成**可复制的模板**：
 > 用 rig-tui 的 look 管线做"内容长什么样"，用 feathers 做"长出来"，用 `feathers_in_3d` 把 UI 放进 3D 世界。
 > 目标是：换一个业务（导购、运维、客服、现场作业），只需要换**工具 + look + 面板内容**，其余不动。
 
@@ -16,7 +16,7 @@
 |---|---|---|
 | `rig-ecs`（kernel） | 上游依赖 | agent / turn / call / Gate / Ask |
 | `rig-harness`（粘合） | **`rig_harness_in_3d`** | 装配、插件服务、扩展点 |
-| `rig-tui`（视图） | **`rig-feathers`** | RenderBatch+look、面板、状态、输入、picker、Front |
+| `rig-tui`（视图） | **`rig_niri`** | RenderBatch+look、面板、状态、输入、picker、Front |
 | （终端设备） | `feathers_in_3d` | 3D 渲染 |
 
 ## 0.1 视图内部的分层（每层只依赖下一层）

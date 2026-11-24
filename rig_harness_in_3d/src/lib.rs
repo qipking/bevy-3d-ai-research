@@ -5,7 +5,7 @@
 //! ```text
 //! rig-ecs（内核）  ← AgentPlugin、agent/turn/call 效应、Gate、Ask
 //! rig-harness（harness）← 会话、slash 命令、Ask/Pick、启动器协议、服务
-//! rig-feathers（视图）← RenderBatch+look、多面板、状态、输入、picker、Front
+//! rig_niri（视图）← RenderBatch+look、多面板、状态、输入、picker、Front
 //! feathers_in_3d（渲染）← route B：SDF 几何 + 字形 + 排序 + 裁剪 + 拾取
 //! ───────────────────────────────────────────────────────────────
 //! 本 crate（harness 模板）= 把上面三层装配起来 + 插件/业务扩展点
@@ -47,14 +47,14 @@
 //! |---|---|
 //! | 业务工具（`Tool` 实现 + `add_tool`） | 你的 `kernel.rs` |
 //! | 工具卡片（look） | 你的 `looks.rs`，注册到 `RenderSystems::Render` |
-//! | 面板内容（状态/输入/额外面板） | 写 `PanelRows`（见 `rig_feathers::status/editor`） |
-//! | 相机（手柄/键盘/陀螺仪） | `rig_feathers::camera_rig` |
+//! | 面板内容（状态/输入/额外面板） | 写 `PanelRows`（见 `rig_niri::status/editor`） |
+//! | 相机（手柄/键盘/陀螺仪） | `rig_niri::camera_rig` |
 //! | 更多 slash 命令 | `.add_command("name", "帮助", 你的系统)` |
 //! | 更多设置 | `[view]` 之外新开一段，照 [`settings`] 的 `add_setting` 写 |
 //!
 //! ## 不要改什么
 //!
-//! `feathers_in_3d`（渲染）与 `rig_feathers`（视图）是上游跟踪层：它们的 API 与
+//! `feathers_in_3d`（渲染）与 `rig_niri`（视图）是上游跟踪层：它们的 API 与
 //! rig 上游对齐，改动会破坏"随上游升级"的承诺。
 
 use std::path::PathBuf;
@@ -64,13 +64,13 @@ use bevy::prelude::*;
 use bevy::text::FontSource;
 use feathers_in_3d::FeathersIn3dPlugin;
 use rig_ecs::prelude::Notice;
-use rig_feathers::{editor, pane, transcript};
+use rig_niri::{editor, pane, transcript};
 use rig_harness::commands::{AppCommandsExt, NoArgs, RunCommand, SlashCommand};
 use rig_harness::harness_protocol::Home;
 use rig_harness::main_agent::{MainAgentQuery, main_agent};
 use rig_harness::prelude::SessionPaths;
 
-pub use rig_feathers::prelude::*;
+pub use rig_niri::prelude::*;
 
 pub mod notice;
 pub mod settings;
@@ -166,8 +166,8 @@ pub fn app(title: &str) -> App {
     settings::install(&mut app, home.settings());
     // 输入历史落盘：`RIG_HOME/data/tui/history.jsonl`（跨会话按 ↑ 能翻出来）。
     // `FeathersViewPlugin` 装的是内存版插件，这里把文件路径交给它读。
-    let history_file = home.data().join(rig_feathers::history::HISTORY_FILE);
-    app.insert_resource(rig_feathers::history::PromptHistory::load(history_file));
+    let history_file = home.data().join(rig_niri::history::HISTORY_FILE);
+    app.insert_resource(rig_niri::history::PromptHistory::load(history_file));
 
     // 1. windowed() 假定 HeadlessPlugins 已经装过这几样；任务池必须最前：
     //    后面的插件在 build 阶段就会用 IoTaskPool。
@@ -202,7 +202,7 @@ pub fn app(title: &str) -> App {
     // harness 本体：session / commands / launcher / clock / watch / ask / pick / run / progress
     app.add_plugins(rig_harness::prelude::RigHarnessPlugins);
     // 视图层：替代 plugins/rig-tui 的 TuiViewPlugin
-    app.add_plugins(rig_feathers::FeathersViewPlugin);
+    app.add_plugins(rig_niri::FeathersViewPlugin);
     // 本模板的扩展：/hello、/setting、输入框命令桥、Notice -> 引擎、状态行、设置
     app.add_plugins(HarnessExtPlugin);
     // 2 + 3. 会话目录宣示与视图字体（字体必须在 PreStartup，否则视图系统被跳过）
@@ -286,8 +286,8 @@ pub fn hello(In(args): In<NoArgs>, mut notices: MessageWriter<Notice>) {
 /// * 状态行每帧从真实 ECS 资源刷新；
 /// * `[view] hide_status` 真的隐藏状态面板。
 ///
-/// 通知回填放在 [`rig_feathers::FeathersSystems::Fit`]，排在
-/// [`rig_feathers::batch::collect_rows`] 之后、[`pane::window_transcript`] 之前：
+/// 通知回填放在 [`rig_niri::FeathersSystems::Fit`]，排在
+/// [`rig_niri::batch::collect_rows`] 之后、[`pane::window_transcript`] 之前：
 /// 先让引擎拿到这一帧的对话行，再把通知历史交给引擎，最后才窗口化。
 pub struct HarnessExtPlugin;
 
@@ -299,7 +299,7 @@ impl Plugin for HarnessExtPlugin {
         app.init_resource::<NoticeHistory>()
             // 视图层通常已经初始化；单独用本插件时也要能跑。
             .init_resource::<pane::TranscriptRows>()
-            .init_resource::<rig_feathers::panels::PanelRows>()
+            .init_resource::<rig_niri::panels::PanelRows>()
             .init_resource::<transcript::Transcript>()
             .init_resource::<rig_tui::AppStatus>()
             .add_command("hello", "Say hello", hello)
@@ -315,21 +315,21 @@ impl Plugin for HarnessExtPlugin {
             .add_systems(
                 Update,
                 notice::notices_to_transcript
-                    .in_set(rig_feathers::FeathersSystems::Fit)
-                    .after(rig_feathers::batch::collect_rows)
+                    .in_set(rig_niri::FeathersSystems::Fit)
+                    .after(rig_niri::batch::collect_rows)
                     .before(pane::window_transcript),
             )
             .add_systems(
                 Update,
                 status::sync_status_items
-                    .in_set(rig_feathers::FeathersSystems::Prepare)
-                    .before(rig_feathers::status::status_rows),
+                    .in_set(rig_niri::FeathersSystems::Prepare)
+                    .before(rig_niri::status::status_rows),
             )
             .add_systems(
                 Update,
                 status::apply_view_settings
-                    .in_set(rig_feathers::FeathersSystems::Draw)
-                    .after(rig_feathers::status::status_rows),
+                    .in_set(rig_niri::FeathersSystems::Draw)
+                    .after(rig_niri::status::status_rows),
             );
     }
 }
@@ -362,7 +362,7 @@ pub trait BusinessPlugin: Plugin {}
 /// 前端模块的再导出，业务代码只从这里拿。
 pub mod prelude {
     pub use crate::{HarnessExt, HarnessExtPlugin, NoticeHistory, SettingsPath, ViewSettings, hello};
-    pub use rig_feathers::{
+    pub use rig_niri::{
         batch::{BatchPlugin, CompletedCalls},
         editor::{Editor, PromptSubmitted, SubmittedPrompts},
         frame::{
@@ -394,11 +394,11 @@ mod tests {
     use rig_core::conversation::Conversation as Talk;
     use rig_core::message::{AssistantContent, AssistantMessage, Message};
     use rig_ecs::prelude::{AgentId, Conversation, TurnOf, spawn_root};
-    use rig_feathers::batch::BatchPlugin;
-    use rig_feathers::editor::SubmittedPrompts;
-    use rig_feathers::frame::{CellRect, PanelArea, PanelAreas, PanelInset, PanelRoots};
-    use rig_feathers::pane::PanePlugin;
-    use rig_feathers::panels::{PanelId, PanelRows};
+    use rig_niri::batch::BatchPlugin;
+    use rig_niri::editor::SubmittedPrompts;
+    use rig_niri::frame::{CellRect, PanelArea, PanelAreas, PanelInset, PanelRoots};
+    use rig_niri::pane::PanePlugin;
+    use rig_niri::panels::{PanelId, PanelRows};
     use rig_harness::harness_protocol::SessionDir;
     use rig_harness::main_agent::ShownAgent;
     use rig_harness::prelude::Settings;
@@ -770,7 +770,7 @@ mod tests {
         let path = dir.join("settings.toml");
         std::fs::write(&path, "[view]\nhide_status = true\n").unwrap();
         let mut app = settings_app(&path);
-        app.add_plugins(rig_feathers::status::StatusPlugin);
+        app.add_plugins(rig_niri::status::StatusPlugin);
         app.init_resource::<PanelRows>()
             .init_resource::<PanelAreas>()
             .init_resource::<PanelRoots>();

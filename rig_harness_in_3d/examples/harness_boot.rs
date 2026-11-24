@@ -25,7 +25,7 @@
 
 use bevy::prelude::*;
 use bevy::text::FontSource;
-use rig_feathers::transcript::TranscriptFont;
+use rig_niri::transcript::TranscriptFont;
 use rig_harness::harness_protocol::Home;
 use rig_harness::prelude::SessionPaths;
 
@@ -70,7 +70,7 @@ fn main() -> AppExit {
     // harness 本体
     app.add_plugins(rig_harness::prelude::RigHarnessPlugins);
     // 视图层：替代 plugins/rig-tui 的 TuiViewPlugin
-    app.add_plugins(rig_feathers::FeathersViewPlugin);
+    app.add_plugins(rig_niri::FeathersViewPlugin);
     // 3. 视图层的字体资源
     app.add_systems(PreStartup, insert_font);
     app.run()

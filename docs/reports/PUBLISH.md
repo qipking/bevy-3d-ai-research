@@ -4,7 +4,7 @@
 
 ```
 feathers_in_3d/       -> github.com/<you>/feathers_in_3d      （3D 渲染底座，无业务）
-rig-feathers/         -> github.com/<you>/rig-feathers        （rig-tui 的 3D 视图层，lib）
+rig_niri/         -> github.com/<you>/rig_niri        （rig-tui 的 3D 视图层，lib）
 rig_harness_in_3d/    -> github.com/<you>/rig_harness_in_3d   （harness 层 fork 模板，lib + demo）
 research/             -> 私有工作区（不发布：证据、spike、occlusion_probe、tools）
 ```
@@ -12,7 +12,7 @@ research/             -> 私有工作区（不发布：证据、spike、occlusio
 ## 依赖关系（发布顺序）
 
 ```
-feathers_in_3d  ←  rig-feathers  ←  rig_harness_in_3d
+feathers_in_3d  ←  rig_niri  ←  rig_harness_in_3d
 ```
 
 `Cargo.toml` 里现在的 `path = "../feathers_in_3d"` 在**发布时**要改成：
@@ -33,7 +33,7 @@ feathers_in_3d = { git = "https://github.com/<you>/feathers_in_3d", tag = "v0.1.
    /assets/fonts/*.otf
    ```
 2. `Cargo.toml` 补元数据：`description` / `license = "MIT"` / `repository` / `keywords` / `categories`；
-3. `README.md`：本仓库已有（`feathers_in_3d/README.md`、`rig-feathers/README.md`、`rig_harness_in_3d/README.md`）；
+3. `README.md`：本仓库已有（`feathers_in_3d/README.md`、`rig_niri/README.md`、`rig_harness_in_3d/README.md`）；
 4. `LICENSE`：rig 上游是 MIT/Apache-2.0，建议与上游一致（双许可）；
 5. `git init` + 首次提交 + `gh repo create`（或网页建仓后 `git push`）。
 
@@ -47,6 +47,6 @@ feathers_in_3d = { git = "https://github.com/<you>/feathers_in_3d", tag = "v0.1.
 
 ## 注意
 
-- `rig-feathers` 的 `UPSTREAM.md` 是**给 fork 者的契约**：说明我们依赖 rig 的哪些公开 API；
+- `rig_niri` 的 `UPSTREAM.md` 是**给 fork 者的契约**：说明我们依赖 rig 的哪些公开 API；
 - `feathers_in_3d` 不依赖 rig，可独立发布/复用；
 - 三个 crate 都还没有 `LICENSE` 文件，发布前补。
