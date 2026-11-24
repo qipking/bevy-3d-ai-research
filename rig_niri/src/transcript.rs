@@ -271,7 +271,7 @@ pub fn spawn_rows(
 /// 这是**退化实现**，不是像素级还原：真要画行内底色/下划线，得让每个 span 自带一层
 /// 带 `BackgroundColor` 的 Node（行高与基线会变，见 `docs/status/PARITY.md` §5）。
 pub fn span_style_color(style: &rig_tui::ratatui::style::Style, theme: &Theme) -> Color {
-    use rig_tui::ratatui::style::{Modifier, Style};
+    use rig_tui::ratatui::style::Modifier;
 
     let fg = style
         .fg
@@ -1156,7 +1156,7 @@ mod tests {
 #[cfg(test)]
 mod span_style_tests {
     use super::*;
-    use rig_tui::ratatui::style::{Modifier, Style};
+    use rig_tui::ratatui::style::Modifier;
 
     fn luma(c: Color) -> f32 {
         let c = c.to_srgba();

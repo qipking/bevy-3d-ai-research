@@ -445,10 +445,13 @@ pub fn default_tree() -> Node {
                     Split::Vertical,
                     NO_GAP,
                     vec![
+                        // 右列顶部留白（Spacer 只吃空间不画面）：这样输入框和状态行
+                        // 贴底，像官方那样"底部是输入区"，其余高度给留白。
+                        Child::proportion(1.0, Node::leaf(PanelId::Spacer)),
                         // 补全 tile 在输入框上方：关着时 0 高度（不占位）。
                         Child::fixed(0.0, Node::leaf(PanelId::Complete)),
-                        // 输入是比例子：补全打开时它让出 6 行，其余高度仍归它。
-                        Child::proportion(1.0, Node::leaf(PanelId::Input)),
+                        // 输入框固定 4 行：补全打开时它不会跟着缩，而是被挤上去。
+                        Child::fixed(4.0 * ROW_HEIGHT, Node::leaf(PanelId::Input)),
                         Child::fixed(2.0 * ROW_HEIGHT, Node::leaf(PanelId::Status)),
                     ],
                 ),
@@ -784,7 +787,7 @@ mod tests {
     fn the_default_tree_covers_the_screen() {
         let node = default_tree();
         let found = node.rects(area());
-        assert_eq!(found.len(), 4, "转写 / 补全 / 输入 / 状态");
+        assert_eq!(found.len(), 5, "转写 / 留白 / 补全 / 输入 / 状态");
         let mut ids: Vec<PanelId> = found.iter().map(|(id, _)| *id).collect();
         ids.sort_by_key(|id| format!("{id:?}"));
         assert_eq!(
@@ -792,6 +795,7 @@ mod tests {
             vec![
                 PanelId::Complete,
                 PanelId::Input,
+                PanelId::Spacer,
                 PanelId::Status,
                 PanelId::Transcript
             ]
@@ -805,7 +809,7 @@ mod tests {
             (leaves - screen).abs() < 1e-3,
             "叶子面积 {leaves} != 区域 {screen}"
         );
-        // 左 2/3、右 1/3；状态在右下角，输入占右列其余高度。
+        // 左 2/3、右 1/3；右列从上到下是留白 / 补全 / 输入 / 状态。
         let transcript = found.iter().find(|(id, _)| *id == PanelId::Transcript).unwrap().1;
         let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
         let status = found.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
@@ -814,10 +818,12 @@ mod tests {
         assert!(close(status.size.y, 2.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS));
         assert!(close(bottom(&status), bottom(&area())));
         assert!(close(bottom(&input), top(&status)));
-        // 补全 tile 关着：高度 0，贴右列顶部，不占输入的地方。
+        // 补全 tile 关着：高度 0，贴输入上方（右列底部是输入+状态，顶部是留白）。
         assert_eq!(complete.size.y, 0.0);
-        assert!(close(top(&complete), top(&area())));
-        assert!(close(top(&input), top(&complete)), "0 高度不挤输入");
+        assert!(close(top(&complete), top(&input)), "0 高度贴输入上沿");
+        let spacer = found.iter().find(|(id, _)| *id == PanelId::Spacer).unwrap().1;
+        assert!(close(top(&spacer), top(&area())), "留白贴顶");
+        assert!(close(bottom(&spacer), top(&complete)), "留白一直铺到补全");
         assert_eq!(node.leaf_size(PanelId::Complete), Some(Size::Fixed(0.0)));
     }
 
@@ -860,11 +866,12 @@ mod tests {
 
     // 16. 补全打开：tile 占 6 行，输入让出同样的高度，右列总高不变。
     #[test]
-    fn opening_the_complete_tile_moves_the_input_down() {
+    fn opening_the_complete_tile_moves_the_input_up() {
         let mut node = default_tree();
         let closed = rects(&node);
         let input_closed = closed.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
         let complete_closed = closed.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
+        let spacer_closed = closed.iter().find(|(id, _)| *id == PanelId::Spacer).unwrap().1;
         assert_eq!(complete_closed.size.y, 0.0);
 
         let row = crate::transcript::ROW_HEIGHT;
@@ -875,29 +882,24 @@ mod tests {
         let complete = open.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
         let input = open.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
         let status = open.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
+        let spacer = open.iter().find(|(id, _)| *id == PanelId::Spacer).unwrap().1;
 
         assert!(close(complete.size.y, 6.0 * row * PX_TO_METERS), "tile 正好 6 行");
-        assert!(close(top(&complete), top(&area())));
-        assert!(
-            close(top(&input), top(&area()) - 6.0 * row * PX_TO_METERS),
-            "输入的上边下移 6 行"
-        );
+        // 输入/状态固定高度且贴底：补全打开时它们**不动**，让位的是顶部留白。
         assert!(close(bottom(&input), bottom(&input_closed)), "输入底边不动");
+        assert!(close(top(&input), top(&input_closed)), "输入整块不动");
+        assert!(close(bottom(&complete), top(&input)), "补全紧贴输入上方");
         assert!(close(bottom(&input), top(&status)));
+        // 留白让出 6 行。
         assert!(
-            close(complete.size.y + input.size.y + status.size.y, area().size.y),
-            "右列高度仍然精确等于区域"
+            close(spacer.size.y, spacer_closed.size.y - 6.0 * row * PX_TO_METERS),
+            "留白让出 6 行：{} → {}",
+            spacer_closed.size.y,
+            spacer.size.y
         );
+        assert!(close(top(&spacer), top(&area())), "留白仍然贴顶");
         let leaves: f32 = open.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
         assert!(close(leaves, area().size.x * area().size.y), "叶子面积仍然铺满");
-
-        // 关回去：tile 回到 0，输入恢复原来的几何。
-        assert!(node.set_leaf_size(PanelId::Complete, Size::Fixed(0.0)));
-        let again = rects(&node);
-        let input_again = again.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
-        assert!(close(top(&input_again), top(&input_closed)));
-        assert!(close(input_again.size.y, input_closed.size.y));
-        assert_eq!(node.leaf_size(PanelId::Complete), Some(Size::Fixed(0.0)));
     }
 
     // 17. 尺寸读写：根就是叶子时没有尺寸可读，也改不动。

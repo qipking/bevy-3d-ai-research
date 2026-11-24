@@ -997,7 +997,8 @@ mod tests {
             &roots,
         );
         assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 64, 28));
-        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 0, 32, 26));
+        // 右列：顶部留白 + 补全(0) + 输入(固定 4 行) + 状态(2 行) 贴底。
+        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 22, 32, 4));
         assert_eq!(areas[&status.index_u32()].rect, CellRect::new(64, 26, 32, 2));
         // 精确中心来自树的 TileRect（不是格子取整后的矩形）。
         let center = areas[&transcript.index_u32()].center.expect("树给精确中心");
@@ -1216,12 +1217,12 @@ mod tests {
         let status = roots.entity(PanelId::Status).expect("状态面板");
         let complete = roots.entity(PanelId::Complete).expect("补全面板");
         let areas = app.world().resource::<PanelAreas>();
-        assert_eq!(areas.0.len(), 4, "四块面板都由树放好");
+        assert_eq!(areas.0.len(), 4, "四块面板都由树放好（留白叶子没有面板）");
         assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 28));
         assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(64, 26, 32, 2));
         // 补全 tile 关着：0 高度，但仍然有区域（这样每帧都能把它写成 0 高）。
         let closed = areas.get(complete).expect("补全区域");
-        assert_eq!(closed.rect, CellRect::new(64, 0, 32, 0));
+        assert_eq!(closed.rect, CellRect::new(64, 22, 32, 0), "补全贴输入上方");
         assert!(closed.is_empty());
 
         // `Node` 尺寸 = 树给的精确像素；3D 锚点 = 树给的精确中心（不是格子中心）。
@@ -1266,12 +1267,12 @@ mod tests {
             &roots,
         );
         let tile = areas[&complete.index_u32()];
-        assert_eq!(tile.rect, CellRect::new(64, 0, 32, 0));
+        assert_eq!(tile.rect, CellRect::new(64, 22, 32, 0), "补全贴输入上方");
         assert!(tile.is_empty(), "0 高度的 tile 这一帧没有文字区");
         assert_eq!(
             areas[&input.index_u32()].rect,
-            CellRect::new(64, 0, 32, 26),
-            "关着的 tile 不挤输入"
+            CellRect::new(64, 22, 32, 4),
+            "关着的 tile 不挤输入（输入固定 4 行贴底）"
         );
     }
 
@@ -1321,7 +1322,7 @@ mod tests {
             "Pane2 的行槽要建好"
         );
         let leaves = app.world().resource::<FrameTree>().0.leaves();
-        assert_eq!(leaves.len(), 5, "默认树 4 叶子 + 新拆的 Pane2");
+        assert_eq!(leaves.len(), 6, "默认树 5 叶子（含留白）+ 新拆的 Pane2");
         assert!(leaves.contains(&PanelId::Pane2));
 
         // 第二次：返回 false，树不变，也不会多一个 Pane2 实体。
@@ -1379,7 +1380,7 @@ mod tests {
             .resource::<PanelRoots>()
             .entity(PanelId::Pane2)
             .expect("Alt+S 要拆出 Pane2");
-        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 5);
+        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 6);
         assert_eq!(
             app.world().resource::<crate::editor::Editor>().text(),
             "",

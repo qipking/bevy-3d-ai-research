@@ -1751,18 +1751,16 @@ mod tests {
         let six_rows = completion_tile_height(true) * crate::layout::PX_TO_METERS;
 
         assert!((complete.size.y - six_rows).abs() < 1e-6);
-        assert!((input.size.y - (input_closed.size.y - six_rows)).abs() < 1e-5);
-        assert!(
-            ((input.center.y + input.size.y * 0.5)
-                - (input_closed.center.y + input_closed.size.y * 0.5 - six_rows))
-                .abs()
-                < 1e-5,
-            "输入整体下移 6 行"
-        );
+        // 输入/状态固定高度且贴底：打开补全时它们**不动**，让位的是顶部留白。
+        assert!((input.size.y - input_closed.size.y).abs() < 1e-5, "输入高度不变");
+        assert!((input.center.y - input_closed.center.y).abs() < 1e-5, "输入位置不变");
         assert!((input.center.y - input.size.y * 0.5 - (status.center.y + status.size.y * 0.5)).abs() < 1e-5);
         assert!(
-            (complete.size.y + input.size.y + status.size.y - area.size.y).abs() < 1e-5,
-            "右列总高不变"
+            (complete.center.y - complete.size.y * 0.5
+                - (input.center.y + input.size.y * 0.5))
+                .abs()
+                < 1e-5,
+            "补全紧贴输入上方"
         );
         let leaves: f32 = open.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
         assert!((leaves - area.size.x * area.size.y).abs() < 1e-5, "叶子仍铺满");

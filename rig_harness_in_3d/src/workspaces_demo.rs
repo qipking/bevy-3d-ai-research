@@ -12,7 +12,7 @@
 
 use bevy::prelude::*;
 use rig_niri::layout;
-use rig_niri::panels::{KeyedRow, PanelId, PanelRows};
+use rig_niri::panels::{KeyedRow, PanelId};
 use rig_niri::transcript::Row;
 use rig_niri::workspaces::{
     arrange_workspaces, focus_workspace, spawn_workspace, Workspace, WorkspacePanels, WorkspaceSet,
@@ -152,7 +152,7 @@ fn demo_keys(world: &mut World) {
 
 /// 首帧整理一次：让间距/朝向由 `arrange_workspaces` 统一算（和按 F10 的结果一致），
 /// 避免"spawn 时的间距"和"整理后的间距"不一样。
-fn arrange_once(mut done: Local<bool>, mut set: ResMut<WorkspaceSet>, mut commands: Commands) {
+fn arrange_once(mut done: Local<bool>, set: Res<WorkspaceSet>, mut commands: Commands) {
     if *done {
         return;
     }
@@ -165,7 +165,7 @@ fn arrange_once(mut done: Local<bool>, mut set: ResMut<WorkspaceSet>, mut comman
 }
 
 /// `RF_SHOW_ALL=1`：启动后取消聚焦，一次看到所有条带。
-fn show_all_once(mut shown: Local<bool>, mut set: ResMut<WorkspaceSet>) {
+fn show_all_once(mut shown: Local<bool>, set: Res<WorkspaceSet>) {
     if *shown || std::env::var("RF_SHOW_ALL").is_err() {
         return;
     }

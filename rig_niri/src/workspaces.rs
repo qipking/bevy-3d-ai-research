@@ -1608,12 +1608,17 @@ mod tests {
             let tree = app.world().get::<Workspace>(workspace).unwrap().tree.clone();
             let panels = app.world().get::<WorkspacePanels>(workspace).unwrap();
             let rects = tree.rects(frame_tile);
+            // 留白叶子只吃空间、没有面板实体，不参与"每片叶子都有区域"。
+            let drawn = rects.iter().filter(|(id, _)| *id != PanelId::Spacer).count();
             assert_eq!(
                 panels.areas.len(),
-                rects.len(),
-                "工作区 {workspace:?} 的每个叶子都有区域"
+                drawn,
+                "工作区 {workspace:?} 的每个叶子都有区域（留白除外）"
             );
             for (id, tile) in rects {
+                if id == PanelId::Spacer {
+                    continue;
+                }
                 let root = panels.roots.entity(id).expect("叶子有根实体");
                 let area = panels.area(root).expect("叶子有区域");
                 assert!(
@@ -1686,6 +1691,9 @@ mod tests {
                         && top <= frame_tile.size.y * 0.5 + 1e-5,
                     "{id:?}"
                 );
+                if id == PanelId::Spacer {
+                    continue;
+                }
                 let root = app
                     .world()
                     .get::<WorkspacePanels>(workspace)

@@ -158,12 +158,7 @@ fn spawn_probe_pointer(mut commands: Commands, window: Single<Entity, With<Prima
     commands.insert_resource(ProbePointer(pointer));
 }
 
-fn setup(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-    ) {
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn((
         ShotCamera,
         RigCamera,
@@ -178,17 +173,6 @@ fn setup(
     commands.spawn((
         DirectionalLight { illuminance: 2200.0, ..default() },
         Transform::from_xyz(2.0, 4.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-
-    // 参考立方体：证明面板在真 3D 里（遮挡关系）
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.16, 0.16, 0.16))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.85, 0.45, 0.15),
-            perceptual_roughness: 0.6,
-            ..default()
-        })),
-        Transform::from_xyz(0.68, -0.18, -0.28),
     ));
 
     // Latin 用 feathers 的等宽字体，中文回退到 Noto Sans CJK SC（tools/fetch_cjk_font.sh 生成）

@@ -43,6 +43,8 @@ pub enum PanelId {
     /// 第二个转写窗格：拆窗（`Alt+S`，见 [`crate::frame::split_transcript`]）后
     /// 出现，每帧显示与 [`PanelId::Transcript`] 完全相同的可见行。
     Pane2,
+    /// 占位：分裂树里只吃空间、不画任何东西（右列顶部留白，让输入框贴底）。
+    Spacer,
     /// 输入框上方的补全 tile：关着时在分裂树里是 0 高度，打开时占 6 行。
     ///
     /// 行由 [`crate::complete`] 产（候选 + 官方提示行），这里只当普通面板走
