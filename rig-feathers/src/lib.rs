@@ -34,10 +34,12 @@ pub mod editor;
 pub mod frame;
 pub mod front;
 pub mod hints;
+pub mod keys;
 pub mod niri;
 pub mod pane;
 pub mod panels;
 pub mod picker;
+pub mod rich;
 pub mod spatial;
 pub mod status;
 pub mod style;
@@ -70,7 +72,16 @@ pub mod prelude {
         CellRect, Extent, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
     };
     pub use crate::pane::{PanePlugin, PaneScroll, TranscriptRows};
+    pub use crate::keys::{
+        AppKeyBindingsExt, InputAction, KeyBinding, KeyFocus, KeyPress, KeyPressed, KeyScope,
+        Keys, Modifiers, PendingInput, RefusedKeys, action_for,
+    };
+    pub use crate::rich::{
+        diff_rows, highlight_rows, markdown_rows, tool_result_rows, upstream_theme,
+    };
     pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots};
+    pub use crate::transcript::{Below, BelowSeen, BlockId, Slot, TextId, Transcript};
+    pub use crate::batch::{CallFact, CallHistory};
     pub use crate::niri::{Column, Layer, PresetSize, Tile, TileRect, Tiling, TilingPlugin};
     pub use crate::spatial::{Card, CardContent, CardLook, Funnel, SpatialFocus, spawn_card};
     pub use crate::status::StatusPlugin;

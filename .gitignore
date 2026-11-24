@@ -1,18 +1,16 @@
 # 依赖缓存与构建产物（体积大、可重建）
 .cargo-home/
-target/
-*/target/
 **/target/
 
-# 抓取的上游源码与运行日志（可重建）
-rig-tui-inspect/
+# 运行期目录（会话日志、临时输出）
+.rig-home/
 .tmp/
-
-# 临时截图
-render/rf_shots/crop_*.png
 
 # jj 的 XDG 重定向目录
 .jjenv/
+
+# 截图裁剪中间产物
+render/rf_shots/crop_*.png
 
 # 生成的 CJK 字体（用 tools/fetch_cjk_font.sh 重新生成）
 rig-feathers/assets/fonts/*.otf
@@ -20,9 +18,11 @@ rig-feathers/assets/fonts/*.otf
 # Python 依赖（fonttools，用于字体子集化）
 tools/pylib/
 
-# 大文件（jj 单文件上限 4MiB，先 ignore 再下载）
-tools/pylib/
-
-# niri 源码（GPL-3.0，只作设计参考，不进仓库）
+# 上游源码，只读参考：niri 是 GPL-3.0，不进仓库
 reference/niri/
-.rig-home/
+
+# 一次性探针的抓取产物（能跑但不保证）
+experiments/rig-tui-inspect/
+
+# 巡游默认输出目录（RF_SHOT_DIR 未指定时）
+shots/

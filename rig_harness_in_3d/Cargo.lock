@@ -6200,6 +6200,7 @@ dependencies = [
  "rig-tui",
  "serde",
  "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

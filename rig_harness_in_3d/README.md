@@ -43,9 +43,10 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 
 | 位置 | 作用 |
 |---|---|
-| `app(title)` | 装好 DefaultPlugins + feathers + `feathers_in_3d` + `rig_feathers` + `AgentPlugin` + Ask/Pick |
+| `app(title)` | 装**真 harness**：`windowed(DefaultPlugins)` + `RigHarnessPlugins` + `feathers_in_3d` + `rig_feathers`；会话由 `Home::new_session()` 建，路径来自 `RIG_HOME` |
 | `KernelPlugin`（demo） | 注册工具（`add_tool`）、闸门（`Stage::Gate`）、spawn agent 与示例调用 |
-| `HarnessExt`（trait） | 会话目录 / slash 命令等 harness 服务，按需实现 |
+| `HarnessExt`（trait） | harness 服务的读取口：`session_dir()` 读真实 `SessionPaths`，`commands()` 扫上游注册的 `SlashCommand` 实体 |
+| `HarnessExtPlugin` | 把 `/hello` 注册成样板命令，并把 `Notice` 桥进转写面板（命令 → 通知 → 行，真链路） |
 | `prelude` | 业务只用这里的类型（含 rig-tui 的 look 契约，不用直接依赖 rig-tui） |
 
 ## 示例业务（可整段删掉）
@@ -57,6 +58,6 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 ## 已知限制
 
 - 模型未接：调用由 `ToolRequest` 注入，不是模型发起（没有 API key）；接缝是 `rig_feathers::batch::ReplyStream`；
-- 会话/设置/slash 命令是空壳（`HarnessExt`），需要时按 rig-harness 的服务补齐；
+- 设置（`Settings`）与 `/resume` 会话恢复还没接线；`Notice` 目前只进转写，还没进状态行；
 - 文字是位图图集，~6× 放大发糊；裁剪只到面板边界；
 - 相机只有键盘路径验证过（无实体手柄）。

@@ -34,9 +34,11 @@ jj evolog -r @            # 工作区 commit 的历次版本
 ## 0.1 一页速览
 
 **目标**：用 **feathers 做前端 + rig 做内核**，做一个带 3D 空间界面的助手（先桌面，后移动端陀螺仪相机）。
-当前阶段（2026-11-25 重定）：目标是 **S1 监看多个 agent**，几何与验收见 [`WATCHWALL.md`](WATCHWALL.md)。
-`niri.rs` 从"全局布局"降级为"单个座位内部的排版引擎"，一行不扔；世界尺度的座位/弧/信标是新的活。
-探针：`rig_harness_in_3d/examples/watchwall.rs`（跑法见该文件头部注释）。
+**当前原则（2026-11-25 重定）**：`niri` 只用于 `rig-feathers` 移植 `rig-tui` 时组件/窗口的
+**布局位置设计**参考（源码 `reference/niri/niri-main`）。斗兽场漏斗、圆柱体总览、环、两级视角
+全部不再推进，相关设计已归档 → [`GEOMETRY_HISTORY.md`](../archive/GEOMETRY_HISTORY.md)、
+[`WATCHWALL.md`](../archive/WATCHWALL.md)。当前推进的仍是功能面（会话、命令、设置、闸门、picker，
+用测试验收），与这些旧几何无关。
 
 | 目录 | 是什么 | 状态 |
 |---|---|---|

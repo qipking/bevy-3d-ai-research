@@ -30,23 +30,26 @@ crates/rig-cli + rig  生成工程、按 settings.toml 选插件、跑 App
 
 ## 1. 插件对照表（plugins/rig-tui → rig-feathers）
 
+> 2026-11-25 按 [`PARITY.md`](PARITY.md) 的逐行审计修正过：原先 6 处 ✅ 属于乐观估计。
+> 真实对位移植覆盖率 ≈ 25%（对位 3558 / 上游 14749 行），公开名字 104 个里 80 个没有对应物。
+
 | rig-tui 模块 | 作用 | rig-feathers 现状 | 下一步 |
 |---|---|---|---|
 | `lib.rs` (`TuiViewPlugin`, `Front="tui"`) | 插件入口 + Front | ✅ `FeathersViewPlugin`（同形：build + finish 注册 `StatusItems`）+ `front.rs` | — |
 | `panel.rs` (`TuiPanel`, `Placement`, `lay_out`) | 可放置面板（四边、尺寸、浮层、剩余区、列） | ✅ `frame.rs`：`Placement`/`Extent`/`CellRect`/`lay_out`（逐条照抄，附 7 个单测） | `fits`（编辑器按内容收行）接上 |
 | `render.rs` (1543 行) 的帧布局部分 | 面板 → 面板区 → 剩余区 | ✅ `frame.rs`：`FrameSize` + `lay_out_frame` + `place_panels`（格子 → Node 尺寸 + 3D 锚点） | — |
 | `screen.rs` | 默认屏幕（输入/状态行/转写） | ✅ `frame.rs::spawn_default_screen`（Bottom 4 / Bottom 2 / Rest） | — |
-| `pane.rs` | 转写窗格：窗口化 + 滚动 | ✅ `pane.rs`：`TranscriptRows` → `PaneScroll`(follow) → `PanelRows`；PgUp/PgDn | "↓ more below" 标记、pane 级 sticky、多 pane |
-| `transcript.rs` | 条目 → 行、滚动、sticky | ✅（`transcript.rs` + keyed 行） | sticky prompt、条目级折叠 |
-| `status.rs` | `StatusItems`/`AppStatus` → 状态行 | ✅ 直接调 `rig_tui::status::line`（keep/min_width 裁剪就是 rig 的），左/右两段由 `SpaceBetween` 对齐 | `styled` 条目、`[status] hide` |
-| `hints.rs` | 键位提示 + 宽度裁剪 | ✅ `hints.rs`（照抄 tables + fit），宽度取输入面板列数 | 与运行时状态（turn running）联动 |
+| `pane.rs` | 转写窗格：窗口化 + 滚动 | ⚠️ 部分 `pane.rs`：`TranscriptRows` → `PaneScroll`(follow) → `PanelRows`；PgUp/PgDn | "↓ more below" 标记、pane 级 sticky、多 pane |
+| `transcript.rs` | 条目 → 行、滚动、sticky | ❌ **未开始**（只有 `LookLine`→节点适配；上游 1783 行的对话引擎没搬） | 见 `PARITY.md` 缺口 1 |
+| `status.rs` | `StatusItems`/`AppStatus` → 状态行 | ⚠️ 部分（无 `styled` 条目的颜色） 直接调 `rig_tui::status::line`（keep/min_width 裁剪就是 rig 的），左/右两段由 `SpaceBetween` 对齐 | `styled` 条目、`[status] hide` |
+| `hints.rs` | 键位提示 + 宽度裁剪 | ⚠️ 部分 `hints.rs`（tables + fit 有；与运行时状态联动没有） | 与 turn running 联动 |
 | `title.rs` | 终端标题 + OSC 133 标记 | ✅ `title.rs`：窗口标题 = `基础标题 · 状态`（working/needs you/error/idle，规则照抄） | OSC 133 只对终端有意义，不做 |
 | `editor.rs`/`input.rs`/`keys.rs` | 多行编辑器、键位、补全、历史 | ⚠️ 基础（单行、光标、↑↓ 历史、PgUp/PgDn 归 pane） | 多行、补全、粘贴/图片 |
 | `complete.rs` | 补全弹窗 | ❌ | `Over`/`BelowInput` 面板 + 候选源 |
-| `pick.rs` (视图侧) | picker 浮层：列表 + preview + keys 行、树形折叠 | ✅ `picker.rs`：容器 `Over` + 列表列 `Within` + preview 列 `Within`、打字过滤、`free_text`/`secret`、多选打勾、树折叠、`PickPreview::Text`、`Highlighted`、点击行 | `more`（`←` 展开完整说明）、`PickPreview::Conversation`（要值转写） |
+| `pick.rs` (视图侧) | picker 浮层：列表 + preview + keys 行、树形折叠 | ⚠️ 大部分 `picker.rs`：容器 `Over` + 列表列 `Within` + preview 列 `Within`、打字过滤、`free_text`/`secret`、多选打勾、树折叠、`PickPreview::Text`、`Highlighted`、点击行 | `more`（`←` 展开完整说明）、`PickPreview::Conversation`（要值转写） |
 | `theme.rs` | 调色（面/条/浮层） | ✅（自有 Theme） | 对齐 rig 的 band 比例（曾改过被回退，需与用户确认） |
 | `markdown.rs`/`highlight.rs`/`diff.rs` | 富文本 look | ❌ | 业务 look 里补 |
-| `clipboard.rs`/`selection.rs` | 选择与复制 | ⚠️ 行级 | 字符级 |
+| `clipboard.rs`/`selection.rs` | 选择与复制 | ❌ **未开始**（`bevy_clipboard` 有依赖但 `src/` 零使用） | 字符级 hit-test + 复制 |
 | `screen.rs`/`terminal.rs` | 终端会话 | — 由 `feathers_in_3d` 取代 | — |
 
 ## 2. rig-harness 侧 UI 需要的服务（已下载到 `rig-harness-src/`）
@@ -213,26 +216,33 @@ Preview  Within { panel: Overlay, part: 1, of: 2 }  预览列（插件挂 PickPr
 | `13_tree_closed.png` | 回车交 `Chosen::items([2])` → harness 收掉 picker，浮层与预览列都消失 |
 | `09_picker.png` | 单选 picker（没有 preview）时列表占满容器（`of = 1`） |
 
-## 9. 移植到 Niri 窗口逻辑：现状与下一步（2026-11-25）
+## 9. Niri 窗口逻辑：仅作布局参考（2026-11-25 归档环/总览线）
 
-**已经能用的**（`rig-feathers/src/niri.rs`，40 个单测，语义照 niri，独立实现）：
+> **范围收窄**：`niri` 只用于 `rig-feathers` 移植 `rig-tui` 时组件/窗口的**布局位置设计**参考
+> （源码 `reference/niri/niri-main`）。环模式、圆柱体总览、两级视角不再推进；原设计已归档 →
+> [`GEOMETRY_HISTORY.md`](../archive/GEOMETRY_HISTORY.md)。
 
-- 列宽预设 / 前缀和 / `view_offset` 居中且夹取 / 列内竖分 / 指数平滑滚动；
-- `Tiling::ring`：总览把各层贴到圆柱内壁（半径 = 最长带鱼屏/2π，短的不绕圈）；
-- 环上卡片**首尾相接无缺口**（无缝隙边界 + 弦中点定位）；
-- 总览自由相机（WASD/QE + 鼠标右键/方向键）；
+**代码现状（保留，不再扩线）**（`rig-feathers/src/niri.rs`，40 个单测，语义照 niri，独立实现）：
+
+- 列宽预设 / 前缀和 / `view_offset` 居中且夹取 / 列内竖分 / 指数平滑滚动；（布局参考）
+- `Tiling::ring`：总览把各层贴到圆柱内壁（半径 = 最长带鱼屏/2π，短的不绕圈）；**（已归档，不推进）**
+- 环上卡片**首尾相接无缺口**（无缝隙边界 + 弦中点定位）；**（已归档，不推进）**
+- 总览自由相机（WASD/QE + 鼠标右键/方向键）；**（已归档，不推进）**
 - **`Tiling::tile_cells(layer, column, tile)`**：平铺格子 → 文字列数/行数 ——
   这是旧面板（转写/输入/状态）接上 Niri 的那把钥匙。
 
-**下一步（按顺序，每步都能单独验收）**：
+**下一步（按顺序，每步都能单独验收；只做布局参考部分）**：
 
 1. `pane.rs::pane_rows` 增加 Niri 来源：转写面板挂 `Tile` 后，行数 = `tile_cells` 的行，
    `frame::PanelAreas` 只作为旧路径保留；
 2. `frame::spawn_default_screen` 改成"三块真面板 = 三个 tile"：
    转写 `2/3` 列、composer `1/3` 列（hints 作为它的第二个 tile）、状态行做底部 ornament；
-3. 弹窗改平铺（picker/补全/确认 → tile），去掉 `Placement::Over` 的浮层路径；
-4. 底部层指示条（当前层高亮）+ 远层只留标题条；
-5. 转写分列，把带鱼屏拉长到 ≥ 8.8 m，让首尾相连自然成立。
+3. ~~弹窗改平铺（picker/补全/确认 → tile），去掉 `Placement::Over` 的浮层路径；~~
+   **（已归档，不推进）**
+4. ~~底部层指示条（当前层高亮）+ 远层只留标题条；~~ **（已归档，不推进）**
+5. ~~转写分列，把带鱼屏拉长到 ≥ 8.8 m，让首尾相连自然成立。~~ **（已归档，不推进）**
+
+> 当前实际推进方向见 §10（harness 装配与功能面），与环/总览无关。
 
 ## 10. harness 本体终于装上了（2026-11-25 夜）
 
