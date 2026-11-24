@@ -99,6 +99,36 @@ pub use settings::{SettingsPath, ViewSettings};
 /// app.add_plugins(MyBusinessPlugin);
 /// app.run();
 /// ```
+/// 找到 `assets/` 目录：环境变量 → 当前目录 → 可执行文件旁边 → 往上找几层。
+///
+/// bevy 默认把资源根取成 `BEVY_ASSET_ROOT`，没有的话取编译期的 `CARGO_MANIFEST_DIR`。
+/// 从别的目录启动二进制时这两条都可能失效，字体加载不到，界面上就一个字都没有。
+fn assets_dir() -> std::path::PathBuf {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(root) = std::env::var_os("BEVY_ASSET_ROOT") {
+        candidates.push(std::path::PathBuf::from(root).join("assets"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("assets"));
+        candidates.push(cwd.join("rig_harness_in_3d/assets"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|d| d.to_path_buf());
+        for _ in 0..5 {
+            let Some(current) = dir else { break };
+            candidates.push(current.join("assets"));
+            candidates.push(current.join("rig_harness_in_3d/assets"));
+            dir = current.parent().map(|d| d.to_path_buf());
+        }
+    }
+    candidates
+        .iter()
+        .find(|path| path.join("fonts").is_dir())
+        .cloned()
+        // 一个都不像：交给 bevy 自己的默认值（并用启动日志里的 `[assets]` 提醒）。
+        .unwrap_or_else(|| std::path::PathBuf::from("assets"))
+}
+
 pub fn app(title: &str) -> App {
     // 会话目录：SessionPlugin 只读不建（正常由 launcher 建），嵌入时自己开一个。
     //
@@ -149,14 +179,23 @@ pub fn app(title: &str) -> App {
         bevy::time::TimePlugin,
         bevy::diagnostic::FrameCountPlugin,
     ));
-    app.add_plugins(rig_harness::windowed(DefaultPlugins).set(WindowPlugin {
-        primary_window: Some(Window {
-            title: title.to_string(),
-            resolution: (1280, 800).into(),
+    // 资源根：字体在 `assets/fonts/`，路径找不到就只有面板没有字——窗口看起来是空的。
+    // 不再依赖 `BEVY_ASSET_ROOT` 环境变量：自己找一个能用的。
+    let assets = assets_dir();
+    info!("[assets] {}", assets.display());
+    app.add_plugins(rig_harness::windowed(DefaultPlugins)
+        .set(WindowPlugin {
+            primary_window: Some(Window {
+                title: title.to_string(),
+                resolution: (1280, 800).into(),
+                ..default()
+            }),
             ..default()
-        }),
-        ..default()
-    }));
+        })
+        .set(bevy::asset::AssetPlugin {
+            file_path: assets.to_string_lossy().into_owned(),
+            ..default()
+        }));
     app.add_plugins(bevy_feathers::FeathersPlugins);
     // 渲染层
     app.add_plugins(FeathersIn3dPlugin);

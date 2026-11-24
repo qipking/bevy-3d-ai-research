@@ -38,6 +38,7 @@ pub mod front;
 pub mod hints;
 pub mod history;
 pub mod keys;
+pub mod layout;
 pub mod niri;
 pub mod pane;
 pub mod panels;
@@ -75,6 +76,8 @@ pub mod prelude {
     pub use crate::frame::{
         CellRect, Extent, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
     };
+    pub use crate::frame::FrameTree;
+    pub use crate::layout::{Child, Node, Size, Split, default_tree};
     pub use crate::pane::{PanePlugin, PaneScroll, TranscriptRows};
     pub use crate::keys::{
         AppKeyBindingsExt, InputAction, KeyBinding, KeyFocus, KeyPress, KeyPressed, KeyScope,

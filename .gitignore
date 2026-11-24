@@ -27,3 +27,9 @@ experiments/rig-tui-inspect/
 # 巡游默认输出目录（RF_SHOT_DIR 未指定时）
 shots/
 .claude/
+*.raw
+
+# 官方 rig 的 crate 源码副本（可一键重新生成，见 experiments/rig-official/README.md）
+experiments/rig-official/*
+!experiments/rig-official/README.md
+!experiments/rig-official/capture.py
