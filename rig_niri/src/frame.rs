@@ -28,6 +28,7 @@ use feathers_in_3d::{MirrorRoot, WorldLayer, WorldPanel};
 use crate::layout::{self, Node as LayoutNode};
 use crate::niri::TileRect;
 use crate::panels::{PanelId, PanelRows};
+use crate::workspaces::{Workspace, WorkspacePanel, WorkspacePanels, WorkspaceSet};
 
 pub use crate::panels::PanelRoots;
 
@@ -473,24 +474,70 @@ pub struct DefaultScreen {
 }
 
 /// 算每块面板这一帧的区域：分裂树叶子 + 浮层。
+///
+/// 有 [`WorkspaceSet`] 时遍历所有工作区：每个工作区用自己的树/根表算一份
+/// 帧内区域（存进 `WorkspacePanels::areas`），聚焦工作区同时把结果写进全局
+/// [`PanelAreas`]（内容系统和还没按工作区改的旧模块读它）。没有工作区时退回
+/// 原来的全局单例路径，行为与第 2 批之前一致。
 pub fn lay_out_frame(
     mut areas: ResMut<PanelAreas>,
     size: Res<FrameSize>,
     roots: Option<Res<PanelRoots>>,
-    tree: Res<FrameTree>,
-    panels: Query<(Entity, &FramePanel, Option<&FitRows>)>,
+    tree: Option<Res<FrameTree>>,
+    set: Option<Res<WorkspaceSet>>,
+    panels: Query<(Entity, &FramePanel, Option<&FitRows>, Option<&WorkspacePanel>)>,
+    mut workspaces: Query<(&Workspace, &mut WorkspacePanels)>,
 ) {
-    let to_lay_out = panels
-        .iter()
-        .map(|(entity, panel, fits)| ToLayOut {
-            entity,
-            placement: panel.placement,
-            order: panel.order,
-            fits: fits.map(|fits| fits.0),
-            inset: panel.inset,
-        });
-    // `FramePlugin` 也可以单独跑（没有 `PanelsPlugin` 时没有 `PanelRoots`）：
-    // 这时树叶子找不到实体，浮层照常布局。
+    if let Some(set) = set.as_deref().filter(|set| !set.items.is_empty()) {
+        let mut focused_areas = None;
+        for workspace_entity in &set.items {
+            let Ok((workspace, mut stored)) = workspaces.get_mut(*workspace_entity) else {
+                continue;
+            };
+            let focused = set.focused == Some(*workspace_entity);
+            // 聚焦工作区的树用全局 `FrameTree`：`complete::sync_completion_tile`
+            // 在同一个 `Layout` 阶段先改它，这里必须看到同一帧的结果。
+            let (want_tree, want_roots) = match (focused, tree.as_deref(), roots.as_deref()) {
+                (true, Some(tree), Some(roots)) => (&tree.0, &roots.0),
+                _ => (&workspace.tree, &stored.roots.0),
+            };
+            let to_lay_out = panels.iter().filter_map(|(entity, panel, fits, tag)| {
+                tag.filter(|tag| tag.0 == *workspace_entity)
+                    .map(|_| ToLayOut {
+                        entity,
+                        placement: panel.placement,
+                        order: panel.order,
+                        fits: fits.map(|fits| fits.0),
+                        inset: panel.inset,
+                    })
+            });
+            let next = lay_out(want_tree, to_lay_out, want_roots, size.screen(), &[]);
+            if stored.areas != next {
+                stored.areas = next.clone();
+            }
+            if focused {
+                focused_areas = Some(next);
+            }
+        }
+        let next = focused_areas.unwrap_or_default();
+        if areas.0 != next {
+            areas.0 = next;
+        }
+        return;
+    }
+
+    // 旧路径：没有 `WorkspacesPlugin` 时全局资源就是唯一的屏幕。
+    // `FramePlugin` 也可以单独跑（没有 `PanelsPlugin` 时没有 `PanelRoots`）。
+    let Some(tree) = tree.as_deref() else {
+        return;
+    };
+    let to_lay_out = panels.iter().map(|(entity, panel, fits, _)| ToLayOut {
+        entity,
+        placement: panel.placement,
+        order: panel.order,
+        fits: fits.map(|fits| fits.0),
+        inset: panel.inset,
+    });
     let empty = HashMap::new();
     let roots = roots.as_deref().map_or(&empty, |roots| &roots.0);
     let next = lay_out(&tree.0, to_lay_out, roots, size.screen(), &[]);
@@ -499,25 +546,98 @@ pub fn lay_out_frame(
     }
 }
 
+/// 面板中心在帧里的像素坐标（原点帧中心，UI 的 y 朝下，世界的 y 朝上）。
+///
+/// 树布局拿精确中心；旧接口 `PanelArea::new` 只有格子区域时退回格子中心。
+fn area_center_px(area: &PanelArea, frame_px: Vec2) -> Vec2 {
+    area.center.unwrap_or_else(|| {
+        Vec2::new(
+            (f32::from(area.rect.x) + f32::from(area.rect.w) * 0.5) * CELL.x
+                - frame_px.x * 0.5,
+            frame_px.y * 0.5
+                - (f32::from(area.rect.y) + f32::from(area.rect.h) * 0.5) * CELL.y,
+        )
+    })
+}
+
 /// 把格子区域落到每块面板的 `Node` 尺寸与 `WorldPanel` 锚点上。
+///
+/// 有 [`WorkspaceSet`] 时每块面板按自己的 [`WorkspacePanel`] 找所属工作区：
+/// 世界锚点 = `workspace.pose × 帧内中心`。没有工作区时走原来的单屏路径
+/// （`FrameGeometry.center` 就是世界原点）。
 pub fn place_panels(
     mut commands: Commands,
     areas: Res<PanelAreas>,
     size: Res<FrameSize>,
     geometry: Res<FrameGeometry>,
+    set: Option<Res<WorkspaceSet>>,
     mut panels: Query<(
         Entity,
         &FramePanel,
+        Option<&WorkspacePanel>,
         &mut Node,
         &mut WorldPanel,
         Option<&mut WorldLayer>,
     )>,
+    workspaces: Query<(&Workspace, &WorkspacePanels)>,
 ) {
+    let frame_px = Vec2::new(f32::from(size.cols), f32::from(size.rows)) * CELL;
+    if set
+        .as_deref()
+        .is_some_and(|set| !set.items.is_empty())
+    {
+        for (entity, panel, tag, mut node, mut world, layer) in panels.iter_mut() {
+            let Some(tag) = tag else {
+                // 还没打标签的面板（本帧刚 spawn）下一帧再放。
+                continue;
+            };
+            let Ok((workspace, stored)) = workspaces.get(tag.0) else {
+                continue;
+            };
+            let Some(area) = stored.areas.get(&entity).copied() else {
+                continue;
+            };
+            let width = px(area.size.x);
+            let height = px(area.size.y);
+            if node.width != width {
+                node.width = width;
+            }
+            if node.height != height {
+                node.height = height;
+            }
+            let center_px = area_center_px(&area, frame_px);
+            let want_layer = panel.placement.stacking(None);
+            // 帧内局部位姿（世界原点时的锚点），再乘工作区的绝对位姿。
+            let local = Transform::from_translation(
+                geometry.center
+                    + Vec3::new(center_px.x, center_px.y, 0.0) * geometry.units_to_world
+                    + Vec3::Z * (f32::from(want_layer) * geometry.layer_depth),
+            );
+            let anchor = workspace.pose.mul_transform(local);
+            if world.anchor != anchor {
+                world.anchor = anchor;
+            }
+            if world.units_to_world != geometry.units_to_world {
+                world.units_to_world = geometry.units_to_world;
+            }
+            match layer {
+                Some(mut layer) => {
+                    if layer.0 != want_layer {
+                        layer.0 = want_layer;
+                    }
+                }
+                None => {
+                    commands.entity(entity).insert(WorldLayer(want_layer));
+                }
+            }
+        }
+        return;
+    }
+
     if areas.0.is_empty() {
         return;
     }
-    let frame_px = Vec2::new(f32::from(size.cols), f32::from(size.rows)) * CELL;
-    for (entity, panel, mut node, mut world, layer) in panels.iter_mut() {
+    for (entity, panel, _tag, mut node, mut world, layer) in panels.iter_mut() {
         let Some(area) = areas.get(entity) else {
             continue;
         };
@@ -529,16 +649,7 @@ pub fn place_panels(
         if node.height != height {
             node.height = height;
         }
-        // 面板中心在帧里的像素坐标（原点在帧中心，UI 的 y 朝下，世界的 y 朝上）。
-        // 树布局拿精确中心；旧接口 `PanelArea::new` 只有格子区域时退回格子中心。
-        let center_px = area.center.unwrap_or_else(|| {
-            Vec2::new(
-                (f32::from(area.rect.x) + f32::from(area.rect.w) * 0.5) * CELL.x
-                    - frame_px.x * 0.5,
-                frame_px.y * 0.5
-                    - (f32::from(area.rect.y) + f32::from(area.rect.h) * 0.5) * CELL.y,
-            )
-        });
+        let center_px = area_center_px(&area, frame_px);
         let want_layer = panel.placement.stacking(None);
         let anchor = geometry.center
             + Vec3::new(center_px.x, center_px.y, 0.0) * geometry.units_to_world
@@ -562,23 +673,27 @@ pub fn place_panels(
     }
 }
 
-/// 装默认屏幕（rig-tui `screen.rs` 的布局在分裂树里重排）：左列转写，右列从上
-/// 到下是补全 tile / 输入 / 状态行。四块面板都是 `layout::default_tree` 的叶子。
-fn spawn_default_screen(
-    mut commands: Commands,
-    mut roots: ResMut<PanelRoots>,
-    mut rows: ResMut<PanelRows>,
-    mut screen: ResMut<DefaultScreen>,
-) {
-    // 新窗口逻辑（Niri）接管时，默认屏幕由 `niri::spawn_niri_screen` 生成。
-    if std::env::var("RF_NIRI_LAYOUT").is_ok() {
-        return;
-    }
-    // 四块面板都是分裂树 `layout::default_tree` 的叶子：区域由树推导，
-    // 不再是 `Bottom(4)/Bottom(2)/Rest` 这种绝对槽位。
+/// 一套默认屏幕面板（分裂树四块叶子），不登记到全局资源。
+///
+/// `workspace` 存在时给每块面板挂 [`WorkspacePanel`]（新工作区用）；`None` 是
+/// `FramePlugin` 的 Startup 建旧全局默认屏幕用。返回这个工作区自己的根表与
+/// 空行槽，由调用方决定放进全局资源还是 `WorkspacePanels`。
+pub(crate) fn default_screen_panels(
+    commands: &mut Commands,
+    workspace: Option<Entity>,
+) -> (PanelRoots, PanelRows) {
+    let mut roots = PanelRoots::default();
+    let mut rows = PanelRows::default();
+    let spawn = |commands: &mut Commands, id: PanelId, panel: FramePanel, look: Look| {
+        let entity = spawn_panel(commands, id, panel, look);
+        if let Some(workspace) = workspace {
+            commands.entity(entity).insert(WorkspacePanel(workspace));
+        }
+        entity
+    };
     // 输入：右列的比例子，吃掉补全 tile 和状态行之外的全部高度。
-    let input = spawn_panel(
-        &mut commands,
+    let input = spawn(
+        commands,
         PanelId::Input,
         FramePanel::tree(),
         Look::new(
@@ -588,8 +703,8 @@ fn spawn_default_screen(
         ),
     );
     // 状态行：右列底部固定 2 格，细条里居中放 1 行字。
-    let status = spawn_panel(
-        &mut commands,
+    let status = spawn(
+        commands,
         PanelId::Status,
         FramePanel::tree().inset(PanelInset::THIN),
         Look {
@@ -600,16 +715,16 @@ fn spawn_default_screen(
         },
     );
     // 转写：左列（Proportion 2，占 2/3 宽）。
-    let transcript = spawn_panel(
-        &mut commands,
+    let transcript = spawn(
+        commands,
         PanelId::Transcript,
         FramePanel::tree(),
         transcript_look(),
     );
     // 补全 tile：右列、输入框上方；关着时树里是 0 高度（不占地方），打开时
     // `complete` 把它改成 6 行并把候选 + 官方提示行写进 `PanelRows`。
-    let complete = spawn_panel(
-        &mut commands,
+    let complete = spawn(
+        commands,
         PanelId::Complete,
         FramePanel::tree().inset(PanelInset::THIN),
         Look::new(
@@ -630,7 +745,28 @@ fn spawn_default_screen(
     ] {
         rows.0.entry(id).or_default();
     }
-    screen.transcript = Some(transcript);
+    (roots, rows)
+}
+
+/// 装默认屏幕（rig-tui `screen.rs` 的布局在分裂树里重排）：左列转写，右列从上
+/// 到下是补全 tile / 输入 / 状态行。四块面板都是 `layout::default_tree` 的叶子。
+///
+/// 这是**没有** `WorkspacesPlugin` 时的旧单屏路径；装了工作区插件后它 spawn 的
+/// 面板会在 `PostStartup` 被收编成默认工作区（见 `workspaces`）。
+fn spawn_default_screen(
+    mut commands: Commands,
+    mut roots: ResMut<PanelRoots>,
+    mut rows: ResMut<PanelRows>,
+    mut screen: ResMut<DefaultScreen>,
+) {
+    // 新窗口逻辑（Niri）接管时，默认屏幕由 `niri::spawn_niri_screen` 生成。
+    if crate::niri::niri_layout() {
+        return;
+    }
+    let (screen_roots, screen_rows) = default_screen_panels(&mut commands, None);
+    screen.transcript = screen_roots.entity(PanelId::Transcript);
+    roots.0.extend(screen_roots.0);
+    rows.0.extend(screen_rows.0);
 }
 
 /// 一块面板的观感（底色、边框、圆角）。

@@ -51,6 +51,7 @@ pub mod style;
 pub mod theme;
 pub mod title;
 pub mod transcript;
+pub mod workspaces;
 
 use bevy::prelude::*;
 
@@ -100,6 +101,12 @@ pub mod prelude {
         diff_rows, highlight_rows, markdown_rows, tool_result_rows, upstream_theme,
     };
     pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots};
+    pub use crate::workspaces::{
+        WORKSPACE_GAP, Workspace, WorkspaceDrag, WorkspacePanel, WorkspacePanels, WorkspaceSet,
+        WorkspacesPlugin, arrange_workspaces, drag_workspace, drag_world_delta, focus_workspace,
+        place_workspace, spawn_workspace, spawn_workspace_with_tree, workspace_step,
+        workspace_strip_height,
+    };
     pub use crate::transcript::{Below, BelowSeen, BlockId, Slot, TextId, Transcript};
     pub use crate::batch::{CallFact, CallHistory};
     pub use crate::niri::{Column, Layer, PresetSize, Tile, TileRect, Tiling, TilingPlugin};
@@ -161,6 +168,9 @@ impl Plugin for FeathersViewPlugin {
             selection::SelectionPlugin,
             camera_rig::CameraRigPlugin,
         ));
+        // 第 2 批：每个工作区一套面板状态。单独一行是因为 bevy 的
+        // `Plugins` 元组最多 15 个，也避免重排上面的插件列表。
+        app.add_plugins(workspaces::WorkspacesPlugin);
     }
 
     fn finish(&self, app: &mut App) {

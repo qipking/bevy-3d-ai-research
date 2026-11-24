@@ -7,7 +7,7 @@
 
 ```
 rig_harness_in_3d/  应用层（harness 装配 + 业务工具 + 演示/巡游）——fork 模板就是它
-rig-feathers/       视图层：照 rig-tui 的模型重写的前端（面板/状态/输入/picker/窗口逻辑）
+rig_niri/           视图层：照 rig-tui 的模型重写的前端（面板/状态/输入/picker/窗口逻辑）
 feathers_in_3d/     渲染层：把 bevy_ui 子树镜像成 3D 网格 + 字形 + 排序 + 裁剪 + 拾取
 bevy_luma/          上游的 SDF 3D UI 材料（vendored，改动要克制）
 
@@ -46,4 +46,5 @@ RIG_HOME=/var/home/lichi/桌面/research/.rig-home cargo run --example harness_b
 
 见 [`docs/status/HANDOFF.md`](docs/status/HANDOFF.md)（一页速览）和
 [`docs/status/PLAN.md`](docs/status/PLAN.md)（进度表）。一句话：
-**渲染层与视图层可用；harness 本体刚装上并能启动；界面内容仍是演示数据，正在接真实链路（命令 / 通知 / 闸门）。**
+**渲染层与视图层可用；harness 本体已装上；布局已改成 niri 分裂树（`rig_niri`）；
+当前在做「工作区 = niri 条带 × 绝对空间坐标」（见 `docs/status/WORKSPACE_MODEL.md`）。**

@@ -50,6 +50,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::clipboard::{self, Copied, MemoryClipboard};
 use crate::panels::{PanelId, PanelRoots, PanelRows, RowLayout};
 use crate::transcript::Row;
+use crate::workspaces::{WorkspacePanel, WorkspaceSet};
 
 /// 上游给选中格子加的样式：反色。调用方把选中区间套上它即可。
 pub const SELECTED_MODIFIER: Modifier = Modifier::REVERSED;
@@ -618,16 +619,54 @@ pub fn cell_column(x: f32, text_left: f32) -> usize {
     cells.max(0.0) as usize
 }
 
-/// 把一次拾取换算成 [`RowHit`]；目标不是面板行（点空白/面板背景/窗口）
-/// 或命中点没有世界坐标时给 `None`。
+/// 这一行属于哪个工作区（看它面板根上的 [`WorkspacePanel`] 标签）。
+///
+/// 工作区维度没有存在 [`RowLayout`] 里（`pane.rs` 还有按三字段构造它的地方，
+/// 加第四个字段会波及那个文件）；面板根一直带着标签，行 → 面板根 → 工作区
+/// 两跳就够，指针事件每帧至多几个，这点查询开销可以忽略。
+///
+/// 没打标签的面板（单工作区、旧 App、测试里手搭的 App）返回 `None`，
+/// 调用方必须把 `None` 当成**可选中**，否则单工作区会回归。
+fn row_workspace(layout: &RowLayout, tags: &Query<&WorkspacePanel>) -> Option<Entity> {
+    tags.get(layout.panel_entity).ok().map(|tag| tag.0)
+}
+
+/// 隐藏工作区里的行不能被指针选中。
+///
+/// 3D 拾取后端只看几何、不看 `Visibility`（`feathers_in_3d::pick`），所以
+/// 非聚焦工作区的行仍然会进拾取索引；这里按 `WorkspaceSet::focused` 过滤。
+/// 没有工作区、没有聚焦、或者行/面板没有工作区标签时一律放行（旧单屏路径）。
+fn selectable_workspace(workspace: Option<Entity>, set: Option<&WorkspaceSet>) -> bool {
+    match (workspace, set.and_then(|set| set.focused)) {
+        (Some(workspace), Some(focused)) => workspace == focused,
+        _ => true,
+    }
+}
+
+/// Alt 是否按住：`Alt+左键` 归工作区拖拽（见 [`crate::workspaces`] 的
+/// `drag_workspaces`），选区这边让路，避免同一个按下既拖工作区又选字。
+fn alt_held(held: Option<&ButtonInput<KeyCode>>) -> bool {
+    held.is_some_and(|held| {
+        held.pressed(KeyCode::AltLeft) || held.pressed(KeyCode::AltRight)
+    })
+}
+
+/// 把一次拾取换算成 [`RowHit`]；目标不是面板行（点空白/面板背景/窗口）、
+/// 命中点没有世界坐标、或行在隐藏的工作区里时给 `None`。
+#[allow(clippy::too_many_arguments)]
 fn hit_row(
     entity: Entity,
     hit: &bevy::picking::backend::HitData,
     layouts: &Query<&RowLayout>,
+    tags: &Query<&WorkspacePanel>,
+    set: Option<&WorkspaceSet>,
     panels: &Query<&WorldPanel>,
     nodes: &Query<&ComputedNode>,
 ) -> Option<RowHit> {
     let layout = layouts.get(entity).ok()?;
+    if !selectable_workspace(row_workspace(layout, tags), set) {
+        return None;
+    }
     let position = hit.position?;
     let panel = panels.get(layout.panel_entity).ok()?;
     let node = nodes.get(layout.panel_entity).ok()?;
@@ -751,6 +790,9 @@ pub fn pointer_selection(
     mut moves: MessageReader<PointerMove>,
     mut releases: MessageReader<PointerRelease>,
     layouts: Query<&RowLayout>,
+    tags: Query<&WorkspacePanel>,
+    set: Option<Res<WorkspaceSet>>,
+    held: Option<Res<ButtonInput<KeyCode>>>,
     panels: Query<&WorldPanel>,
     nodes: Query<&ComputedNode>,
     panel_rows: Res<PanelRows>,
@@ -765,11 +807,23 @@ pub fn pointer_selection(
         if press.button != PointerButton::Primary {
             continue;
         }
+        // Alt+左键是拖工作区，不是选字（见 `workspaces::drag_workspaces`）。
+        if alt_held(held.as_deref()) {
+            continue;
+        }
         // 新的一次按下：清掉上一次的复制失败提示（成功提示由 apply 清）。
         if let Some(status) = status.as_deref_mut() {
             clipboard::clear_copy_failed(status);
         }
-        let Some(hit) = hit_row(press.entity, &press.hit, &layouts, &panels, &nodes) else {
+        let Some(hit) = hit_row(
+            press.entity,
+            &press.hit,
+            &layouts,
+            &tags,
+            set.as_deref(),
+            &panels,
+            &nodes,
+        ) else {
             // 点在没有行的空白上（面板背景、窗口、别的控件）：收起选区。
             selection.clear();
             continue;
@@ -784,7 +838,15 @@ pub fn pointer_selection(
         if !selection.is_dragging() {
             continue;
         }
-        let Some(hit) = hit_row(moved.entity, &moved.hit, &layouts, &panels, &nodes) else {
+        let Some(hit) = hit_row(
+            moved.entity,
+            &moved.hit,
+            &layouts,
+            &tags,
+            set.as_deref(),
+            &panels,
+            &nodes,
+        ) else {
             continue;
         };
         let rows = panel_rows.row_values(hit.panel);
@@ -799,8 +861,15 @@ pub fn pointer_selection(
         }
         // 松开处还落在同一面板的某一行时，先把 focus 收过去：拖得快时最后
         // 一帧的 PointerMove 可能没来。
-        if let Some(hit) = hit_row(release.entity, &release.hit, &layouts, &panels, &nodes)
-            && selection.is_dragging()
+        if let Some(hit) = hit_row(
+            release.entity,
+            &release.hit,
+            &layouts,
+            &tags,
+            set.as_deref(),
+            &panels,
+            &nodes,
+        ) && selection.is_dragging()
             && selection.panel() == Some(hit.panel)
         {
             let rows = panel_rows.row_values(hit.panel);
@@ -1901,6 +1970,107 @@ mod wiring_tests {
         });
         fixture.app.update();
         assert_eq!(selection(&fixture).panel(), None, "右键不碰选区");
+    }
+
+    // ---- 多工作区：只在聚焦工作区里选字 ----
+
+    /// 给面板根挂工作区标签，并把 `focused` 设为 `focused`。
+    fn panel_belongs_to(fixture: &mut Fixture, workspace: Entity, focused: Entity) {
+        fixture
+            .app
+            .world_mut()
+            .entity_mut(fixture.panel)
+            .insert(WorkspacePanel(workspace));
+        fixture.app.init_resource::<WorkspaceSet>();
+        let mut set = fixture.app.world_mut().resource_mut::<WorkspaceSet>();
+        set.items = vec![focused, workspace];
+        set.focused = Some(focused);
+    }
+
+    #[test]
+    fn hidden_workspace_rows_cannot_be_selected() {
+        let mut fixture = fixture(&["hello world"]);
+        let focused = fixture.app.world_mut().spawn_empty().id();
+        let hidden = fixture.app.world_mut().spawn_empty().id();
+        panel_belongs_to(&mut fixture, hidden, focused);
+
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        assert_eq!(
+            selection(&fixture).panel(),
+            None,
+            "隐藏工作区的行虽然还在拾取索引里，但用户看不见，不能选中"
+        );
+        assert!(!selection(&fixture).has_selection());
+    }
+
+    #[test]
+    fn the_focused_workspace_rows_can_still_be_selected() {
+        let mut fixture = fixture(&["hello world"]);
+        let focused = fixture.app.world_mut().spawn_empty().id();
+        let other = fixture.app.world_mut().spawn_empty().id();
+        panel_belongs_to(&mut fixture, focused, focused);
+        let _ = other;
+
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        drag(&mut fixture, 0, 5);
+        fixture.app.update();
+        assert_eq!(selection(&fixture).panel(), Some(PanelId::Transcript));
+        assert_eq!(
+            selection(&fixture).start(),
+            Point::new(0, 0),
+            "聚焦工作区的选字照旧"
+        );
+        release(&mut fixture, 0, 5);
+        fixture.app.update();
+        assert_eq!(printed(&fixture).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn rows_without_a_workspace_tag_stay_selectable() {
+        // 没打标签 = 单工作区 / 旧 App / 测试里手搭的 App：一律放行，不能回归。
+        let mut fixture = fixture(&["hello"]);
+        let focused = fixture.app.world_mut().spawn_empty().id();
+        fixture.app.init_resource::<WorkspaceSet>();
+        fixture.app.world_mut().resource_mut::<WorkspaceSet>().focused = Some(focused);
+
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        assert_eq!(
+            selection(&fixture).panel(),
+            Some(PanelId::Transcript),
+            "没有 WorkspacePanel 标签的面板照旧可选"
+        );
+    }
+
+    #[test]
+    fn alt_left_starts_a_workspace_drag_not_a_text_selection() {
+        let mut fixture = fixture(&["hello"]);
+        fixture.app.init_resource::<ButtonInput<KeyCode>>();
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::AltLeft);
+
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        assert_eq!(
+            selection(&fixture).panel(),
+            None,
+            "Alt+左键归工作区拖拽（workspaces::drag_workspaces），不选字"
+        );
+
+        // 松开 Alt：普通左键照旧选字。
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::AltLeft);
+        press(&mut fixture, 0, 0, 1);
+        fixture.app.update();
+        assert_eq!(selection(&fixture).panel(), Some(PanelId::Transcript));
     }
 
     // ---- resize 清选区（上游 input.rs 的 Event::Resize） ----

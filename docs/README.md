@@ -23,6 +23,7 @@
 | [`HANDOFF.md`](status/HANDOFF.md) | 交接页（含 jj 事故记录与规则） | 当前 |
 | [`PLAN.md`](status/PLAN.md) | 实施顺序、每步做到哪、下一步（环/总览已归档，仅留布局参考） | 当前 |
 | [`PARITY.md`](status/PARITY.md) | 逐模块移植审计：谁已移植、谁部分、谁没开始、缺哪个公开 API | **当前，查进度看它** |
+| [`WORKSPACE_MODEL.md`](status/WORKSPACE_MODEL.md) | **工作区模型**：niri 条带 × 绝对空间坐标、四个操作、六条不变量 | **当前，布局的唯一目标** |
 
 ## design/ —— 为什么这么做
 

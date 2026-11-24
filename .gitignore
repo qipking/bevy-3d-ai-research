@@ -33,3 +33,8 @@ shots/
 experiments/rig-official/*
 !experiments/rig-official/README.md
 !experiments/rig-official/capture.py
+
+# 一次性调试截图（不当作证据存档）
+render/ws*/
+render/layout_check/
+render/dbg*/

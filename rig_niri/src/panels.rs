@@ -16,6 +16,9 @@ use crate::selection::{Selection, paint_hash, selected_row};
 use crate::transcript::{
     Row, RowText, fill_row_text_themed, spawn_row_themed,
 };
+use crate::workspaces::{
+    WorkspacePanels, WorkspaceSet, commit_focused_panels, publish_focused_spawned,
+};
 
 /// 一行面板内容 + 稳定的 key/hash（增量 diff 靠它对齐）。
 #[derive(Clone, Debug)]
@@ -63,7 +66,10 @@ pub struct RowLayout {
 }
 
 /// 每块面板当前要显示的行。
-#[derive(Resource, Default)]
+///
+/// 第 2 批之后：聚焦工作区的全局工作副本；每个工作区自己的权威行在
+/// [`WorkspacePanels::rows`](crate::workspaces::WorkspacePanels) 里。
+#[derive(Resource, Default, Clone)]
 pub struct PanelRows(pub HashMap<PanelId, Vec<KeyedRow>>);
 
 impl PanelRows {
@@ -90,7 +96,10 @@ impl PanelRows {
 }
 
 /// 面板根实体，按 [`PanelId`] 索引（frame 生成时填）。
-#[derive(Resource, Default)]
+///
+/// 第 2 批之后：聚焦工作区的全局工作副本；每个工作区自己的根表在
+/// [`WorkspacePanels::roots`](crate::workspaces::WorkspacePanels) 里。
+#[derive(Resource, Default, Clone)]
 pub struct PanelRoots(pub HashMap<PanelId, Entity>);
 
 impl PanelRoots {
@@ -100,7 +109,7 @@ impl PanelRoots {
 }
 
 /// 一块面板已经生成的行（增量 diff 用）。
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq)]
 pub struct SpawnedRows {
     pub keys: Vec<u64>,
     pub hashes: Vec<u64>,
@@ -108,7 +117,7 @@ pub struct SpawnedRows {
 }
 
 /// 每块面板各自的已生成行。
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, PartialEq)]
 pub struct PanelSpawned(pub HashMap<PanelId, SpawnedRows>);
 
 impl PanelSpawned {
@@ -125,6 +134,11 @@ impl PanelSpawned {
 /// 拆出来的 [`PanelId::Pane2`] 只是同一份内容的第二个视口，所以每帧抄一份。
 /// 这是普通的面板行同步，`sync_panels` 不需要为它写特殊情况。
 fn mirror_transcript_rows(roots: Res<PanelRoots>, mut rows: ResMut<PanelRows>) {
+    mirror_pane2_rows(&mut rows, &roots);
+}
+
+/// 一块工作区自己的 `Pane2` 镜像（非聚焦工作区没有全局系统替它做）。
+fn mirror_pane2_rows(rows: &mut PanelRows, roots: &PanelRoots) {
     if roots.entity(PanelId::Pane2).is_none() {
         return;
     }
@@ -142,24 +156,22 @@ fn row_plain(row: &Row) -> String {
     plain
 }
 
-/// 每块面板做增量 diff：前缀原地改文字，只重建变化的后缀。
+/// 一个工作区（或旧的全局单例）的增量 diff：前缀原地改字，只重建变化的后缀。
 ///
 /// 选区高亮也在这里落：选中行会被 [`selected_row`] 套上 `REVERSED` 后再
 /// 生成 span。`SpawnedRows::hashes` 里存的是 **上游 hash × 选区样式 hash**
 /// 的合成值，所以拖动选区导致同一行的选中区间变化时，这一行也会重画；
 /// 选区清掉后，合成值回到上游 hash，同样触发一次去高亮的重画。
-#[allow(clippy::type_complexity)]
-fn sync_panels(
-    mut commands: Commands,
-    rows: Res<PanelRows>,
-    roots: Res<PanelRoots>,
-    mut spawned: ResMut<PanelSpawned>,
-    font: Res<crate::transcript::TranscriptFont>,
-    theme: Option<Res<crate::theme::Theme>>,
-    selection: Option<Res<Selection>>,
+#[allow(clippy::too_many_arguments)]
+fn sync_panel_rows(
+    mut commands: &mut Commands,
+    rows: &PanelRows,
+    roots: &PanelRoots,
+    spawned: &mut PanelSpawned,
+    font: &crate::transcript::TranscriptFont,
+    theme: &crate::theme::Theme,
+    selection: Option<&Selection>,
 ) {
-    // 主题是可选资源：没有主题的测试 App 退化成默认主题，不让系统被跳过。
-    let theme = theme.map(|t| *t.as_ref()).unwrap_or_default();
     for (id, panel_rows) in rows.0.iter() {
         let Some(root) = roots.entity(*id) else {
             continue;
@@ -168,9 +180,7 @@ fn sync_panels(
 
         // 只有"选区就在这块面板里"时才需要行值/字节区间；否则 ranges 为空，
         // 下面的 row 原样生成，合成 hash 退回上游 hash。
-        let selected = selection
-            .as_deref()
-            .filter(|selection| selection.panel() == Some(*id));
+        let selected = selection.filter(|selection| selection.panel() == Some(*id));
         let row_values = selected.map(|_| panel_rows.iter().map(|item| item.row.clone()).collect::<Vec<_>>());
         let ranges: Vec<Vec<(usize, usize)>> = match (&selected, &row_values) {
             (Some(selection), Some(values)) => (0..panel_rows.len())
@@ -202,7 +212,7 @@ fn sync_panels(
                 let entity = state.entities[index];
                 let painted = painted(index);
                 let row = painted.as_ref().unwrap_or(&panel_rows[index].row);
-                fill_row_text_themed(&mut commands, entity, row, &font.0, &theme);
+                fill_row_text_themed(&mut commands, entity, row, &font.0, theme);
                 commands.entity(entity).insert(RowText(row_plain(row)));
                 state.hashes[index] = hash;
             }
@@ -223,7 +233,7 @@ fn sync_panels(
             let mut entities = Vec::new();
             commands.entity(root).with_children(|parent| {
                 for (_, _, row) in &new_rows {
-                    entities.push(spawn_row_themed(parent, row, &font.0, &theme));
+                    entities.push(spawn_row_themed(parent, row, &font.0, theme));
                 }
             });
             for (offset, ((key, hash, _), entity)) in
@@ -242,6 +252,67 @@ fn sync_panels(
     }
 }
 
+/// 按工作区分派行同步。
+///
+/// * 有 [`WorkspaceSet`]（插件模式）：每个工作区用自己的行/根/已生成行做 diff，
+///   所以两条条带不会互相覆盖；聚焦工作区的状态是 `Render` 里刚提交的工作副本。
+/// * 没有 `WorkspaceSet`（只装 `PanelsPlugin` 的旧 App）：退回原来的全局单例，
+///   行为与第 2 批之前完全一致。
+#[allow(clippy::type_complexity)]
+fn sync_panels(
+    mut commands: Commands,
+    rows: Res<PanelRows>,
+    roots: Res<PanelRoots>,
+    mut spawned: ResMut<PanelSpawned>,
+    font: Res<crate::transcript::TranscriptFont>,
+    theme: Option<Res<crate::theme::Theme>>,
+    selection: Option<Res<Selection>>,
+    set: Option<Res<WorkspaceSet>>,
+    mut workspaces: Query<&mut WorkspacePanels>,
+) {
+    // 主题是可选资源：没有主题的测试 App 退化成默认主题，不让系统被跳过。
+    let theme = theme.map(|t| *t.as_ref()).unwrap_or_default();
+    if let Some(set) = set.as_deref().filter(|set| !set.items.is_empty()) {
+        for workspace in &set.items {
+            let Ok(mut panels) = workspaces.get_mut(*workspace) else {
+                continue;
+            };
+            let WorkspacePanels {
+                rows: panel_rows,
+                roots: panel_roots,
+                spawned: panel_spawned,
+                ..
+            } = &mut *panels;
+            // 非聚焦工作区没有全局的 `mirror_transcript_rows` 替它镜像 Pane2。
+            mirror_pane2_rows(panel_rows, panel_roots);
+            // 选区现在只属于聚焦工作区（`Selection` 还没有工作区字段）：
+            // 非聚焦的行按原样画，别把聚焦工作区的选中区间套过去。
+            let workspace_selection = (set.focused == Some(*workspace))
+                .then_some(selection.as_deref())
+                .flatten();
+            sync_panel_rows(
+                &mut commands,
+                panel_rows,
+                panel_roots,
+                panel_spawned,
+                &font,
+                &theme,
+                workspace_selection,
+            );
+        }
+        return;
+    }
+    sync_panel_rows(
+        &mut commands,
+        &rows,
+        &roots,
+        &mut spawned,
+        &font,
+        &theme,
+        selection.as_deref(),
+    );
+}
+
 pub struct PanelsPlugin;
 
 impl Plugin for PanelsPlugin {
@@ -251,7 +322,12 @@ impl Plugin for PanelsPlugin {
             .init_resource::<PanelSpawned>()
             .add_systems(
                 Update,
-                (mirror_transcript_rows, sync_panels)
+                (
+                    mirror_transcript_rows,
+                    commit_focused_panels,
+                    sync_panels,
+                    publish_focused_spawned,
+                )
                     .chain()
                     .in_set(crate::FeathersSystems::Render),
             );

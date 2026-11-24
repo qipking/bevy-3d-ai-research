@@ -73,6 +73,7 @@ use rig_harness::prelude::SessionPaths;
 pub use rig_niri::prelude::*;
 
 pub mod notice;
+pub mod workspaces_demo;
 pub mod settings;
 pub mod status;
 
@@ -197,6 +198,7 @@ pub fn app(title: &str) -> App {
             ..default()
         }));
     app.add_plugins(bevy_feathers::FeathersPlugins);
+    app.add_plugins(workspaces_demo::WorkspacesDemoPlugin);
     // 渲染层
     app.add_plugins(FeathersIn3dPlugin);
     // harness 本体：session / commands / launcher / clock / watch / ask / pick / run / progress
