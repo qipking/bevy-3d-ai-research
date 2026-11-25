@@ -16,7 +16,10 @@ use bevy::text::{ComputedTextBlock, TextLayoutInfo};
 use bevy_ui::{ComputedNode, Node, UiGlobalTransform};
 
 use crate::sort::PanelSort;
-use crate::world3d::{LAYER_BIAS, MirrorRoot, PanelSortRange, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL};
+use crate::world3d::{
+    LAYER_BIAS, MirrorRoot, PanelSortRange, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL,
+    physical_size_to_world, physical_to_logical,
+};
 
 /// Cache of one `StandardMaterial` per font-atlas texture.
 #[derive(Resource, Default)]
@@ -87,10 +90,13 @@ pub fn sync_panel_text(
 
     for (panel_entity, panel, panel_cn, layer, bias_range, existing) in panels.iter_mut() {
         let units = panel.units_to_world;
+        let inverse_scale_factor = panel_cn.inverse_scale_factor;
         let layer_bias = layer.map_or(0, |layer| layer.0) as f32 * LAYER_BIAS;
 
         // Collect this panel's text nodes and their offsets from the panel centre.
-        let clip_half = panel_cn.size * 0.5;
+        // `ComputedNode`/`UiGlobalTransform` 都是物理像素，镜像统一用逻辑像素
+        // （见 `world3d` 的换算说明）；1× 下 inverse_scale_factor == 1.0，结果不变。
+        let clip_half = physical_to_logical(panel_cn.size * 0.5, inverse_scale_factor);
         let mut rows: Vec<PanelText> = Vec::new();
         for (entity, info, cn, ugt, block, color) in texts.iter() {
             if info.glyphs.is_empty() {
@@ -114,6 +120,7 @@ pub fn sync_panel_text(
         // Cheap signature: rebuild when anything that changes the quads changed.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         panel_cn.size.to_bits_parts().hash(&mut hasher);
+        inverse_scale_factor.to_bits().hash(&mut hasher);
         for row in &rows {
             row.entity.hash(&mut hasher);
             row.info.glyphs.len().hash(&mut hasher);
@@ -161,7 +168,10 @@ pub fn sync_panel_text(
                     Some(image) => image.size().as_vec2(),
                     None => continue,
                 };
-                let centre = row.offset + content_min + glyph.position;
+                let centre = physical_to_logical(
+                    row.offset + content_min + glyph.position,
+                    inverse_scale_factor,
+                );
                 // Clip to the panel box (one glyph of margin keeps half-scrolled rows sane).
                 let margin = 2.0;
                 if centre.x < -clip_half.x - margin
@@ -171,7 +181,11 @@ pub fn sync_panel_text(
                 {
                     continue;
                 }
-                let half = glyph.atlas_info.rect.size() * 0.5 * units;
+                let half = physical_size_to_world(
+                    glyph.atlas_info.rect.size() * 0.5,
+                    inverse_scale_factor,
+                    units,
+                );
                 let cx = centre.x * units;
                 let cy = -centre.y * units;
 
@@ -281,7 +295,8 @@ struct PanelText<'a> {
     cn: &'a ComputedNode,
     block: Option<&'a ComputedTextBlock>,
     color: Option<&'a TextColor>,
-    /// Text-node centre relative to the panel centre, in physical pixels.
+    /// Text-node centre relative to the panel centre, in physical pixels
+    /// (the mirror converts it to logical pixels before building glyphs).
     offset: Vec2,
 }
 

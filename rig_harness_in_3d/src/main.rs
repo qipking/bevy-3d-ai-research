@@ -445,7 +445,19 @@ fn home_z(size: &FrameSize, aspect: f32) -> f32 {
     fit * 1.32
 }
 
-/// 巡游机位。`zoom` 把整套机位按帧尺寸等比放大：帧变大时同样的构图不会裁掉
+/// 巡游机位的 `(pos, look)`。
+///
+/// `zoom` 只缩放机位距离（`pos`）：窗口变大时相机后退，面板几何本身没缩放。
+/// `look` 必须保持原世界坐标——若跟着乘 `zoom`，大窗口下相机会看向缩放后的
+/// 世界点，"对准某一行"的镜头（`target + (0,0,0.55)`）就偏了。96×28 时
+/// `zoom == 1.0`，与旧机位逐字节一致。
+fn shot_pose(pos: Vec3, look: Vec3, zoom: f32) -> (Vec3, Vec3) {
+    // 巡游的机位和目标点都是"帧内的相对位置"：帧变大时同一个相对位置的
+    // world 坐标就是放大的，所以两者一起乘。96×28 时 zoom == 1，逐像素不变。
+    (pos * zoom, look * zoom)
+}
+
+/// 巡游机位。`zoom` 把机位距离按帧尺寸等比放大：帧变大时同样的构图不会裁掉
 /// 面板，帧还是 96×28 时 `zoom == 1.0`，机位与以前的截图逐像素一致。
 fn set_cam(
     camera: &mut Query<&mut Transform, With<ShotCamera>>,
@@ -453,8 +465,7 @@ fn set_cam(
     look: Vec3,
     zoom: f32,
 ) {
-    let pos = pos * zoom;
-    let look = look * zoom;
+    let (pos, look) = shot_pose(pos, look, zoom);
     // RF_RIG=1 时相机交给操作架（手柄/键盘），巡游不再抢机位
     if std::env::var("RF_RIG").is_ok() {
         return;
@@ -506,7 +517,7 @@ fn run_tour(
     };
 
     match step {
-        0..=5 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom),
+        0..=5 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, 1.0),
         6 if sub == 0 => shoot(&mut runner, &mut commands, "01_overview"),
         7 => set_cam(&mut camera, Vec3::new(0.0, 0.02, 1.08), Vec3::ZERO, zoom),
         8 if sub == 0 => shoot(&mut runner, &mut commands, "02_near"),
@@ -520,7 +531,7 @@ fn run_tour(
         }
         14 if sub == 0 => shoot(&mut runner, &mut commands, "04_text_zoom"),
         15 => {
-            set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom);
+            set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, 1.0);
             if let Ok(mut scroll) = scrolls.single_mut() {
                 scroll.follow = false;
                 scroll.top = scroll.top.saturating_sub(4);
@@ -627,7 +638,7 @@ fn run_tour(
         // 斜着看：浮层在 3D 里也是盖在转写上面的（层排序，不靠距离）
         35 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO, zoom),
         36 if sub == 0 => shoot(&mut runner, &mut commands, "10b_picker_oblique"),
-        37 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom),
+        37 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, 1.0),
         // 打字过滤：四个字符后列表只剩 deepseek
         38 if sub == 0 => {
             for (code, char) in [
@@ -693,5 +704,36 @@ fn run_tour(
             exit.write(AppExit::Success);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注视点跟着 `zoom` 一起缩放：巡游的 `target` 是"帧内的相对位置"（例如
+    /// 表格里某一行），帧变大后同一个相对位置的 world 坐标本来就该放大；只缩
+    /// `pos` 会让镜头瞄到帧里**另一个**位置。
+    #[test]
+    fn zoom_scales_the_whole_pose_because_targets_are_frame_relative() {
+        let target = Vec3::new(-0.42, 0.33, 0.0);
+        let pos = target + Vec3::new(0.0, 0.0, 0.55);
+
+        let (zoomed_pos, zoomed_look) = shot_pose(pos, target, 2.0);
+        assert_eq!(zoomed_pos, pos * 2.0, "pos 按 zoom 后退");
+        assert_eq!(zoomed_look, target * 2.0, "look 是帧内相对位置，同样放大");
+
+        let (plain_pos, plain_look) = shot_pose(pos, target, 1.0);
+        assert_eq!(plain_pos, pos, "96×28 下机位原样");
+        assert_eq!(plain_look, target, "96×28 下注视点原样");
+    }
+
+    /// 96×28（默认帧）时 `zoom` 必须恰好是 1.0，现有截图不变。
+    #[test]
+    fn the_default_frame_needs_no_zoom() {
+        let aspect = 16.0 / 10.0;
+        let default_frame = home_z(&FrameSize::default(), aspect);
+        let reference = home_z(&FrameSize { cols: 96, rows: 28 }, aspect);
+        assert_eq!(default_frame / reference, 1.0);
     }
 }

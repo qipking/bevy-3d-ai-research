@@ -27,12 +27,20 @@
 //! 额外送一条普通消息（上游靠内核的 `Incoming::command` 分流；本 crate 没有
 //! refused 概念，所以也不做 `Deliver::literal` 重发）。
 //!
-//! 显示：`editor_rows` 把文本按输入面板列宽折行（和转写同一个
-//! `rig_tui::wrap::wrap`），每行一个 [`KeyedRow`]；光标画在真实行列上
-//! （反色 + 下划线的 `▏`），超过 [`MOST_LINES`] 行时按光标滚动。
-//! [`sync_editor_tile`] 让输入 tile 的高度跟着行数走（最少 [`LEAST_ROWS`]
-//! 行、最多 [`MOST_LINES`] 行 + 面板上下 chrome），右列的总高仍由 Spacer
-//! 这个比例子吸收，精确不变。
+//! 显示：`editor_rows` 把文本按输入面板列宽折行（用 `rig_tui::wrap::wrap_typed`，
+//! 人打的文本不因首词后的空格悬挂缩进），每行一个 [`KeyedRow`]。
+//!
+//! 光标**不是额外字符**：旧实现往行里插一个 `▏`，渲染行宽会比折行宽多一列，
+//! 写满一行的中间改字时行尾被裁；现在只把光标所在列的那个 grapheme 反色 +
+//! 下划线，行尾（或折行丢掉的空白里）补一个反色空格，放不下就不补，所以任何
+//! 情况下渲染行宽都不超过面板列数。
+//!
+//! 可见行数取 `min(折行行数, 输入面板实际能放的行数, [`MOST_LINES`])`：面板
+//! 能放几行从 [`PanelAreas`] 的 [`PanelId::Input`] 区域读（`area.rows` 已经
+//! 扣掉 inset 的 chrome），每个 Update 重算，窗口矮到放不下 [`MOST_LINES`]
+//! 时滚动仍把光标行留在可见段里。[`sync_editor_tile`] 让输入 tile 的高度跟着
+//! 行数走（最少 [`LEAST_ROWS`] 行、最多 [`MOST_LINES`] 行 + 面板上下 chrome），
+//! 右列的总高仍由 Spacer 这个比例子吸收，精确不变。
 //!
 //! 未接的行为：粘贴图片（Ctrl+V 现在只粘文本；图片见 [`crate::clipboard`]
 //! 模块文档）、转写区滚动/选择（由 `pane.rs` 现有系统负责）。
@@ -133,8 +141,13 @@ pub struct EditorLayout {
     pub cursor_column: usize,
     /// 可见段从 `rows` 的第几行开始（滚动）。
     pub top: usize,
-    /// 可见几行（`clamp(rows.len(), 1, MOST_LINES)`）。
+    /// 可见几行：`min(rows.len(), 面板能放的行数, MOST_LINES)`。
     pub visible: usize,
+    /// 折行用的面板列数（含第一行两列提示符）。
+    ///
+    /// 光标在行尾补空格、面板窄到连提示符都放不下时裁行，都靠它保证
+    /// **渲染行宽 ≤ 面板列数**。布局还没跑过（`Default`）时是 0。
+    width: usize,
 }
 
 impl EditorLayout {
@@ -145,35 +158,55 @@ impl EditorLayout {
     }
 
     /// 这一帧要显示的行：`top..top+visible`，第一行带 `› `、续行带两个空格，
-    /// 光标所在行在真实列上插入 [`CURSOR`]。
+    /// 光标所在行把光标列上的 grapheme 反色（不插入字符，见 [`with_cursor`]）。
+    ///
+    /// 面板窄到连提示符（两列）都放不下时，行会被裁到面板列数以内——正常
+    /// 宽度下折行与光标样式已经保证不越界，这里只是最后一道保险。
     pub fn visible_rows(&self, theme: &Theme) -> Vec<Line<'static>> {
         if self.rows.is_empty() {
             // 布局还没跑过（例如系统被跳过）时也至少画出提示符和光标。
-            return vec![Line::from(vec![prompt_span(true, theme), cursor_span()])];
+            let line = Line::from(vec![prompt_span(true, theme), end_cursor_span()]);
+            return vec![match self.width {
+                0 => line,
+                width => fit_to_width(line, width),
+            }];
+        }
+        if self.visible == 0 {
+            return Vec::new();
         }
         let start = self.top.min(self.rows.len().saturating_sub(1));
-        let end = start
-            .saturating_add(self.visible.max(1))
-            .min(self.rows.len());
+        let end = start.saturating_add(self.visible).min(self.rows.len());
         (start..end)
             .map(|index| {
                 let mut row = self.rows[index].clone();
                 if index == self.cursor_row {
-                    row = with_cursor(row, self.cursor_column);
+                    row = with_cursor(row, self.cursor_column, self.body_width());
                 }
                 let mut spans = vec![prompt_span(index == 0, theme)];
                 spans.extend(row.spans);
-                Line {
-                    spans,
-                    style: row.style,
-                    alignment: row.alignment,
-                }
+                fit_to_width(
+                    Line {
+                        spans,
+                        style: row.style,
+                        alignment: row.alignment,
+                    },
+                    self.width,
+                )
             })
             .collect()
     }
+
+    /// 正文（不含提示符两列）的显示列数；与 [`Editor::layout`] 的折行宽度一致。
+    fn body_width(&self) -> usize {
+        self.width.max(3) - 2
+    }
 }
 
-/// 光标画成的字符（沿用旧实现的 `▏`，但位置是真的）。
+/// 旧实现插在行里的光标字符 `▏`。
+///
+/// 现在光标**不再**多占一列：它把光标处的 grapheme 反色（行尾补一个反色
+/// 空格），所以渲染行里不会出现这个字符。保留常量是为了兼容旧引用，测试
+/// 也用它断言"没有额外插入字符"。
 pub const CURSOR: &str = "▏";
 
 /// 光标的样式：反色 + 下划线，前景仍是旧的浅青色。
@@ -183,8 +216,9 @@ pub fn cursor_style() -> Style {
         .add_modifier(Modifier::REVERSED | Modifier::UNDERLINED)
 }
 
-fn cursor_span() -> Span<'static> {
-    Span::styled(CURSOR, cursor_style())
+/// 行尾（或折行丢掉的空白里）补出来的光标格：一个反色的空格。
+fn end_cursor_span() -> Span<'static> {
+    Span::styled(" ", cursor_style())
 }
 
 /// 行首提示符：第一行 `› `（绿色粗体），续行两个空格（dim，和上游一致）。
@@ -195,12 +229,18 @@ fn prompt_span(first: bool, theme: &Theme) -> Span<'static> {
     }
 }
 
-/// 在行内第 `column` 个显示列处插入光标。
+/// 把光标画在行内第 `column` 个显示列上：反色该列上的 grapheme，**不插入
+/// 任何额外字符**。
 ///
-/// 光标是额外的一列而不是盖在字上：中文字/emoji 的宽度由
-/// [`UnicodeWidthStr`] 算，和折行用的是同一套列宽。行比 `column` 短时先补
-/// 空格——光标可能停在折行时被丢掉的空白里（上游终端光标也停在那里）。
-fn with_cursor(line: Line<'static>, column: usize) -> Line<'static> {
+/// 旧实现插入一个 `▏`（宽 1 列），渲染行宽 = 折行宽 + 1，写满一行时行尾
+/// 会被面板裁掉。现在反色覆盖这一列的 grapheme，宽字/emoji 也是原地反色，
+/// 行宽不变。
+///
+/// 光标可能停在行尾或折行时被丢掉的空白里：先补空格到 `column`，再反色
+/// 一个空格。补这一格的前提是正文仍在 `body_width` 列以内；放不下就只停在
+/// 行尾位置，绝不撑宽（正常情况下 `layout` 会把写满一行的行尾光标挪到下一
+/// 行，所以只有空白/防御路径会走到这里）。
+fn with_cursor(line: Line<'static>, column: usize, body_width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     let mut seen = 0usize;
     let mut placed = false;
@@ -212,10 +252,15 @@ fn with_cursor(line: Line<'static>, column: usize) -> Line<'static> {
                 if !text.is_empty() {
                     spans.push(Span::styled(std::mem::take(&mut text), span.style));
                 }
-                spans.push(cursor_span());
+                // 一个 grapheme（含 ZWJ emoji / 组合字符）整体反色，宽度不变。
+                spans.push(Span::styled(
+                    grapheme.to_owned(),
+                    span.style.patch(cursor_style()),
+                ));
                 placed = true;
+            } else {
+                text.push_str(grapheme);
             }
-            text.push_str(grapheme);
             seen = seen.saturating_add(width);
         }
         if !text.is_empty() {
@@ -223,10 +268,50 @@ fn with_cursor(line: Line<'static>, column: usize) -> Line<'static> {
         }
     }
     if !placed {
-        if seen < column {
-            spans.push(Span::styled(" ".repeat(column - seen), Style::default()));
+        let padding = column.saturating_sub(seen);
+        if seen.saturating_add(padding).saturating_add(1) <= body_width {
+            if padding > 0 {
+                spans.push(Span::styled(" ".repeat(padding), Style::default()));
+            }
+            spans.push(end_cursor_span());
         }
-        spans.push(cursor_span());
+    }
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// 把一行裁到 `width` 列以内：只保留完整 grapheme，宽字/emoji 不会被切成
+/// 半个。
+///
+/// 正常宽度下折行（正文 ≤ 面板列数 - 2）和光标（原地反色，最多补一个空格）
+/// 已经保证 `2 + 正文 <= 面板列数`；只有面板窄到连提示符都放不下时
+/// （[`Editor::layout`] 把正文宽度兜底成 1 列）才会真的裁。这是"渲染行宽
+/// 永远不超过面板列数"的最后一道保险。
+fn fit_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    'spans: for span in line.spans {
+        let mut text = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if used.saturating_add(cells) > width {
+                if !text.is_empty() {
+                    spans.push(Span::styled(text, span.style));
+                }
+                break 'spans;
+            }
+            used = used.saturating_add(cells);
+            text.push_str(grapheme);
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
     }
     Line {
         spans,
@@ -514,10 +599,13 @@ impl Editor {
                 .map_or(line.len(), |(index, _)| index);
     }
 
-    /// 按输入面板的 `width` 个文字列折行，并算出光标落在第几行第几列。
+    /// 按输入面板的 `width` 个文字列折行，并算出光标落在第几行第几列；
+    /// 可见行数最多 [`MOST_LINES`] 行。
     ///
-    /// 折行用 [`rig_tui::wrap::wrap`]——和转写 `transcript::wrap_rows` 是同一个
-    /// 折行器（按 unicode 列宽、词边界、列表续行缩进）。第一行前面的 `› `
+    /// 折行用 [`rig_tui::wrap::wrap_typed`]——和转写 `transcript::wrap_rows`
+    /// 的 [`rig_tui::wrap::wrap`] 是同一个折行器，但输入框里是人打的文本：
+    /// 首词后面两个以上空格更可能是手滑，不该像代码/列表那样让续行悬挂
+    /// 缩进（上游 `rig-tui editor.rs` 也分这两个入口）。第一行前面的 `› `
     /// 也占两列，所以正文宽度是 `width - 2`，与上游 `layout(width)` 一致。
     /// 控制字符按上游换成同样字节数的空格（tab 因此显示成一个空格）；换行
     /// 按 `\n` 拆成逻辑行。光标是 grapheme 边界上的字节偏移，折行时被丢掉
@@ -526,6 +614,17 @@ impl Editor {
     /// 返回的 [`EditorLayout`] 不含提示符：`cursor_column` 是行内显示列，
     /// 提示符两列由 [`EditorLayout::visible_rows`] 加。
     pub fn layout(&self, width: usize) -> EditorLayout {
+        self.layout_within(width, MOST_LINES)
+    }
+
+    /// [`Self::layout`]，可见行数还受输入面板这一帧实际能放的行数
+    /// （[`PanelAreas`] 的 `area.rows`）限制：`min(折行行数, max_rows,
+    /// MOST_LINES)`。
+    ///
+    /// 面板变矮时 `top` 仍按光标滚动，所以光标行一定在 `top..top+visible`
+    /// 里；`max_rows == 0` 时 `visible == 0`，一行都不写。
+    fn layout_within(&self, width: usize, max_rows: usize) -> EditorLayout {
+        let panel_width = width;
         // `width` 是面板文字列数，去掉提示符的两列；至少留 1 列。
         let width = width.max(3) - 2;
         let mut rows: Vec<Line<'static>> = Vec::new();
@@ -545,7 +644,7 @@ impl Editor {
                 .checked_sub(start)
                 .filter(|at| *at <= line.len());
             let mut end = 0;
-            for (row, joint) in rig_tui::wrap::wrap(&Line::from(shown.as_str()), width) {
+            for (row, joint) in rig_tui::wrap::wrap_typed(&Line::from(shown.as_str()), width) {
                 let (gap, indent) = joint
                     .as_ref()
                     .map_or(("", 0), |joint| (joint.gap.as_str(), joint.indent));
@@ -580,14 +679,18 @@ impl Editor {
             }
             start += line.len() + 1;
         }
-        let visible = rows.len().clamp(1, MOST_LINES);
-        let top = (cursor.0 + 1).saturating_sub(visible);
+        let visible = rows.len().min(max_rows).min(MOST_LINES);
+        let top = match visible {
+            0 => 0,
+            visible => (cursor.0 + 1).saturating_sub(visible),
+        };
         EditorLayout {
             rows,
             cursor_row: cursor.0,
             cursor_column: cursor.1,
             top,
             visible,
+            width: panel_width,
         }
     }
 
@@ -1220,19 +1323,37 @@ pub fn input_width(roots: Option<&PanelRoots>, areas: Option<&PanelAreas>) -> us
         .map_or(97, |area| usize::from(area.cols.max(1)))
 }
 
-/// 按输入面板的列宽算这一帧的 [`EditorLayout`]（折行、光标行列、滚动 top）。
+/// 输入框这一帧**能放几行文字**：树给 [`PanelId::Input`] 叶子的
+/// [`crate::frame::PanelArea::rows`]。
+///
+/// `PanelArea::rows` 是文字区行数，`PanelArea::from_tile` 里已经减过
+/// `PanelInset` 的 pad + border（`size - inset.total()`），**不要**再扣一次
+/// chrome。根/区域还没建好（只装 `EditorPlugin` 的最小 App、第一帧）时用
+/// [`MOST_LINES`] 兜底，和 [`input_width`] 的 97 兜底同一套规则。
+pub fn input_rows(roots: Option<&PanelRoots>, areas: Option<&PanelAreas>) -> usize {
+    roots
+        .and_then(|roots| roots.entity(PanelId::Input))
+        .and_then(|root| areas.and_then(|areas| areas.get(root)))
+        .map_or(MOST_LINES, |area| usize::from(area.rows))
+}
+
+/// 按输入面板的列宽和高度算这一帧的 [`EditorLayout`]（折行、光标行列、
+/// 滚动 top、可见行数）。
 ///
 /// 排在 [`keys`] 之后：同一帧敲进去的字、Shift+Enter 的新行立刻参与布局。
-/// 宽度取**上一帧** `lay_out_frame` 写下的 `PanelAreas`：右列的宽度不随
-/// 输入框高度变（高度只由 Spacer 吸收），所以这个宽度和这一帧布局后一致，
-/// 且 `sync_editor_tile` 能在 `lay_out_frame` 之前用同一份行数改树。
+/// 宽度和能放的行数取**上一帧** `lay_out_frame` 写下的 `PanelAreas`：右列
+/// 宽度不随输入框高度变，高度也只会在窗口压扁 Fixed 高度时变，所以用上一帧
+/// 的值不会抖；`sync_editor_tile` 能在 `lay_out_frame` 之前用同一份行数改树。
+/// 每个 Update 都重算，面板尺寸变了不需要额外事件。
 pub fn layout_editor(
     editor: Res<Editor>,
     roots: Option<Res<PanelRoots>>,
     areas: Option<Res<PanelAreas>>,
     mut layout: ResMut<EditorLayout>,
 ) {
-    let next = editor.layout(input_width(roots.as_deref(), areas.as_deref()));
+    let width = input_width(roots.as_deref(), areas.as_deref());
+    let max_rows = input_rows(roots.as_deref(), areas.as_deref());
+    let next = editor.layout_within(width, max_rows);
     if *layout != next {
         *layout = next;
     }
@@ -1258,9 +1379,10 @@ pub fn sync_editor_tile(layout: Res<EditorLayout>, tree: Option<ResMut<FrameTree
 
 /// 输入面板这一帧的行：折好的可见行，每行一个 [`KeyedRow`]。
 ///
-/// 行来自 [`EditorLayout`]（宽度/折行/滚动已在 [`layout_editor`] 里算好）；
-/// 光标画在真实行列上，是行内的一个反色 + 下划线 span。超过
-/// [`MOST_LINES`] 行时只写 `top..top+visible`，光标行一定在可见段里。
+/// 行来自 [`EditorLayout`]（宽度/折行/滚动/可见行数已在 [`layout_editor`]
+/// 里算好）；光标是光标行里被反色的 grapheme，不再插入额外字符。超过
+/// [`MOST_LINES`] 或面板能放的行数时只写 `top..top+visible`，光标行一定在
+/// 可见段里。
 pub fn editor_rows(mut panels: ResMut<PanelRows>, layout: Res<EditorLayout>, theme: Res<Theme>) {
     let rows: Vec<KeyedRow> = layout
         .visible_rows(&theme)
@@ -1364,7 +1486,7 @@ mod tests {
         editor
     }
 
-    /// 一行里所有 span 的纯文本（光标是其中一个 span，测试直接找它）。
+    /// 一行里所有 span 的纯文本（光标只改样式，所以这也是渲染出来的文本）。
     fn plain(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -1372,8 +1494,24 @@ mod tests {
             .collect()
     }
 
-    /// 只装布局/产行系统的最小 App：`width` 是输入面板的文字列数。
-    fn layout_app(width: u16) -> App {
+    /// 光标标记：第一个反色 span 的起始显示列（含提示符）+ 文本。
+    ///
+    /// 光标不再插入 `▏`，而是把光标列的 grapheme 反色；行尾/空白处是反色的
+    /// 一个空格。返回 `None` 表示这一行没有光标。
+    fn cursor_marker(line: &Line<'_>) -> Option<(usize, String)> {
+        let mut column = 0usize;
+        for span in &line.spans {
+            if span.style.add_modifier.contains(Modifier::REVERSED) {
+                return Some((column, span.content.to_string()));
+            }
+            column += span.width();
+        }
+        None
+    }
+
+    /// 只装布局/产行系统的最小 App：`width` 是输入面板的文字列数，
+    /// `rows` 是面板这一帧能放的行数（和 `PanelArea.rows` 一样已扣 chrome）。
+    fn layout_app_with(width: u16, rows: u16) -> App {
         let mut app = App::new();
         app.init_resource::<Editor>()
             .init_resource::<EditorLayout>()
@@ -1387,7 +1525,7 @@ mod tests {
             root,
             crate::frame::PanelArea {
                 cols: width,
-                rows: 3,
+                rows,
                 ..Default::default()
             },
         );
@@ -1395,6 +1533,11 @@ mod tests {
             .insert_resource(areas)
             .add_systems(Update, (layout_editor, editor_rows).chain());
         app
+    }
+
+    /// 只装布局/产行系统的最小 App；面板能放 [`MOST_LINES`] 行。
+    fn layout_app(width: u16) -> App {
+        layout_app_with(width, MOST_LINES as u16)
     }
 
     /// 只装布局 + tile 同步的最小 App（带一棵默认帧树）。
@@ -2467,12 +2610,18 @@ mod tests {
         assert_eq!(raw, ["one two", "three", "four five"]);
         editor.set_cursor(0);
         let layout = editor.layout(12);
-        let shown: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(shown, ["› ▏one two", "  three", "  four five"]);
+        let shown = layout.visible_rows(&Theme::default());
+        let text: Vec<String> = shown.iter().map(plain).collect();
+        assert_eq!(text, ["› one two", "  three", "  four five"]);
+        assert_eq!(
+            cursor_marker(&shown[0]),
+            Some((2, "o".to_owned())),
+            "光标反色行首的 o，不多占列"
+        );
+        assert!(
+            text.iter().all(|row| !row.contains(CURSOR)),
+            "不再把 ▏ 插进行里"
+        );
 
         // 更窄：同样的文本要折更多行，每行正文不超过正文宽度。
         let narrow = editor.layout(8);
@@ -2489,6 +2638,30 @@ mod tests {
     }
 
     #[test]
+    fn typed_text_continuation_rows_are_not_hanging_indented() {
+        // 首词后两个空格：普通 `wrap` 会把它当列（悬挂缩进），输入框用
+        // `wrap_typed`，续行从行首开始（上游 `rig-tui editor.rs` 的选择）。
+        let editor = ed("run  one two three");
+        let layout = editor.layout(10); // 正文 8 列
+        let raw: Vec<String> = layout.rows.iter().map(plain).collect();
+        assert_eq!(raw, ["run", "one two", "three"]);
+        assert!(
+            raw[1..].iter().all(|row| !row.starts_with(' ')),
+            "续行不能悬挂缩进：{raw:?}"
+        );
+
+        // 同一文本交给普通 `wrap` 会缩进续行——证明换的是对的入口。
+        let upstream: Vec<String> = rig_tui::wrap::wrap(&Line::from("run  one two three"), 8)
+            .into_iter()
+            .map(|(row, _)| plain(&row))
+            .collect();
+        assert!(
+            upstream[1..].iter().any(|row| row.starts_with(' ')),
+            "普通折行器会悬挂缩进：{upstream:?}"
+        );
+    }
+
+    #[test]
     fn cursor_is_drawn_at_its_real_row_and_column() {
         let mut editor = ed("one two three four five");
         // "one two " 之后是 "three" 的 8..13；11 在 "thr|ee" 中间。
@@ -2496,40 +2669,32 @@ mod tests {
         let layout = editor.layout(12);
         assert_eq!((layout.cursor_row, layout.cursor_column), (1, 3));
         assert_eq!(layout.cursor_in_view(), Some(1));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[0], "› one two");
-        assert_eq!(rows[1], "  thr▏ee", "光标画在第二行第 3 个显示列");
-        assert_eq!(rows[2], "  four five");
-        assert!(!rows[0].contains(CURSOR), "光标不能留在第一行");
-        let line = &layout.visible_rows(&Theme::default())[1];
-        let marker = line
+        let shown = layout.visible_rows(&Theme::default());
+        let text: Vec<String> = shown.iter().map(plain).collect();
+        assert_eq!(text, ["› one two", "  three", "  four five"]);
+        assert_eq!(
+            cursor_marker(&shown[1]),
+            Some((5, "e".to_owned())),
+            "光标反色第二行第 3 个显示列的 e"
+        );
+        assert!(cursor_marker(&shown[0]).is_none(), "光标不能留在第一行");
+        let marker = shown[1]
             .spans
             .iter()
-            .find(|span| span.content == CURSOR)
-            .expect("光标是行里的一个 span");
-        assert!(
-            marker.style.add_modifier.contains(Modifier::REVERSED),
-            "光标要反色"
-        );
+            .find(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .expect("光标是行内被反色的 span，不是额外字符");
         assert!(
             marker.style.add_modifier.contains(Modifier::UNDERLINED),
             "光标要下划线"
         );
 
-        // 行首：光标在最前面。
+        // 行首：光标在行内第一个字上。
         editor.set_cursor(8);
         let layout = editor.layout(12);
         assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[1], "  ▏three");
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[1]), "  three");
+        assert_eq!(cursor_marker(&shown[1]), Some((2, "t".to_owned())));
     }
 
     #[test]
@@ -2539,38 +2704,44 @@ mod tests {
         let layout = editor.layout(6); // 正文 4 列：你好 / 世界
         assert_eq!(layout.rows.len(), 2);
         assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[1], "  ▏世界");
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[1]), "  世界");
+        assert_eq!(cursor_marker(&shown[1]), Some((2, "世".to_owned())));
+        assert_eq!(shown[1].width(), 6, "宽字反色不多占列");
 
         editor.set_cursor(9); // 世 与 界 之间
         let layout = editor.layout(6);
         assert_eq!((layout.cursor_row, layout.cursor_column), (1, 2));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[1], "  世▏界", "汉字算 2 个显示列");
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[1]), "  世界");
+        assert_eq!(
+            cursor_marker(&shown[1]),
+            Some((4, "界".to_owned())),
+            "汉字算 2 个显示列"
+        );
+        assert_eq!(shown[1].width(), 6);
     }
 
     #[test]
     fn a_cursor_in_whitespace_dropped_by_wrapping_stays_at_its_column() {
-        let mut editor = ed("ab   cd");
-        editor.set_cursor(3); // 三个空格里的第一个：折行时可能被丢掉
-        let layout = editor.layout(6); // 正文 4 列
+        let mut editor = ed("one two three");
+        editor.set_cursor(3); // "one" 后面被折行丢掉的空格
+        let layout = editor.layout(7); // 正文 5 列
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 3));
+        assert_eq!(plain(&layout.rows[0]), "one", "空格被折行丢掉");
         let in_view = layout.cursor_in_view().expect("光标行要在可见段里");
-        let row = &layout.visible_rows(&Theme::default())[in_view];
-        let text = plain(row);
-        let at = text.find(CURSOR).expect("光标标记");
+        let shown = layout.visible_rows(&Theme::default());
         assert_eq!(
-            UnicodeWidthStr::width(&text[..at]),
-            2 + layout.cursor_column,
-            "光标前的显示宽 = 提示符 2 列 + 算出的列：{text:?}"
+            cursor_marker(&shown[in_view]),
+            Some((2 + layout.cursor_column, " ".to_owned())),
+            "光标落在被丢掉空白的列上，补的是反色空格"
         );
+        assert_eq!(
+            shown[in_view].width(),
+            2 + layout.cursor_column + 1,
+            "提示符 2 列 + 空格补到光标列 + 反色格"
+        );
+        assert!(shown[in_view].width() <= 7);
     }
 
     #[test]
@@ -2579,12 +2750,176 @@ mod tests {
         let layout = editor.layout(12);
         assert_eq!(layout.rows.len(), 2, "写满一行后光标另起一行");
         assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[1], "  ▏", "新行只有光标");
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[0]), "› 0123456789");
+        assert_eq!(shown[0].width(), 12, "写满的行正好 12 列，不超");
+        assert_eq!(plain(&shown[1]), "   ", "新行只有反色的一个空格");
+        assert_eq!(cursor_marker(&shown[1]), Some((2, " ".to_owned())));
+        assert_eq!(shown[1].width(), 3);
+    }
+
+    #[test]
+    fn a_full_row_does_not_widen_with_the_cursor() {
+        // 审查算例：面板 12 列、正文正好 10 列、光标在第 5 列。旧实现插入
+        // 额外一列 `▏`，渲染成 `› 01234▏56789` = 13 列 > 12，行尾被裁。
+        let mut editor = ed("0123456789");
+        editor.set_cursor(5);
+        let layout = editor.layout(12);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 5));
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(shown.len(), 1);
+        assert_eq!(plain(&shown[0]), "› 0123456789", "没有多出来的字符");
+        assert_eq!(shown[0].width(), 12, "渲染行宽 = 面板列数，不超");
+        assert_eq!(
+            cursor_marker(&shown[0]),
+            Some((7, "5".to_owned())),
+            "反色光标列上的 5"
+        );
+        assert!(!plain(&shown[0]).contains(CURSOR));
+    }
+
+    #[test]
+    fn rendered_rows_never_exceed_the_panel_width() {
+        let samples = [
+            ("0123456789", 12usize),
+            ("one two three four five", 12),
+            ("你好世界", 6),
+            ("abcdefghij", 3),
+            ("👨\u{200d}👩\u{200d}👧\u{200d}👦 family", 8),
+            ("one two three", 7),
+            ("", 3),
+        ];
+        for (text, panel) in samples {
+            // 逐字节放光标（会吸附到 grapheme 边界），所有行都不能超面板列数。
+            for cursor in 0..=text.len() {
+                let mut editor = ed(text);
+                editor.set_cursor(cursor);
+                let layout = editor.layout(panel);
+                for (index, row) in layout
+                    .visible_rows(&Theme::default())
+                    .iter()
+                    .enumerate()
+                {
+                    assert!(
+                        row.width() <= panel,
+                        "text={text:?} panel={panel} cursor={cursor} row={index}: \
+                         渲染宽 {} > {panel}",
+                        row.width()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_panel_narrower_than_the_prompt_still_never_overflows() {
+        for panel in 1..=2 {
+            let editor = ed("abc");
+            let layout = editor.layout(panel);
+            for row in layout.visible_rows(&Theme::default()) {
+                assert!(row.width() <= panel, "panel={panel} row={row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_is_always_painted_when_its_row_is_visible() {
+        // 反色式光标不能因为"行尾放不下"或滚动窗口而消失：布局把写满一行的
+        // 行尾光标挪到下一行，`top` 又保证光标行在可见段里。
+        for panel in 3..=20 {
+            for text in [
+                "",
+                "a",
+                "0123456789",
+                "one two three four five",
+                "你好世界",
+                "run  one two three",
+                "ab   cd",
+                "e\u{301}x",
+            ] {
+                for cursor in 0..=text.len() {
+                    // 面板正文比文本里最宽的一个 grapheme 还窄时，那个字本身
+                    // 都放不下（折行也切不开一个 grapheme），裁行会把光标格
+                    // 一起裁掉——这是退化几何，不属于这里要保的可见性。
+                    let widest = text
+                        .graphemes(true)
+                        .map(UnicodeWidthStr::width)
+                        .max()
+                        .unwrap_or(0);
+                    if panel < 2 + widest {
+                        continue;
+                    }
+                    let mut editor = ed(text);
+                    editor.set_cursor(cursor);
+                    let layout = editor.layout(panel);
+                    assert!(
+                        layout.cursor_column < layout.body_width(),
+                        "panel={panel} text={text:?} cursor={cursor}: \
+                         光标列 {} 不满足 < 正文宽 {}（上游同一条不变量）",
+                        layout.cursor_column,
+                        layout.body_width()
+                    );
+                    let Some(in_view) = layout.cursor_in_view() else {
+                        continue;
+                    };
+                    let shown = layout.visible_rows(&Theme::default());
+                    assert!(
+                        cursor_marker(&shown[in_view]).is_some(),
+                        "panel={panel} text={text:?} cursor={cursor}: \
+                         光标行 {in_view} 没有被反色：{shown:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zwj_family_emoji_keeps_the_cursor_column_in_step_with_wrapping() {
+        // 已验证口径一致：rig-markdown 0.47 的折行按 **grapheme** 切 cell，
+        // unicode-width 0.2.3 对完整 ZWJ 序列算 2 列；cursor_column 用
+        // "grapheme 边界上的前缀 width"，三者是同一套列宽（没有偏一列）。
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        assert_eq!(family.graphemes(true).count(), 1, "ZWJ 家族是一个 grapheme");
+        assert_eq!(
+            UnicodeWidthStr::width(family),
+            2,
+            "整个 ZWJ 序列占 2 列，不是里面每个 emoji 各 2 列"
+        );
+
+        let mut editor = ed(&format!("ab{family}cd"));
+        // 正文 6 列：ab + 家族 emoji(2) + cd 正好一行。
+        editor.set_cursor(2);
+        let layout = editor.layout(8);
+        assert_eq!(layout.rows.len(), 1);
+        assert_eq!(layout.rows[0].width(), 6);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 2));
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(
+            cursor_marker(&shown[0]),
+            Some((4, family.to_owned())),
+            "反色整个家族，占 2 列"
+        );
+        assert_eq!(shown[0].width(), 8, "提示符 2 + 正文 6，正好填满");
+
+        // 光标在家族 emoji 之后：列数是 2 + 2 = 4，不是 2 + 8。
+        editor.set_cursor(2 + family.len());
+        let layout = editor.layout(8);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (0, 4));
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(
+            cursor_marker(&shown[0]),
+            Some((6, "c".to_owned())),
+            "光标没有偏一列"
+        );
+
+        // 窄到正文 4 列：家族 emoji 跨行（ab + emoji 一行，cd 下一行），
+        // 光标在它之后落到下一行行首。
+        let layout = editor.layout(6);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[0]), format!("› ab{family}"));
+        assert_eq!(cursor_marker(&shown[1]), Some((2, "c".to_owned())));
+        assert!(shown.iter().all(|row| row.width() <= 6));
     }
 
     #[test]
@@ -2599,27 +2934,68 @@ mod tests {
         assert_eq!(layout.visible, MOST_LINES, "最多显示 10 行");
         assert_eq!(layout.top, 5, "光标在最后一行：可见段是 5..15");
         assert_eq!(layout.cursor_in_view(), Some(MOST_LINES - 1));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
+        let shown = layout.visible_rows(&Theme::default());
+        let rows: Vec<String> = shown.iter().map(plain).collect();
         assert_eq!(rows.len(), MOST_LINES);
         assert_eq!(rows[0], "  line 5", "滚到光标所在的那一段");
-        assert!(rows[9].contains("line 14"));
-        assert!(rows[9].contains(CURSOR), "光标行在可见段里");
+        assert_eq!(rows[9], "  line 14 ", "行尾反色空格也是光标格");
+        assert!(cursor_marker(&shown[9]).is_some(), "光标行在可见段里");
 
         // 光标回到第一行：滚回顶部。
         editor.set_cursor(0);
         let layout = editor.layout(97);
         assert_eq!(layout.top, 0);
         assert_eq!(layout.cursor_in_view(), Some(0));
-        let rows: Vec<String> = layout
-            .visible_rows(&Theme::default())
-            .iter()
-            .map(plain)
-            .collect();
-        assert_eq!(rows[0], "› ▏line 0");
+        let shown = layout.visible_rows(&Theme::default());
+        assert_eq!(plain(&shown[0]), "› line 0");
+        assert_eq!(cursor_marker(&shown[0]), Some((2, "l".to_owned())));
+    }
+
+    #[test]
+    fn a_short_input_panel_shows_seven_rows_and_keeps_the_cursor_visible() {
+        // 审查场景：窗口矮到主区 < 200px 时 Fixed(200) 被压成 ~162px，
+        // 输入面板只放得下 7 行；文本有 10 行，不能照写 10 行把光标行裁掉。
+        let mut app = layout_app_with(97, 7);
+        let text = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.world_mut().resource_mut::<Editor>().set(text);
+        app.update();
+
+        let layout = app.world().resource::<EditorLayout>();
+        assert_eq!(layout.visible, 7, "可见行数被面板高度卡住");
+        assert_eq!(layout.top, 3, "滚动到光标所在段");
+        assert_eq!(layout.cursor_in_view(), Some(6), "光标行一定在可见段里");
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
+        assert_eq!(rows.len(), 7, "只写面板放得下的 7 行");
+        let shown: Vec<String> = rows.iter().map(|keyed| plain(&keyed.row.line)).collect();
+        assert_eq!(shown[0], "  line 3");
+        assert_eq!(shown[6], "  line 9 ");
+        assert!(
+            cursor_marker(&rows[6].row.line).is_some(),
+            "光标行在最后一行"
+        );
+
+        // 面板再变矮：每个 Update 重算，不需要专门的事件。
+        let root = app
+            .world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Input)
+            .expect("输入根实体");
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .get_mut(&root)
+            .expect("输入区域")
+            .rows = 4;
+        app.update();
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
+        assert_eq!(rows.len(), 4, "面板变矮后立刻少写行");
+        assert!(
+            cursor_marker(&rows[3].row.line).is_some(),
+            "光标仍然可见"
+        );
     }
 
     #[test]
@@ -2643,8 +3019,35 @@ mod tests {
         let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
         let shown: Vec<String> = rows.iter().map(|keyed| plain(&keyed.row.line)).collect();
         assert_eq!(shown[0], "› one two");
-        assert_eq!(shown[1], "  thr▏ee", "系统产出的行里光标在真实列上");
+        assert_eq!(shown[1], "  three", "光标只改样式，不改文本");
         assert_eq!(shown[2], "  four five");
+        assert_eq!(
+            cursor_marker(&rows[1].row.line),
+            Some((5, "e".to_owned())),
+            "系统产出的行里光标在真实列上"
+        );
+    }
+
+    #[test]
+    fn editor_rows_keeps_a_full_row_within_the_panel() {
+        // 端到端：面板 12 列、正文正好 10 列、光标在第 5 列，写出来的行
+        // （含提示符和光标样式）仍然是 12 列，不会因光标多一列。
+        let mut app = layout_app(12);
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.set("0123456789");
+        editor.set_cursor(5);
+        drop(editor);
+        app.update();
+
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(plain(&rows[0].row.line), "› 0123456789");
+        assert_eq!(rows[0].row.line.width(), 12, "渲染行宽不超面板列数");
+        assert_eq!(
+            cursor_marker(&rows[0].row.line),
+            Some((7, "5".to_owned())),
+            "光标是反色的 5，不是额外字符"
+        );
     }
 
     #[test]
@@ -2661,8 +3064,11 @@ mod tests {
         assert_eq!(rows.len(), MOST_LINES, "只写可见的 10 行");
         let shown: Vec<String> = rows.iter().map(|keyed| plain(&keyed.row.line)).collect();
         assert_eq!(shown[0], "  line 10", "滚到光标所在段的第一行");
-        assert!(shown[9].contains("line 19"), "最后一行是光标行");
-        assert!(shown[9].contains(CURSOR), "光标标记在最后一行");
+        assert_eq!(shown[9], "  line 19 ", "最后一行是光标行（含行尾光标格）");
+        assert!(
+            cursor_marker(&rows[9].row.line).is_some(),
+            "光标标记在最后一行"
+        );
     }
 
     // ---- 输入 tile 高度 ----

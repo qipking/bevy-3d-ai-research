@@ -132,15 +132,17 @@ impl FrameSize {
     /// `RF_FRAME` 存在且可解析时的覆盖值；没设 / 坏值返回 `None`。
     ///
     /// `None` 才允许窗口接管。命令行的截图/测试脚本靠这里保确定性。
+    /// 坏值的警告由 [`FramePlugin`] 通过 [`FrameEnv::from_env`] 打，见
+    /// [`FrameEnv::warning`]。
     pub fn env_override() -> Option<Self> {
-        Self::from_env_text(std::env::var("RF_FRAME").ok().as_deref())
+        FrameEnv::from_env().size()
     }
 
     /// 解析一个可选的 `RF_FRAME` 文本值（读环境变量与解析分开，方便测试）。
     ///
     /// `None` 或 `"nope"` 这类坏值都返回 `None`，与"没设环境变量"同义。
     pub fn from_env_text(value: Option<&str>) -> Option<Self> {
-        value.and_then(Self::parse)
+        FrameEnv::parse(value).size()
     }
 
     /// 主窗口的**逻辑**像素尺寸 → 格子数。
@@ -176,6 +178,60 @@ impl FrameSize {
 
     pub fn screen(&self) -> CellRect {
         CellRect::new(0, 0, self.cols, self.rows)
+    }
+}
+
+/// `RF_FRAME` 的解析结果。
+///
+/// 把"没设 / 好值 / 坏值"做成可断言的结构：坏值保留原始文本，[`FrameEnv::warning`]
+/// 给出要打的警告。行为与以前一致——只有 [`FrameEnv::Pinned`] 会钉住尺寸；坏值
+/// 仍按"没设"处理（窗口尺寸接管），但不再静默，[`FramePlugin`] 会 `warn!` 一行。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameEnv {
+    /// 环境变量没设：窗口尺寸接管。
+    Unset,
+    /// 环境变量可解析：启动时钉住这个尺寸。
+    Pinned(FrameSize),
+    /// 环境变量存在但解析失败：保留原始值，报告后按"没设"处理。
+    Invalid(String),
+}
+
+impl FrameEnv {
+    /// 读进程环境里的 `RF_FRAME`。
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var("RF_FRAME").ok().as_deref())
+    }
+
+    /// 解析一个可选的 `RF_FRAME` 文本值（不含环境变量读取，方便测试）。
+    ///
+    /// 空串同样是坏值：环境变量"存在"却解析不出 `COLSxROWS`。
+    pub fn parse(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Unset,
+            Some(raw) => match FrameSize::parse(raw) {
+                Some(size) => Self::Pinned(size),
+                None => Self::Invalid(raw.to_string()),
+            },
+        }
+    }
+
+    /// 可以钉住的尺寸；[`FrameEnv::Unset`] / [`FrameEnv::Invalid`] 都是 `None`。
+    pub fn size(&self) -> Option<FrameSize> {
+        match self {
+            Self::Pinned(size) => Some(*size),
+            Self::Unset | Self::Invalid(_) => None,
+        }
+    }
+
+    /// 坏值要打的警告（带原始值和期望格式）；好值/没设返回 `None`。
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Self::Invalid(raw) => Some(format!(
+                "[frame] RF_FRAME={raw:?} 无法解析；期望格式 COLSxROWS（例如 96x28），\
+                 本次按未设置处理，尺寸改由窗口决定"
+            )),
+            Self::Unset | Self::Pinned(_) => None,
+        }
     }
 }
 
@@ -948,7 +1004,13 @@ pub struct FramePlugin;
 impl Plugin for FramePlugin {
     fn build(&self, app: &mut App) {
         // `RF_FRAME` 生效 = 确定性覆盖：启动时钉住，窗口 resize 不再改它。
-        let env_size = FrameSize::env_override();
+        // 坏值不能再静默忽略（截图脚本的 `96X28` 会悄悄跟窗口）：先 warn，
+        // 再按"没设"处理——行为除日志外与以前一致。
+        let env = FrameEnv::from_env();
+        if let Some(warning) = env.warning() {
+            warn!("{warning}");
+        }
+        let env_size = env.size();
         app.insert_resource(env_size.unwrap_or_default())
             .insert_resource(FrameSizePinned(env_size.is_some()))
             .init_resource::<PanelAreas>()
@@ -1511,6 +1573,35 @@ mod tests {
             FrameSize::from_window_size(Vec2::new(-10.0, f32::NAN)),
             FrameSize { cols: 1, rows: 1 }
         );
+    }
+
+    /// 坏 `RF_FRAME` 不再静默：解析结果保留原始值并给出带期望格式的警告，
+    /// 但尺寸仍不钉住（窗口接管）——除日志外与旧行为一致。
+    #[test]
+    fn a_bad_rf_frame_value_is_reported_instead_of_silently_following_the_window() {
+        let bad = FrameEnv::parse(Some("96X28x"));
+        assert_eq!(
+            bad,
+            FrameEnv::Invalid("96X28x".to_string()),
+            "坏值必须保留原始文本"
+        );
+        assert_eq!(bad.size(), None, "坏值不钉住尺寸");
+        let warning = bad.warning().expect("坏值必须产生警告");
+        assert!(warning.contains("96X28x"), "警告要带原始值：{warning}");
+        assert!(warning.contains("COLSxROWS"), "警告要写期望格式：{warning}");
+
+        // 环境变量存在但是空串：同样算坏值，同样要警告。
+        assert_eq!(FrameEnv::parse(Some("")), FrameEnv::Invalid(String::new()));
+        assert!(FrameEnv::parse(Some("")).warning().is_some());
+
+        // 好值 / 没设不警告。
+        assert_eq!(
+            FrameEnv::parse(Some("96x28")),
+            FrameEnv::Pinned(FrameSize { cols: 96, rows: 28 })
+        );
+        assert_eq!(FrameEnv::parse(Some("96x28")).warning(), None);
+        assert_eq!(FrameEnv::parse(None), FrameEnv::Unset);
+        assert_eq!(FrameEnv::parse(None).warning(), None);
     }
 
     /// `RF_FRAME` 生效时窗口尺寸不覆盖 `FrameSize`（截图/测试确定性）。

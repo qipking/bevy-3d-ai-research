@@ -24,11 +24,20 @@
 //! - 滚轮（[`pane_wheel`]）：一次 [`WHEEL_ROWS`] 行（上游 `input.rs::moused`
 //!   的 `pane.scroll.up(3)`），指针在别的面板上时不动转写。
 //!
-//! 转写的行是扁平的，但 key 的高 32 位是块序号（`transcript.rs` 的
-//! `row_key`），所以一块的行在流里相邻；[`item_rows`] 按它分组，Alt+↑/↓ 选中的
+//! 转写的行是扁平的，但 key 的高 32 位是块序号（引擎的
+//! `transcript::row_key` 是 `ordinal << 32 | index`，实时块的
+//! `batch::live_key` 是同一约定：高 32 位 = 调用/块身份、低 32 位 = 块内行号），
+//! 所以一块的行在流里相邻；[`item_rows`] 按它分组，Alt+↑/↓ 选中的
 //! 就是“一整块”。选中态存在 [`Selection`]（复用鼠标选区的高亮/复制），条目
 //! 身份是 [`Selection::item`]；`sync_item_selection` 每帧把身份换算回当前
 //! 可见行。
+//!
+//! 选中条目会把 [`KeyFocus`] 拿到转写根上（Esc 走面板作用域的“交还输入框”，
+//! 而不是输入框作用域的 Stop）。**交还只发生在显式动作之后**：Esc、鼠标点
+//! 输入面板（`selection::pointer_selection`）、条目滚出窗口收起高亮
+//! （[`release_transcript_focus`]）；[`sync_item_selection`] 是被动同步，
+//! 不再每帧把焦点抢回转写根 —— 否则点完输入框下一帧就被抢回去，字符键全被
+//! 面板作用域丢掉（用户可见：打字没反应、也没有提示）。
 //!
 //! 往上滚是用户主动往回看，取消 [`PaneScroll::follow`]；滚到末尾恢复跟随。
 //! 窗口/面板尺寸变化不在本模块缓存：窗口化每帧从 [`PanelAreas`]（或 Niri 的
@@ -88,6 +97,11 @@ impl ItemRows {
 
 /// 把一段扁平的行流按 `key >> 32` 分组，得到每个条目占的行区间（上游
 /// `view::ItemRow` 里“行 -> 条目”的换算）。
+///
+/// 两种产行方用同一个约定（高 32 位 = 块身份、低 32 位 = 块内行号）：引擎是
+/// `transcript::row_key` 的 `ordinal << 32 | index`，实时内容是
+/// `batch::live_key` 的 `段标记 | part 哈希 << 32 | index`。所以一条消息 /
+/// 一次调用 / 一段流式回复各自一个条目，Alt+↑/↓ 一下一条。
 ///
 /// “下面还有”标记行的 key 是 `u64::MAX`、不属于任何块，跳过它。
 /// 可见窗口可能从一块的中间开始（滚动后），这时第一组也从窗口的第 0 行算起；
@@ -432,12 +446,16 @@ pub fn pane_keys(
 ///   `None` 时这里直接返回）；
 /// - 条目滚出窗口：保留身份、收起高亮（滚回来再亮）；
 /// - 块整个消失了（压缩/重排）：清掉选中。
+///
+/// **不碰 [`KeyFocus`]**：焦点只由用户的显式动作决定 —— Alt+↑/↓ 在
+/// [`select_pane_item`] 里拿键、Esc / 点输入面板 / 条目收起高亮在
+/// [`release_transcript_focus`] 里还键。以前这里每帧把焦点抢回转写根：点完
+/// 输入框打不了字，而且"滚出去、没高亮"时也会被一直按住；键盘焦点不该由
+/// “这一帧重新算了一遍高亮”这种被动同步来抢。
 fn sync_item_selection(
     full: Res<TranscriptRows>,
     panels: Res<PanelRows>,
-    roots: Res<PanelRoots>,
     mut selection: Option<ResMut<Selection>>,
-    mut focus: Option<ResMut<KeyFocus>>,
 ) {
     // 先只读：鼠标选区（`item == None`）每帧原样返回，不把 `Selection` 标记成
     // 改过，也不去扫整段行。
@@ -479,18 +497,18 @@ fn sync_item_selection(
     {
         selection.select_item(PanelId::Transcript, shown.start, shown.end, item);
     }
-    if let Some(focus) = focus.as_deref_mut()
-        && let Some(root) = roots.entity(PanelId::Transcript)
-    {
-        focus.0 = Some(root);
-    }
 }
 
-/// 条目选中没了就把 [`KeyFocus`] 还给输入框（`None`）。
+/// 条目选中不再“有效”（清掉、或者滚出窗口被 [`Selection::suspend_item`] 收起
+/// 高亮）就把 [`KeyFocus`] 还给输入框（`None`）。
 ///
 /// 放在 `Fit`、[`pane_keys`] 之后而不是按键处理里：见 [`pane_keys`] 的注释
 /// —— Esc 的“交还输入框”必须让 `editor::keys` 先看到焦点还在转写根上。这里
 /// 同时兜住鼠标点击、滚轮、resize 清掉选中之后把键还给输入框。
+///
+/// “选着但没高亮”也算可归还：条目滚出可见区后身份还在（滚回来还能亮），
+/// 但用户眼前没有任何选中标记，此时再按住键盘不给输入框就是纯粹的焦点陷阱
+/// （用户可见：Alt+↑ 选了一条、滑走之后再点输入框也打不了字）。
 fn release_transcript_focus(
     roots: Option<Res<PanelRoots>>,
     selection: Option<Res<Selection>>,
@@ -508,7 +526,12 @@ fn release_transcript_focus(
     if focus.0 != Some(root) {
         return;
     }
-    if selection.as_deref().and_then(Selection::item).is_none() {
+    // 只有“条目选着、而且高亮真的亮在屏幕上”才继续拿键；`item` 为 `None`
+    // （鼠标选区/没有选中）或已 suspend（anchor == focus）都交还输入框。
+    let keeping = selection
+        .as_deref()
+        .is_some_and(|selection| selection.item().is_some() && selection.has_selection());
+    if !keeping {
         focus.0 = None;
     }
 }
@@ -617,11 +640,15 @@ mod tests {
     use std::collections::HashMap;
 
     use bevy::camera::NormalizedRenderTarget;
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
     use bevy::input::mouse::MouseScrollUnit;
     use bevy::input::touch::TouchPhase;
     use bevy::picking::backend::HitData;
-    use bevy::picking::events::Pointer;
-    use bevy::picking::pointer::{Location, PointerId};
+    use bevy::picking::events::{Pointer, PointerPress};
+    use bevy::picking::pointer::{Location, PointerButton, PointerId};
+    use bevy::ui::ComputedNode;
+    use feathers_in_3d::WorldPanel;
 
     use super::*;
     use crate::frame::{CellRect, PanelArea};
@@ -1342,15 +1369,386 @@ mod tests {
         assert!(!selection(&fixture.app).has_selection(), "滚出窗口时不画高亮");
         assert_eq!(
             focus(&fixture.app).0,
-            Some(fixture.root),
-            "条目还选着，键还在转写上"
+            None,
+            "没有高亮就没有键盘目标：键还给输入框，不留焦点陷阱"
         );
 
-        // PgUp 滚回来：同一个条目重新亮起来。
+        // PgUp 滚回来：同一个条目重新亮起来；键仍在输入框（被动同步不抢焦点）。
         tap(&mut fixture.app, &[], KeyCode::PageUp);
         assert_eq!(selection(&fixture.app).item(), Some(0));
         assert!(selection(&fixture.app).has_selection());
         assert_eq!(selection(&fixture.app).anchor(), Point::new(0, 0));
+        assert_eq!(focus(&fixture.app).0, None);
+    }
+
+    // ---- 焦点归还：条目收起高亮 / 焦点被别处拿走 / 点输入面板 ----
+
+    #[test]
+    fn an_item_that_scrolls_out_of_view_gives_the_keys_back() {
+        let mut fixture = keys_app_rows(single_row_blocks(20), 5);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(focus(&fixture.app).0, Some(fixture.root));
+
+        // 条目滚出可见区：`suspend_item` 保留身份、收起高亮。此时转写上已经
+        // 没有可操作的选中目标，键盘必须还给输入框（否则点输入框打字没反应）。
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0), "身份保留，滚回来还能亮");
+        assert!(!selection(&fixture.app).has_selection(), "没有高亮");
+        assert_eq!(
+            focus(&fixture.app).0,
+            None,
+            "`item().is_some()` 但已 suspend 也要归还焦点"
+        );
+    }
+
+    #[test]
+    fn a_focus_taken_elsewhere_is_not_grabbed_back_by_the_selection_sync() {
+        let mut fixture = keys_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(focus(&fixture.app).0, Some(fixture.root));
+
+        // 别的系统把焦点拿走（点击输入面板、切面板……）。被动的高亮同步
+        // 不该把它抢回转写根：以前这里每帧无条件 `focus.0 = Some(root)`。
+        fixture.app.world_mut().resource_mut::<KeyFocus>().0 = None;
+        fixture.app.update();
+        assert_eq!(
+            focus(&fixture.app).0,
+            None,
+            "同步条目高亮不是“用户回到转写”，不能抢键盘"
+        );
+        assert!(
+            selection(&fixture.app).has_selection(),
+            "条目仍然亮着（选区本身没被动过）"
+        );
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+    }
+
+    struct ClickFixture {
+        app: App,
+        transcript_root: Entity,
+        input_root: Entity,
+        input_row: Entity,
+        /// 输入面板根下面那块铺满输入框的拾取面（生产里点空白命中的就是它）。
+        input_surface: Entity,
+    }
+
+    /// 生产结构的无窗口 App：`PanePlugin` + `SelectionPlugin` + `EditorPlugin`，
+    /// 带转写/输入两块面板（输入面板根要给 3D 拾取换算用的 `WorldPanel` +
+    /// `ComputedNode`）和一行输入行实体。
+    fn focus_click_app(blocks: &[&[&str]], height: u16) -> ClickFixture {
+        let mut app = App::new();
+        // 生产里由 `FeathersViewPlugin::build` 排好的阶段顺序。
+        app.configure_sets(
+            Update,
+            (
+                FeathersSystems::Prepare,
+                FeathersSystems::Layout,
+                FeathersSystems::Draw,
+                FeathersSystems::Fit,
+                FeathersSystems::Render,
+            )
+                .chain(),
+        );
+        app.add_plugins((
+            crate::pane::PanePlugin,
+            crate::selection::SelectionPlugin,
+            crate::editor::EditorPlugin,
+        ))
+        .init_resource::<crate::theme::Theme>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        // `PanePlugin` 只建 `TranscriptRows`/`PaneScroll`；面板资源平时由
+        // `PanelsPlugin` 建，这里不装整条面板同步，只补资源。
+        .init_resource::<PanelRoots>()
+        .init_resource::<PanelRows>()
+        .init_resource::<PanelAreas>()
+        .add_message::<KeyboardInput>();
+
+        let transcript_root = app.world_mut().spawn_empty().id();
+        let input_root = app
+            .world_mut()
+            .spawn((
+                WorldPanel {
+                    units_to_world: crate::frame::UNITS_TO_WORLD,
+                    anchor: Transform::default(),
+                },
+                // 800px 宽、没有边框/内边距：行首在面板局部 x = -400。
+                ComputedNode {
+                    size: Vec2::new(800.0, 400.0),
+                    ..default()
+                },
+            ))
+            .id();
+        {
+            let mut roots = app.world_mut().resource_mut::<PanelRoots>();
+            roots.0.insert(PanelId::Transcript, transcript_root);
+            roots.0.insert(PanelId::Input, input_root);
+        }
+        {
+            let mut areas = app.world_mut().resource_mut::<PanelAreas>();
+            areas.0.insert(transcript_root, pane_area(height));
+            areas.0.insert(
+                input_root,
+                PanelArea {
+                    rect: CellRect::new(0, 0, 80, 3),
+                    size: Vec2::new(80.0 * crate::frame::CELL.x, 3.0 * crate::frame::CELL.y),
+                    cols: 80,
+                    rows: 3,
+                    center: None,
+                },
+            );
+        }
+        {
+            let rows: Vec<KeyedRow> = blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(ordinal, lines)| block_rows(ordinal as u32, lines))
+                .collect();
+            app.world_mut().resource_mut::<TranscriptRows>().0 = rows;
+        }
+        // 输入面板的一行（`EditorPlugin` 的 `editor_rows` 每帧会重写成同一行数）。
+        app.world_mut().resource_mut::<PanelRows>().set(
+            PanelId::Input,
+            vec![KeyedRow {
+                key: 1,
+                hash: 1,
+                row: Row::new(Line::from("draft")),
+            }],
+        );
+        let input_row = app
+            .world_mut()
+            .spawn(RowLayout {
+                panel: PanelId::Input,
+                panel_entity: input_root,
+                index: 0,
+            })
+            .id();
+        // 先跑一帧：窗口/跟随位置、输入行、拾取面都就位。
+        app.update();
+        let mut surfaces = app
+            .world_mut()
+            .query_filtered::<Entity, With<crate::selection::InputFocusSurface>>();
+        let input_surface = surfaces
+            .iter(app.world())
+            .next()
+            .expect("输入面板根下面要有拾取面");
+        ClickFixture {
+            app,
+            transcript_root,
+            input_root,
+            input_row,
+            input_surface,
+        }
+    }
+
+    /// 往输入面板的 `target`（输入行或拾取面/面板根）写一条主键按下：命中点落在
+    /// 第 0 格正中（和 `selection.rs` 的鼠标测试同一套换算）。
+    fn press_input(fixture: &mut ClickFixture, target: Entity) {
+        let node = fixture
+            .app
+            .world()
+            .get::<ComputedNode>(fixture.input_root)
+            .expect("输入面板的 ComputedNode");
+        let x = crate::selection::content_left(node) + 0.5 * crate::frame::CELL.x;
+        let local = Vec3::new(x * crate::frame::UNITS_TO_WORLD, 0.0, 0.0);
+        let world = Transform::default().transform_point(local);
+        fixture.app.world_mut().write_message(PointerPress {
+            entity: target,
+            pointer: mouse_pointer(),
+            button: PointerButton::Primary,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, Some(world), Some(Vec3::Z)),
+            count: 1,
+        });
+        fixture.app.update();
+    }
+
+    /// 敲一个字符（走真实的 `KeyboardInput` 消息和 `editor::keys`）。
+    fn type_character(app: &mut App, character: char) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::KeyX, // 测试只关心文本，物理键随意
+            logical_key: Key::Character(character.to_string().into()),
+            state: ButtonState::Pressed,
+            text: Some(character.to_string().into()),
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    #[test]
+    fn clicking_an_input_row_gives_the_keys_back_and_typing_reaches_the_editor() {
+        let mut fixture = focus_click_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(
+            focus(&fixture.app).0,
+            Some(fixture.transcript_root),
+            "选条目时键在转写上"
+        );
+
+        // 用户点输入框：必须把键盘交回输入框，否则字符键被面板作用域丢掉。
+        let input_row = fixture.input_row;
+        press_input(&mut fixture, input_row);
+        assert_eq!(
+            focus(&fixture.app).0,
+            None,
+            "点输入行 = 键盘回输入框（以前这里一直卡在转写根）"
+        );
+
+        // 端到端：焦点回来之后敲的字符真的进 `Editor`。
+        type_character(&mut fixture.app, 'x');
+        assert_eq!(
+            fixture.app.world().resource::<crate::editor::Editor>().text(),
+            "x",
+            "点完输入框打字要能落进输入框"
+        );
+    }
+
+    #[test]
+    fn clicking_the_input_panels_blank_area_gives_the_keys_back() {
+        // 输入框的空白处不是行实体：生产里点它命中的是铺满输入框的
+        // `InputFocusSurface`（没有它连 `PointerPress` 都不会产生）。
+        let mut fixture = focus_click_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(focus(&fixture.app).0, Some(fixture.transcript_root));
+
+        let surface = fixture.input_surface;
+        press_input(&mut fixture, surface);
+        assert_eq!(focus(&fixture.app).0, None);
+        assert_eq!(
+            selection(&fixture.app).item(),
+            None,
+            "点输入框空白 = 转写上的键盘选中作废（和点转写行一致）"
+        );
+
+        // 点回输入行也照样归还（拾取面/行两种命中都覆盖）。
+        let mut fixture = focus_click_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        let row = fixture.input_row;
+        press_input(&mut fixture, row);
+        assert_eq!(focus(&fixture.app).0, None);
+    }
+
+    #[test]
+    fn clicking_the_input_boxes_blank_area_keeps_its_own_text_selection() {
+        let mut fixture = focus_click_app(&[&["one"][..], &["two"][..]], 10);
+        // 输入面板里拖选一段文字（鼠标选区，`item` 为 None）。
+        let rows = fixture
+            .app
+            .world()
+            .resource::<PanelRows>()
+            .row_values(PanelId::Input);
+        assert!(!rows.is_empty(), "输入面板要有行");
+        {
+            let mut selection = fixture.app.world_mut().resource_mut::<Selection>();
+            selection.press_kind(PanelId::Input, &rows, 0, 0, ClickKind::Single);
+            selection.drag(PanelId::Input, &rows, 0, 3);
+            assert!(selection.has_selection());
+        }
+
+        // 拾取面和输入行共面：空白处那一下不能把行上的拖选清掉。
+        let surface = fixture.input_surface;
+        press_input(&mut fixture, surface);
+        let selection = selection(&fixture.app);
+        assert_eq!(selection.panel(), Some(PanelId::Input));
+        assert!(
+            selection.has_selection(),
+            "点输入框空白不该清掉输入框里的拖选"
+        );
+    }
+
+    // ---- 实时块：一个调用 = 一个条目（`batch::live_key` 的高 32 位） ----
+
+    /// 两个并行实时调用（不同 effect）经真实 `batch::live_additions` 产出的行。
+    fn live_call_rows(width: u16) -> Vec<KeyedRow> {
+        use rig_core::message::{CallId, ToolCall, ToolFunction, ToolName};
+        use rig_ecs::effects::Effects;
+        use rig_ecs::prelude::*;
+
+        let mut world = World::new();
+        world.insert_resource(Effects::default());
+        let agent = world.spawn(AgentId("live".into())).id();
+        for (id, name) in [("call_a", "search_products"), ("call_b", "create_order")] {
+            let name = ToolName::new(name).expect("工具名非空");
+            world.spawn((
+                ToolRequest {
+                    call: ToolCall::new(
+                        CallId::from_wire(id),
+                        ToolFunction::new(name, serde_json::json!({ "q": id })),
+                    ),
+                },
+                ForAgent(agent),
+            ));
+        }
+        world.flush();
+        crate::batch::live_additions(&mut world, agent, width)
+    }
+
+    #[test]
+    fn live_calls_become_one_item_each_and_alt_down_steps_between_them() {
+        // 宽度故意很小：每张卡都会折成多行，正好检验“不是一行一个条目”。
+        let rows = live_call_rows(8);
+        assert!(rows.len() >= 4, "两张卡各折成几行：{}", rows.len());
+
+        // 段标记：live 行的高 32 位落在 [0x4000_0000, 0x8000_0000)（bit62 = 1、
+        // bit63 = 0），避开引擎按位置发的 0x0_ 段和 Ask 的 0x8000 段。
+        for key in rows.iter().map(|keyed| keyed.key) {
+            let high = key >> 32;
+            assert!(
+                (0x4000_0000..0x8000_0000).contains(&high),
+                "live 行的段标记不对：{key:#x}"
+            );
+        }
+
+        // key 的位分配：同一块高 32 位相同、低 32 位是块内行号且从 0 连续递增。
+        let mut runs: Vec<(u64, Vec<u32>)> = Vec::new();
+        for key in rows.iter().map(|keyed| keyed.key) {
+            let block = key >> 32;
+            let line = (key & 0xFFFF_FFFF) as u32;
+            match runs.last_mut() {
+                Some((last, lines)) if *last == block => {
+                    assert_eq!(line, lines.len() as u32, "块内行号从 0 连续递增");
+                    lines.push(line);
+                }
+                _ => runs.push((block, vec![line])),
+            }
+        }
+        assert_eq!(runs.len(), 2, "两个并行调用 = 两个块：{runs:?}");
+        assert_ne!(runs[0].0, runs[1].0, "不同调用的块身份必须不同");
+        assert!(
+            runs.iter().all(|(_, lines)| lines.len() >= 2),
+            "每张卡都折成多行（否则测不出一行一条目的 bug）：{runs:?}"
+        );
+        assert!(
+            runs.iter().all(|(_, lines)| lines.first() == Some(&0)),
+            "行号是**调用内**行号，不是全局行号：{runs:?}"
+        );
+
+        let items = item_rows(&rows);
+        assert_eq!(items.len(), 2, "一个调用 = 一个条目：{items:?}");
+        assert_eq!(items[0].rows(), 0..runs[0].1.len());
+        assert_eq!(
+            items[1].rows(),
+            runs[0].1.len()..runs[0].1.len() + runs[1].1.len()
+        );
+        assert_ne!(items[0].ordinal, items[1].ordinal);
+
+        // Alt+↓ 两下分别落在两个调用上（一下一条，不逐行、也不跳过整片）。
+        let height = 40;
+        let mut fixture = keys_app_rows(rows, height);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(
+            selection(&fixture.app).item(),
+            Some(items[0].ordinal),
+            "第一下选中第一个调用"
+        );
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(
+            selection(&fixture.app).item(),
+            Some(items[1].ordinal),
+            "第二下选第二个调用（不是同一块里的下一行）"
+        );
     }
 }
 

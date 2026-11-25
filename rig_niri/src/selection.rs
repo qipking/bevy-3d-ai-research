@@ -26,6 +26,7 @@
 //! | 双击 | [`Selection::press_kind`]（或用 [`Selection::press`] 自动数） | 选中当前词 |
 //! | 三击 | 同上 | 选中整行 |
 //! | 点空白 | 行越界，或 [`Selection::clear`] | 清除选区 |
+//! | 点输入面板（输入行或输入框空白） | [`pointer_selection`] + [`InputFocusSurface`] | [`KeyFocus`] 交回输入框（`None`） |
 //! | Alt+↑/↓（`pane.rs`） | [`Selection::select_item`] | 选中一整块条目（复用下面的高亮/复制） |
 //! | 滚轮 | [`crate::pane::pane_wheel`] | 滚走的内容收起选区（滚动本身在 `pane.rs`） |
 //! | 窗口/面板尺寸变化 | [`clear_selection_on_resize`] | 清除选区（上游 `Event::Resize`） |
@@ -37,10 +38,12 @@
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use bevy::ecs::system::SystemParam;
+use bevy::picking::Pickable;
 use bevy::picking::events::{PointerMove, PointerPress, PointerRelease};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
-use bevy::ui::ComputedNode;
+use bevy::ui::{ComputedNode, Node, percent, px};
 use bevy::window::WindowResized;
 use feathers_in_3d::WorldPanel;
 use rig_tui::AppStatus;
@@ -50,6 +53,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::clipboard::{self, Copied, MemoryClipboard};
+use crate::keys::KeyFocus;
 use crate::panels::{PanelId, PanelRoots, PanelRows, RowLayout};
 use crate::transcript::Row;
 use crate::workspaces::{WorkspacePanel, WorkspaceSet};
@@ -830,10 +834,111 @@ pub fn clear_selection_on_resize(
     }
 }
 
+/// 输入面板的“点空白也能交还键盘”的拾取面。
+///
+/// 面板根自己不在 3D 拾取索引里（`feathers_in_3d::pick::build_pick_index`
+/// 从子节点往上找面板根，根自己永远不是子节点），输入面板里只有行实体带
+/// [`Pickable`]；输入框是多行高、字只占其中一行，点在空白处**根本不会产生
+/// `PointerPress`**，焦点就留在转写根上（用户可见：点输入框打字没反应）。
+///
+/// 这个实体是输入面板根下面一个铺满的透明节点：它让整块输入框都成为拾取
+/// 目标，空白处的按下会走到 [`pointer_selection`] 的“不是行 -> 清选区”分支，
+/// 再经 [`crate::pane::release_transcript_focus`] 把键交回输入框。
+///
+/// `should_block_lower = false`：它和输入行在拾取里是共面的，拾取顺序不保证
+/// 谁先谁后；不挡下层实体，点输入文字时行实体自己照样能收到事件。
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct InputFocusSurface;
+
+/// [`pointer_selection`] 里“点输入面板就把键盘交还输入框”要的两样东西。
+///
+/// 合成一个 [`SystemParam`] 而不是两个参数：`pointer_selection` 的参数已经到
+/// bevy 的上限（16 个），再多一个就装不进 schedule。两者都可缺省（没有输入
+/// 面板 / 没有键盘系统的测试 App 也能跑）。
+#[derive(SystemParam)]
+pub struct InputFocus<'w, 's> {
+    roots: Option<Res<'w, PanelRoots>>,
+    /// 输入面板根下面那块拾取面（点空白时命中的就是它）。
+    surfaces: Query<'w, 's, (), With<InputFocusSurface>>,
+    focus: Option<ResMut<'w, KeyFocus>>,
+}
+
+impl InputFocus<'_, '_> {
+    /// 输入面板根实体（没有面板时 `None`）。
+    fn root(&self) -> Option<Entity> {
+        self.roots
+            .as_deref()
+            .and_then(|roots| roots.entity(PanelId::Input))
+    }
+
+    /// 这个拾取实体是不是输入框的拾取面（点空白处时命中的那个）。
+    fn is_surface(&self, entity: Entity) -> bool {
+        self.surfaces.contains(entity)
+    }
+
+    /// 把键盘交回输入框。
+    fn release(&mut self) {
+        if let Some(focus) = self.focus.as_deref_mut() {
+            focus.0 = None;
+        }
+    }
+}
+
+/// 保证输入面板根下面有一块 [`InputFocusSurface`]（每帧补，面板根换了就跟过去）。
+///
+/// 绝对定位、铺满父节点、无底色：不参与 flex 布局、不可见，只贡献拾取矩形。
+/// 行实体在拾取顺序上排在它后面（painter order 更大），所以点在字上仍然是行
+/// 先命中；`pointer_selection` 对“落在输入面板/拾取面上的按下”只做交还焦点，
+/// 不区分有没有同时命中行。
+fn ensure_input_focus_surface(
+    mut commands: Commands,
+    roots: Option<Res<PanelRoots>>,
+    children: Query<&Children>,
+    surfaces: Query<(), With<InputFocusSurface>>,
+) {
+    let Some(root) = roots
+        .as_deref()
+        .and_then(|roots| roots.entity(PanelId::Input))
+    else {
+        return;
+    };
+    // 面板根还在用旧的那块就不再补（工作区切换后 `PanelRoots::Input` 会换实体）。
+    let present = children
+        .get(root)
+        .is_ok_and(|children| children.iter().any(|child| surfaces.contains(child)));
+    if present {
+        return;
+    }
+    commands.entity(root).with_children(|parent| {
+        parent.spawn((
+            InputFocusSurface,
+            Pickable {
+                // 共面时不挡下层实体：点字仍然是行先收到事件（输入文字选中不受
+                // 拾取顺序影响）；点空白时只有它能被拾取。
+                should_block_lower: false,
+                ..default()
+            },
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100.0),
+                height: percent(100.0),
+                ..default()
+            },
+        ));
+    });
+}
+
 /// 鼠标 -> 选区：按下、拖动、松开；松手时把选中的文字写进剪贴板。
 ///
 /// 系统参数全都可以缺省（`Option<Res<...>>`），所以没有窗口/剪贴板/状态行
 /// 的测试 App 也能跑：点空白清空、有内存剪贴板就复制、没有就写错误状态。
+///
+/// 按在**输入面板**上（输入行，或输入框的空白处/拾取面）时顺带把
+/// [`KeyFocus`] 交回输入框（`None`）：转写条目选着时焦点在转写根上，
+/// `editor::keys` 会把面板作用域里的字符键丢掉，用户点输入框打字却没反应。
+/// 这是显式的“点哪里 = 键盘给哪里”，不依赖选区状态（选区下面照旧清空/落行）。
 #[allow(clippy::too_many_arguments)]
 pub fn pointer_selection(
     mut presses: MessageReader<PointerPress>,
@@ -845,6 +950,7 @@ pub fn pointer_selection(
     held: Option<Res<ButtonInput<KeyCode>>>,
     panels: Query<&WorldPanel>,
     nodes: Query<&ComputedNode>,
+    mut input: InputFocus,
     panel_rows: Res<PanelRows>,
     mut selection: ResMut<Selection>,
     mut system_clipboard: Option<ResMut<bevy_clipboard::Clipboard>>,
@@ -865,7 +971,18 @@ pub fn pointer_selection(
         if let Some(status) = status.as_deref_mut() {
             clipboard::clear_copy_failed(status);
         }
-        let Some(hit) = hit_row(
+        // 点输入框的拾取面（空白处）：只把键盘交回输入框，不走下面“不是行 ->
+        // 清选区”的分支。拾取面和输入行共面，同一位置可能同时命中行：这里
+        // 清选区会把行刚拉起的拖选（选中输入文字）又清掉。转写上的键盘条目
+        // 选区不属于输入框，点输入框时收掉。
+        if input.is_surface(press.entity) {
+            input.release();
+            if selection.item().is_some() {
+                selection.clear();
+            }
+            continue;
+        }
+        let hit = hit_row(
             press.entity,
             &press.hit,
             &layouts,
@@ -873,7 +990,15 @@ pub fn pointer_selection(
             set.as_deref(),
             &panels,
             &nodes,
-        ) else {
+        );
+        // 点了输入面板：键盘交回输入框。即使这一下同时命中拾取面和行
+        // （两者在拾取里都可见），焦点也只会被设成 `None`，没有副作用。
+        let on_input = hit.as_ref().is_some_and(|hit| hit.panel == PanelId::Input)
+            || input.root() == Some(press.entity);
+        if on_input {
+            input.release();
+        }
+        let Some(hit) = hit else {
             // 点在没有行的空白上（面板背景、窗口、别的控件）：收起选区。
             selection.clear();
             continue;
@@ -1062,9 +1187,15 @@ impl Plugin for SelectionPlugin {
             .add_message::<PointerMove>()
             .add_message::<PointerRelease>()
             // resize 先清（清的是上一帧的旧选区），同一帧的按下/拖动再落新选区。
+            // 输入面板的拾取面排在鼠标处理前补好：这一帧的空白点击也有目标可命中
+            // （新面板根要等下一帧布局后才有矩形，属正常）。
             .add_systems(
                 Update,
-                (clear_selection_on_resize, pointer_selection)
+                (
+                    clear_selection_on_resize,
+                    ensure_input_focus_surface,
+                    pointer_selection,
+                )
                     .chain()
                     .in_set(crate::FeathersSystems::Prepare),
             );
@@ -2272,5 +2403,50 @@ mod wiring_tests {
         fixture.app.update();
         assert!(selection(&fixture).has_selection());
         assert_eq!(selection(&fixture).end(), Point::new(0, 5));
+    }
+
+    // ---- 输入面板的拾取面：点空白也能把键盘交回输入框 ----
+
+    #[test]
+    fn the_input_panel_gets_one_pickable_focus_surface() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::picking::Pickable;
+        use bevy::ui::Node;
+
+        let mut world = World::new();
+        world.init_resource::<PanelRoots>();
+        let input = world.spawn_empty().id();
+        world
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Input, input);
+
+        // 补两次：第二次看到已经有了，不再多 spawn（每帧调用是安全的）。
+        world
+            .run_system_once(ensure_input_focus_surface)
+            .expect("补拾取面");
+        world
+            .run_system_once(ensure_input_focus_surface)
+            .expect("补拾取面");
+        world.flush();
+
+        let children: Vec<Entity> = world
+            .get::<Children>(input)
+            .map(|children| children.iter().collect())
+            .unwrap_or_default();
+        assert_eq!(children.len(), 1, "输入面板根下只补一块拾取面");
+        let surface = children[0];
+        assert!(world.get::<InputFocusSurface>(surface).is_some());
+        let pickable = world
+            .get::<Pickable>(surface)
+            .expect("拾取面要进 3D 拾取索引，空白处的点击才有 PointerPress");
+        assert!(
+            !pickable.should_block_lower,
+            "共面时不挡输入行：点字仍然由行实体收到事件"
+        );
+        let node = world.get::<Node>(surface).expect("要真的参与 UI 布局");
+        assert_eq!(node.position_type, PositionType::Absolute);
+        assert_eq!(node.width, percent(100.0));
+        assert_eq!(node.height, percent(100.0), "铺满输入框，整块都能点");
     }
 }
