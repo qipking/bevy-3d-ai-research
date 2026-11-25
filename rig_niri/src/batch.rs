@@ -49,6 +49,8 @@ use crate::editor::SubmittedPrompts;
 use crate::frame::{PanelAreas, PanelRoots};
 use crate::pane::TranscriptRows;
 use crate::panels::{KeyedRow, PanelId, PanelRows};
+use crate::rich::upstream_theme;
+use crate::theme::Theme;
 use crate::transcript::{
     BlockId, Row, Slot, TextId, Transcript as TranscriptEngine, row_hash, wrap_lines,
 };
@@ -601,6 +603,7 @@ pub fn rebuild_batch(
     mut dialogue: ResMut<Dialogue>,
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
+    theme: Res<Theme>,
     turn: ShownTurn,
     kernel: KernelData,
 ) {
@@ -619,7 +622,10 @@ pub fn rebuild_batch(
     // 测试/导出路径）就退回全量，见下面的 `scope`。
     let shown = turn.agent();
     batch.agent = shown;
-    let theme = RTheme::default();
+    // 生产路径用**我们的**语义主题（17 个 band 逐字段映射），不是上游
+    // `RTheme::default()` 的终端默认色；`Theme::from_env` 的 `NO_COLOR`
+    // 无色版也经这里下去。
+    let rtheme = upstream_theme(&theme);
     dialogue.clear();
 
     // 1) 还没结算的调用：先收成自己的数据，后面既进 batch 也进调用树。
@@ -737,12 +743,12 @@ pub fn rebuild_batch(
             &history,
             &tree,
             &running_calls,
-            &theme,
+            &rtheme,
             batch.width,
         );
         for (key, input) in frame.requests {
             let output = RenderOutput {
-                lines: default_lines(&input, &theme),
+                lines: default_lines(&input, &rtheme),
                 decorations: Vec::new(),
             };
             batch.requests.insert(
@@ -776,7 +782,7 @@ pub fn rebuild_batch(
             call: fact.call.clone(),
             result: Some(fact.result.clone()),
             state: CallState::Done,
-            theme,
+            theme: rtheme,
             // 结算时从效应上的 `Published` 抄下来的事实：退出码、输出截断
             // 标记、`FilesChanged` 都从这里进 header/结果行（见
             // [`published_facts`] 与 [`record_calls`]）。
@@ -807,7 +813,7 @@ pub fn rebuild_batch(
             call: call.call.clone(),
             result: call.result.clone(),
             state: call.state.clone(),
-            theme,
+            theme: rtheme,
             // 已经答复但还没提交进对话的调用有 `Published`（和 `Outcome` 一起
             // 插上的）；还在跑的没有 —— 那时确实没有任何退出码/截断事实。
             facts: call.facts.clone(),
@@ -830,20 +836,23 @@ pub fn rebuild_batch(
     // 业务 look 在 `run_looks` 里整块覆盖，`Decorate` 再追加具名贡献。
     for request in batch.requests.values_mut() {
         if request.output.lines.is_empty() && request.output.decorations.is_empty() {
-            request.output.lines = default_lines(&request.input, &theme);
+            request.output.lines = default_lines(&request.input, &rtheme);
         }
     }
 }
 
 /// 一个请求在没有 look 时画什么（上游 `RenderInput::default_lines` 的公开部分）。
 fn default_lines(input: &RenderInput, theme: &RTheme) -> Vec<LookLine> {
-    match input {
-        // 默认 look 已经带了调用状态色带。
+    let lines: Vec<LookLine> = match input {
+        // 默认 look 已经带了调用状态色带（来自 `ToolRender::theme`）。
         RenderInput::Tool(call) => call.default_lines(),
-        RenderInput::Entry(entry) => on_band(entry.default_lines(), theme.tool)
-            .into_iter()
-            .map(LookLine::from)
-            .collect(),
+        RenderInput::Entry(entry) => on_band(
+            entry.default_lines(),
+            theme_band(theme, theme.tool),
+        )
+        .into_iter()
+        .map(LookLine::from)
+        .collect(),
         RenderInput::Content(content) => content
             .default_lines()
             .into_iter()
@@ -851,10 +860,19 @@ fn default_lines(input: &RenderInput, theme: &RTheme) -> Vec<LookLine> {
             .collect(),
         // 上游把非 note aside 交给画它的插件（默认不画）；本前端没有这种插件，
         // 全不画就等于"aside 全丢"，所以给一个兜底：种类 + 来源 + 内容。
-        RenderInput::Aside(aside) => on_band(aside_fallback_lines(aside), theme.tool)
-            .into_iter()
-            .map(LookLine::from)
-            .collect(),
+        RenderInput::Aside(aside) => on_band(
+            aside_fallback_lines(aside),
+            theme_band(theme, theme.tool),
+        )
+        .into_iter()
+        .map(LookLine::from)
+        .collect(),
+    };
+    // `NO_COLOR`：上游终端会在 buffer 上统一清色，我们的渲染层没有那一步，
+    // 默认 look 自带的 band/代码色也要在落行前清掉（rich 的 plain 路径同理）。
+    match theme.plain {
+        true => lines.into_iter().map(plain_look).collect(),
+        false => lines,
     }
 }
 
@@ -886,13 +904,15 @@ struct RunningCall {
 /// look 调度不跑（非聚焦条带不该有两套 look 状态），调用树也没有。
 ///
 /// 还没落进对话的东西（在飞的调用、流式正文/推理、待回答的 Ask）不在这里，
-/// 由 [`live_additions`] 补在行流后面。`width` 是文字列数。
+/// 由 [`live_additions`] 补在行流后面。`width` 是文字列数；`theme` 是当前
+/// 应用主题（和聚焦管线同一个 `upstream_theme` 映射，`NO_COLOR` 也走它）。
 pub fn dialogue_batch(
     conversation: &Conversation,
     agent: Entity,
     width: u16,
+    theme: &Theme,
 ) -> (RenderBatch, Vec<(TextId, Vec<Line<'static>>)>) {
-    let theme = RTheme::default();
+    let rtheme = upstream_theme(theme);
     let frame = conversation_frame(
         conversation,
         &CallHistory::default(),
@@ -900,7 +920,7 @@ pub fn dialogue_batch(
         // 没有自己管线的工作区拿不到内核的活效应（正是"没有管线"的定义），
         // 所以没有在飞状态可传：对话里没结果的调用按 Running(None) 画。
         &HashMap::new(),
-        &theme,
+        &rtheme,
         width,
     );
     let mut batch = RenderBatch {
@@ -911,7 +931,7 @@ pub fn dialogue_batch(
     };
     for (key, input) in frame.requests {
         let output = RenderOutput {
-            lines: default_lines(&input, &theme),
+            lines: default_lines(&input, &rtheme),
             decorations: Vec::new(),
         };
         batch.requests.insert(key, RenderRequest { input, output });
@@ -974,7 +994,7 @@ fn conversation_frame(
                                 lines.extend(rig_tui::text_rows(body, Style::new().dim()));
                                 frame.text.push((
                                     TextId::Message { at, block },
-                                    on_band(lines, theme.tool),
+                                    on_band(lines, theme_band(theme, theme.tool)),
                                 ));
                                 continue;
                             }
@@ -1016,16 +1036,17 @@ fn conversation_frame(
                                                 &text.text,
                                                 Style::new().dim(),
                                             ),
-                                            theme.tool,
+                                            theme_band(theme, theme.tool),
                                         ),
                                     ));
                                 }
                                 None => {
                                     let mut lines = vec![Line::default()];
                                     lines.extend(user_lines(&text.text));
-                                    frame
-                                        .text
-                                        .push((TextId::Message { at, block }, on_band(lines, theme.user)));
+                                    frame.text.push((
+                                        TextId::Message { at, block },
+                                        on_band(lines, theme_band(theme, theme.user)),
+                                    ));
                                 }
                             }
                         }
@@ -1211,10 +1232,18 @@ fn user_lines(text: &str) -> Vec<Line<'static>> {
 /// `markdown::render`，表格按宽度收，折行交给对话引擎）。
 fn reply_lines(text: &str, width: u16, theme: &RTheme) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
-    rig_tui::markdown::render(text, theme, Some(width))
+    let mut lines: Vec<Line<'static>> = rig_tui::markdown::render(text, theme, Some(width))
         .into_iter()
         .map(|line| line.line().clone())
-        .collect()
+        .collect();
+    // 上游终端在 buffer 上统一清色；我们的渲染层没有那一步，markdown 的
+    // 标题/引用/代码块颜色要在 `NO_COLOR` 时自己清掉。
+    if theme.plain {
+        for line in &mut lines {
+            clear_colors(line);
+        }
+    }
+    lines
 }
 
 /// 推理：dim + italic 的 markdown（上游 `renderers::reasoning_lines`）。
@@ -1226,8 +1255,15 @@ fn reasoning_lines(text: &str, width: u16, theme: &RTheme) -> Vec<Line<'static>>
         .collect()
 }
 
-/// 把行放到 `band` 上（上游 `transcript::on_band`：行自己已有底色的不覆盖）。
-fn on_band(lines: impl IntoIterator<Item = Line<'static>>, band: RColor) -> Vec<Line<'static>> {
+/// 把行放到 `band` 上（上游 `transcript::on_band`：行自己已有底色的不覆盖）；
+/// `None`（`NO_COLOR`）时不画底色。
+fn on_band(
+    lines: impl IntoIterator<Item = Line<'static>>,
+    band: Option<RColor>,
+) -> Vec<Line<'static>> {
+    let Some(band) = band else {
+        return lines.into_iter().collect();
+    };
     lines
         .into_iter()
         .map(|mut line| {
@@ -1235,6 +1271,29 @@ fn on_band(lines: impl IntoIterator<Item = Line<'static>>, band: RColor) -> Vec<
             line
         })
         .collect()
+}
+
+/// `NO_COLOR` 时的 band：不画。
+fn theme_band(theme: &RTheme, band: RColor) -> Option<RColor> {
+    (!theme.plain).then_some(band)
+}
+
+/// 清掉一行（含 span）的前景/底色，保留修饰符（`NO_COLOR`）。
+fn clear_colors(line: &mut Line<'static>) {
+    line.style.fg = None;
+    line.style.bg = None;
+    for span in &mut line.spans {
+        span.style.fg = None;
+        span.style.bg = None;
+    }
+}
+
+/// `NO_COLOR` 下的 look 行：先按正常方式展开代码色，再清掉所有颜色
+/// （上游终端在 buffer 上统一 `strip_colors`，我们在这里做）。
+fn plain_look(line: LookLine) -> LookLine {
+    let mut line = line.colored();
+    clear_colors(&mut line);
+    LookLine::from(line)
 }
 
 /// 非 note aside 的兜底 look：`⤶ aside · 种类 · 来源`，然后是它的值。
@@ -1318,12 +1377,30 @@ fn state_words(state: &CallState) -> String {
     }
 }
 
-/// 子 agent 调用树的行：缩进 + 名字（`agent · tool`）+ 状态，失败红、结果一行。
+/// 一次调用的状态色带，判据和上游 `ToolRender::header_at` 同一顺序：
+/// 停止/被按住/排队用 `call_waiting`，运行中 `call_running`，已答复
+/// `call_done`，失败（含非 0 退出码）`call_failed`。
+fn call_band(call: &ToolRender) -> RColor {
+    match (&call.result, &call.state) {
+        (_, CallState::Stopped) => call.theme.call_waiting,
+        (Some(_), _) if call.failed() => call.theme.call_failed,
+        (_, CallState::Held(_)) => call.theme.call_waiting,
+        (Some(_), _) => call.theme.call_done,
+        (None, CallState::Running(_)) => call.theme.call_running,
+        (None, _) => call.theme.call_waiting,
+    }
+}
+
+/// 子 agent 调用树的行：缩进 + 名字（`agent · tool`）+ 状态，失败用
+/// `call_failed` 色带、结果一行。
 ///
 /// 这是上游 rig-basics `SubagentLooks` 的语义（那张 look 不在本仓库的依赖里，
 /// 数据来自 [`ChildCall`]：`ToolRender::children`）。
-fn child_call_lines(children: &[ChildCall], width: u16) -> Vec<Line<'static>> {
+fn child_call_lines(children: &[ChildCall], width: u16, theme: &RTheme) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
+    let failed_band = theme_band(theme, theme.call_failed);
+    // 名字只加粗，不再写死 Cyan；状态/失败由 band 表达。
+    let name_style = Style::new().add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
     for child in children {
         let indent = "  ".repeat(child.depth + 1);
@@ -1335,17 +1412,19 @@ fn child_call_lines(children: &[ChildCall], width: u16) -> Vec<Line<'static>> {
             .unwrap_or_default();
         let mut line = Line::from(vec![
             Span::styled(format!("{indent}{mark} "), Style::new().dim()),
-            Span::styled(
-                format!("{agent}{}", child.name),
-                Style::new().fg(RColor::Cyan),
-            ),
+            Span::styled(format!("{agent}{}", child.name), name_style),
         ]);
         let state = state_words(&child.state);
         if !state.is_empty() {
             line.push_span(Span::styled(format!("  {state}"), Style::new().dim()));
         }
         if child.failed {
-            line.push_span(Span::styled("  failed", Style::new().red()));
+            // 失败用主题的 `call_failed` band，而不是写死的红前景。
+            let style = match failed_band {
+                Some(band) => Style::new().bg(band),
+                None => Style::new(),
+            };
+            line.push_span(Span::styled("  failed", style));
         }
         lines.push(line);
         if let Some(answer) = &child.answer {
@@ -1354,10 +1433,10 @@ fn child_call_lines(children: &[ChildCall], width: u16) -> Vec<Line<'static>> {
             let room = width.saturating_sub(indent.len() + 2).max(8);
             let shown: String = first.chars().take(room).collect();
             if !shown.is_empty() {
-                let style = if child.failed {
-                    Style::new().red().dim()
-                } else {
-                    Style::new().dim()
+                let style = match (child.failed, failed_band) {
+                    (true, Some(band)) => Style::new().bg(band).dim(),
+                    (true, None) => Style::new().dim(),
+                    (false, _) => Style::new().dim(),
                 };
                 lines.push(Line::from(Span::styled(format!("{indent}  {shown}"), style)));
             }
@@ -1374,13 +1453,34 @@ fn child_calls_look(mut batch: ResMut<RenderBatch>) {
         if call.children.is_empty() {
             continue;
         }
-        out.decorate("children", child_call_lines(&call.children, width));
+        out.decorate(
+            "children",
+            child_call_lines(&call.children, width, &call.theme),
+        );
     }
 }
 
 /// 跑一遍 rig-tui 的 look 调度（独占：它要整个 world）。
 pub fn run_looks(world: &mut World) {
     world.run_schedule(TranscriptRender);
+    // `NO_COLOR`：look 可能自己写了颜色（业务 look、默认 look 的状态带），
+    // 上游终端在 buffer 上统一清掉，我们的渲染层没有那一步，这里清。
+    if world
+        .get_resource::<Theme>()
+        .is_some_and(|theme| theme.plain)
+        && let Some(mut batch) = world.get_resource_mut::<RenderBatch>()
+    {
+        for request in batch.requests.values_mut() {
+            for line in &mut request.output.lines {
+                *line = plain_look(std::mem::take(line));
+            }
+            for (_, lines) in &mut request.output.decorations {
+                for line in lines {
+                    clear_colors(line);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,6 +1492,7 @@ pub fn run_looks(world: &mut World) {
 /// 待确认的 `Ask` 不在这里拼：它们走确认面板（[`confirm_panel_rows`]）。
 pub fn collect_rows(
     batch: Res<RenderBatch>,
+    theme: Res<Theme>,
     mut transcript: ResMut<TranscriptEngine>,
     dialogue: Res<Dialogue>,
     stream: Res<ReplyStream>,
@@ -1426,13 +1527,13 @@ pub fn collect_rows(
 
     // 流式回复：真实 `Partial` 的正文/推理；流结束、没有流、或者回复已经落进
     // 对话，就收掉这一块。
-    let theme = RTheme::default();
+    let rtheme = upstream_theme(&theme);
     if stream.finished || dialogue.has_reply || stream.reasoning.is_empty() {
         transcript.remove(&BlockId::Text(TextId::StreamingReasoning));
     } else {
         transcript.set_text(
             TextId::StreamingReasoning,
-            reasoning_lines(&stream.reasoning, width, &theme),
+            reasoning_lines(&stream.reasoning, width, &rtheme),
         );
     }
     if stream.finished || dialogue.has_reply || stream.text.is_empty() {
@@ -1440,7 +1541,7 @@ pub fn collect_rows(
     } else {
         // 推理和正文之间空一行（上游 `lay_out_transcript` 的最后一段）。
         let mut lines = vec![Line::default()];
-        lines.extend(reply_lines(&stream.text, width, &theme));
+        lines.extend(reply_lines(&stream.text, width, &rtheme));
         transcript.set_text(TextId::StreamingReply, lines);
     }
 
@@ -1675,7 +1776,10 @@ fn push_ask_rows(
 ///
 /// 已经落进对话的调用不会重复画（真管线里的 `rendered` 集合做同一件事）。
 pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<KeyedRow> {
-    let theme = RTheme::default();
+    // 主题资源可能不存在（没有装 `BatchPlugin`/`FeathersViewPlugin` 的裸 world）：
+    // 那时退回默认主题。存在时和聚焦管线一样逐字段映射到上游 `RTheme`。
+    let our_theme = world.get_resource::<Theme>().copied().unwrap_or_default();
+    let rtheme = upstream_theme(&our_theme);
     let mut rows: Vec<KeyedRow> = Vec::new();
 
     /// 一个还没结算的调用：建树只用到效应 id / 父 / owner，画卡用其余字段。
@@ -1790,6 +1894,9 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
             }
             let mut render =
                 ToolRender::new(fact.call.clone(), Some(fact.result.clone()), CallState::Done);
+            // `ToolRender::new` 内部写死 `RTheme::default()`，这里换成映射后的
+            // 主题（状态带/结果色都跟我们的 `Theme` 走）。
+            render.theme = rtheme;
             render.took = fact.took;
             // 结算时从 `Published` 抄下的事实（退出码/截断标记/…）。
             render.facts = fact.facts.clone();
@@ -1803,16 +1910,27 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
         }
         let mut render =
             ToolRender::new(call.call.clone(), call.result.clone(), call.state.clone());
+        render.theme = rtheme;
         render.facts = call.facts.clone();
         render.output = call.output.clone();
         cards.push((call.effect, render));
     }
     cards.sort_by_key(|(effect, _)| *effect);
     for (effect, render) in cards {
+        let mut lines: Vec<Line<'static>> = render
+            .default_lines()
+            .iter()
+            .map(LookLine::colored)
+            .collect();
+        if rtheme.plain {
+            for line in &mut lines {
+                clear_colors(line);
+            }
+        }
         push_live_block(
             &mut rows,
             &format!("tool:{}", effect.as_u64()),
-            render.default_lines().iter().map(LookLine::colored).collect(),
+            lines,
             width,
         );
     }
@@ -1829,14 +1947,14 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
             push_live_block(
                 &mut rows,
                 "streaming-reasoning",
-                reasoning_lines(&partial.reasoning, width, &theme),
+                reasoning_lines(&partial.reasoning, width, &rtheme),
                 width,
             );
         }
         if !in_dialogue && !partial.text.is_empty() {
             // 推理和正文之间空一行（和 `collect_rows` 的流式块同形）。
             let mut lines = vec![Line::default()];
-            lines.extend(reply_lines(&partial.text, width, &theme));
+            lines.extend(reply_lines(&partial.text, width, &rtheme));
             push_live_block(&mut rows, "streaming-reply", lines, width);
         }
     }
@@ -1957,6 +2075,8 @@ fn search_product_look(mut batch: ResMut<RenderBatch>) {
 }
 
 fn search_product_lines(call: &ToolRender) -> Vec<LookLine> {
+    // header 的底色来自调用的状态 band，不再写死状态词的前景色。
+    let band = theme_band(&call.theme, call_band(call));
     let dim = Style::default().fg(RColor::Rgb(120, 128, 145));
     let secondary = Style::default().fg(RColor::Rgb(165, 175, 195));
     let price_style = Style::default().fg(RColor::Green);
@@ -1970,24 +2090,19 @@ fn search_product_lines(call: &ToolRender) -> Vec<LookLine> {
         CallState::Stopped => "(stopped)".to_string(),
     };
 
-    let mut lines: Vec<LookLine> = Vec::new();
-    lines.push(
-        Line::from(vec![
-            Span::styled("* ", Style::default().fg(RColor::Green)),
-            Span::styled(
-                "search_products",
-                Style::default()
-                    .fg(RColor::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {state}"), dim),
-            Span::styled(
-                format!("  query={}", call.argument("query").unwrap_or("-")),
-                secondary,
-            ),
-        ])
-        .into(),
-    );
+    let mut header = Line::from(vec![
+        Span::styled("* ", Style::default()),
+        Span::styled("search_products", Style::default().bold()),
+        Span::styled(format!("  {state}"), Style::default().italic()),
+        Span::styled(
+            format!("  query={}", call.argument("query").unwrap_or("-")),
+            Style::default().dim(),
+        ),
+    ]);
+    if let Some(band) = band {
+        header = header.bg(band);
+    }
+    let mut lines: Vec<LookLine> = vec![header.into()];
 
     if let Some(text) = call.result_text()
         && let Ok(products) = serde_json::from_str::<serde_json::Value>(&text)
@@ -2022,48 +2137,58 @@ fn search_product_lines(call: &ToolRender) -> Vec<LookLine> {
 /// `create_order` 的 look：等待确认 / 已下单。
 fn order_look(mut batch: ResMut<RenderBatch>) {
     for (call, out) in batch.tools_mut("create_order") {
-        let held = matches!(call.state, CallState::Held(_));
-        let done = matches!(call.state, CallState::Done);
-        let tail = if held {
-            "  waiting for your confirmation (gate)"
-        } else if done {
-            "  order placed"
-        } else {
-            "  queued"
-        };
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("* ", Style::default().fg(RColor::Magenta)),
-                Span::styled("create_order", Style::default().fg(RColor::LightMagenta)),
-                Span::styled(tail, Style::default().fg(RColor::Rgb(180, 186, 200))),
-            ])
-            .into(),
-        ];
-        if done && let Some(text) = call.result_text() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                lines.push(
-                    Line::from(Span::styled(
-                        format!(
-                            "  order {} · total {} · status {}",
-                            value["order_id"].as_str().unwrap_or("-"),
-                            value["total"].as_i64().unwrap_or(0),
-                            value["status"].as_str().unwrap_or("-")
-                        ),
-                        Style::default().fg(RColor::Green),
-                    ))
-                    .into(),
-                );
-            }
-        }
-        out.lines = lines;
+        out.lines = order_lines(call);
     }
+}
+
+fn order_lines(call: &ToolRender) -> Vec<LookLine> {
+    let held = matches!(call.state, CallState::Held(_));
+    let done = matches!(call.state, CallState::Done);
+    let tail = if held {
+        "  waiting for your confirmation (gate)"
+    } else if done {
+        "  order placed"
+    } else {
+        "  queued"
+    };
+    // 和 search 一样：header 底色来自调用的状态 band，状态词不再写死颜色。
+    let mut header = Line::from(vec![
+        Span::styled("* ", Style::default()),
+        Span::styled("create_order", Style::default().bold()),
+        Span::styled(tail, Style::default().dim()),
+    ]);
+    if let Some(band) = theme_band(&call.theme, call_band(call)) {
+        header = header.bg(band);
+    }
+    let mut lines = vec![header.into()];
+    if done && let Some(text) = call.result_text() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            lines.push(
+                Line::from(Span::styled(
+                    format!(
+                        "  order {} · total {} · status {}",
+                        value["order_id"].as_str().unwrap_or("-"),
+                        value["total"].as_i64().unwrap_or(0),
+                        value["status"].as_str().unwrap_or("-")
+                    ),
+                    Style::default().dim(),
+                ))
+                .into(),
+            );
+        }
+    }
+    lines
 }
 
 pub struct BatchPlugin;
 
 impl Plugin for BatchPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<RenderBatch>()
+        // `Theme` 是绘制系统（`rebuild_batch`/`collect_rows`/`run_looks`）的
+        // 必需资源；应用层通常由 `FeathersViewPlugin` 用 `Theme::from_env()`
+        // 插入（`NO_COLOR`）。这里只做兜底：已存在时不覆盖。
+        app.init_resource::<Theme>()
+            .init_resource::<RenderBatch>()
             .init_resource::<ReplyStream>()
             .init_resource::<CompletedCalls>()
             .init_resource::<CallHistory>()
@@ -2563,7 +2688,8 @@ mod tests {
                 answer: Some("boom\nsecond line".to_owned()),
             },
         ];
-        let lines = child_call_lines(&children, 40);
+        let theme = RTheme::default();
+        let lines = child_call_lines(&children, 40, &theme);
         let drawn: Vec<String> = lines.iter().map(text).collect();
         assert!(
             drawn[0].starts_with("  ↳ helper · search"),
@@ -2579,10 +2705,14 @@ mod tests {
         assert!(drawn[1].contains("failed"), "{:?}", drawn[1]);
         assert!(drawn[2].contains("boom"), "结果只取第一行：{:?}", drawn[2]);
         assert!(!drawn[2].contains("second line"));
-        // 失败的结果是红的。
+        // 失败用 `call_failed` 色带（不是写死的红前景）。
+        assert_eq!(
+            lines[2].spans.last().map(|span| span.style.bg),
+            Some(Some(theme.call_failed))
+        );
         assert_eq!(
             lines[2].spans.last().map(|span| span.style.fg),
-            Some(Some(RColor::Red))
+            Some(None)
         );
     }
 
@@ -3442,7 +3572,7 @@ mod tests {
         let (conversation, tool, note) = conversation();
         let conversation = Conversation(conversation);
         let agent = Entity::from_raw_u32(77).expect("合法实体");
-        let (batch, texts) = dialogue_batch(&conversation, agent, 80);
+        let (batch, texts) = dialogue_batch(&conversation, agent, 80, &Theme::default());
 
         assert_eq!(batch.agent, Some(agent), "批要指认它属于哪个 agent");
         assert_eq!(batch.width, 80, "宽度原样交给 look");
@@ -3784,6 +3914,266 @@ mod tests {
         }
     }
 
+    /// 一个带主题的 `ToolRender`（业务 look 的测试用）。
+    fn render_of(
+        name: &str,
+        state: CallState,
+        result: Option<ToolResult>,
+        theme: RTheme,
+    ) -> ToolRender {
+        ToolRender {
+            call: call(name, serde_json::json!({ "query": "tabs" })),
+            result,
+            state,
+            theme,
+            facts: None,
+            took: None,
+            output: None,
+            children: Vec::new(),
+            item: None,
+        }
+    }
+
+    /// 一条构造好的工具结果（`message::ToolResult`，look 读的形状）。
+    fn message_result(name: &str, text: &str, is_error: bool) -> ToolResult {
+        ToolResult {
+            call: CallId::from_wire("call_test"),
+            name: ToolName::new(name).expect("工具名非空"),
+            content: vec![ToolResultContent::Text(Text::new(text))],
+            is_error,
+        }
+    }
+
+    /// 一行（含 span）没有前景/底色，只有修饰符（`NO_COLOR`）。
+    fn assert_no_colors(line: &Line<'static>, what: &str) {
+        assert_eq!(line.style.fg, None, "{what} 还有前景色：{line:?}");
+        assert_eq!(line.style.bg, None, "{what} 还有底色：{line:?}");
+        for span in &line.spans {
+            assert_eq!(
+                span.style.fg, None,
+                "{what} 的 span {:?} 还有前景色",
+                span.content
+            );
+            assert_eq!(
+                span.style.bg, None,
+                "{what} 的 span {:?} 还有底色",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn tool_card_headers_take_the_call_bands_from_the_app_theme() {
+        // 三个 band 换成一眼能认出的值：header 必须原样拿到它们，说明走的是
+        // `upstream_theme(我们的 Theme)`，不是上游 `RTheme::default()`。
+        let mut theme = Theme::default();
+        let running = RColor::Rgb(11, 22, 33);
+        let done = RColor::Rgb(21, 22, 23);
+        let failed = RColor::Rgb(31, 32, 33);
+        theme.call_running = Style::new().bg(running);
+        theme.call_done = Style::new().bg(done);
+        theme.call_failed = Style::new().bg(failed);
+
+        let (mut app, shown) = focused_app();
+        app.insert_resource(theme);
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_running", "search_running"),
+            },
+            ForAgent(shown),
+            // `Has<Started>` 就够：还没交任务句柄也算 running。
+            Started {
+                at: std::time::SystemTime::now(),
+            },
+        ));
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_done", "search_done"),
+            },
+            Outcome::from(rig_core::tool::ToolResult::success(
+                rig_core::tool::ToolOutput::text("ok"),
+            )),
+            ForAgent(shown),
+        ));
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_failed", "search_failed"),
+            },
+            // 错误结果：header 走 `call_failed` 色带（不是 Done 的绿）。
+            Outcome::refused("not allowed"),
+            ForAgent(shown),
+        ));
+        rebuild_now(&mut app);
+
+        let batch = app.world().resource::<RenderBatch>();
+        let band_of = |name: &str| {
+            batch.requests.values().find_map(|request| match &request.input {
+                RenderInput::Tool(render)
+                    if render.call.function.name.as_str() == name =>
+                {
+                    request
+                        .output
+                        .lines
+                        .first()
+                        .map(|line| line.line().style.bg)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(band_of("search_running"), Some(Some(running)));
+        assert_eq!(band_of("search_done"), Some(Some(done)));
+        assert_eq!(band_of("search_failed"), Some(Some(failed)));
+    }
+
+    #[test]
+    fn custom_look_headers_take_their_state_band_from_the_theme() {
+        let theme = upstream_theme(&Theme::default());
+
+        // search：running 的 header 用 call_running；状态词不再有写死的 dim 色，
+        // 底色由整行 band 提供。
+        let running = render_of("search_products", CallState::Running(None), None, theme);
+        let lines = search_product_lines(&running);
+        assert_eq!(lines[0].line().style.bg, Some(theme.call_running));
+        let state = lines[0]
+            .line()
+            .spans
+            .iter()
+            .find(|span| span.content.contains("(running)"))
+            .expect("状态词");
+        assert_eq!(state.style.fg, None, "状态词不再写死颜色");
+        assert!(state.style.add_modifier.contains(Modifier::ITALIC));
+
+        // order：done → call_done；held → call_waiting；failed → call_failed。
+        let done = render_of(
+            "create_order",
+            CallState::Done,
+            Some(message_result(
+                "create_order",
+                r#"{"order_id":"o-1","total":9,"status":"placed"}"#,
+                false,
+            )),
+            theme,
+        );
+        let lines = order_lines(&done);
+        assert_eq!(lines[0].line().style.bg, Some(theme.call_done));
+        let tail = lines[0]
+            .line()
+            .spans
+            .iter()
+            .find(|span| span.content.contains("order placed"))
+            .expect("done 的状态词");
+        assert_eq!(tail.style.fg, None, "状态词不再写死颜色");
+
+        let held = render_of(
+            "create_order",
+            CallState::Held(vec!["gate".to_owned()]),
+            None,
+            theme,
+        );
+        assert_eq!(
+            order_lines(&held)[0].line().style.bg,
+            Some(theme.call_waiting)
+        );
+
+        let failed = render_of(
+            "search_products",
+            CallState::Done,
+            Some(message_result("search_products", "boom", true)),
+            theme,
+        );
+        assert_eq!(
+            search_product_lines(&failed)[0].line().style.bg,
+            Some(theme.call_failed)
+        );
+    }
+
+    #[test]
+    fn the_default_theme_keeps_the_same_key_colors() {
+        // 前景 token（旧可见色）不变；17 个 band 的默认值也不变（theme.rs 钉过，
+        // 这里再钉一遍 batch 真正消费的那几个）。
+        let ours = Theme::default();
+        assert_eq!(ours.fg.fg, Some(RColor::Rgb(210, 216, 228)));
+        assert_eq!(ours.dim.fg, Some(RColor::Rgb(120, 128, 145)));
+        let theme = upstream_theme(&ours);
+        assert_eq!(theme.user, RColor::Rgb(18, 38, 49));
+        assert_eq!(theme.tool, RColor::Rgb(31, 37, 49));
+        assert_eq!(theme.call_running, RColor::Rgb(53, 58, 33));
+        assert_eq!(theme.call_done, RColor::Rgb(18, 36, 34));
+        assert_eq!(theme.call_failed, RColor::Rgb(76, 20, 29));
+        // 默认主题下自定义 look 的 header 底色 = 上面这些默认 band。
+        let running = render_of("search_products", CallState::Running(None), None, theme);
+        assert_eq!(
+            search_product_lines(&running)[0].line().style.bg,
+            Some(RColor::Rgb(53, 58, 33))
+        );
+    }
+
+    #[test]
+    fn from_env_only_reads_the_no_color_variable() {
+        // 不改进程环境（并行测试会串）：只读当前值，断言 `from_env` 的判定
+        // 和它一致。`NO_COLOR` 的解析本身在 `theme::tests` 里钉过。
+        let expected = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+        assert_eq!(Theme::from_env().plain, expected);
+    }
+
+    #[test]
+    fn a_plain_theme_draws_no_foreground_or_background_colors() {
+        // `NO_COLOR` 的等价入口：`Theme::from_env` 设了变量时返回的就是它
+        // （`theme::tests::no_color_is_set_only_when_nonempty` 钉了判定）。
+        let plain = Theme::default().without_color();
+        assert!(plain.plain);
+
+        // rich 的 plain 路径（markdown 的标题/引用/代码块底色也清掉）。
+        let rows = crate::rich::markdown_rows("## 标题\n\n正文 `inline`\n\n```rust\nfn main() {}\n```\n", 40, &plain);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_no_colors(&row.line, "rich 行");
+        }
+
+        // batch 自己的路径：对话（用户/assistant/tool/note）出来的行也不能有颜色。
+        let (conversation, _, _) = conversation();
+        let conversation = Conversation(conversation);
+        let (batch, texts) = dialogue_batch(&conversation, Entity::PLACEHOLDER, 80, &plain);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for request in batch.requests.values() {
+            lines.extend(request.output.lines.iter().map(|line| line.line().clone()));
+            for (_, decoration) in &request.output.decorations {
+                lines.extend(decoration.iter().cloned());
+            }
+        }
+        for (_, text) in &texts {
+            lines.extend(text.iter().cloned());
+        }
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert_no_colors(line, "batch 行");
+        }
+    }
+
+    #[test]
+    fn a_plain_theme_strips_colors_after_the_real_looks() {
+        // 生产链路：rebuild -> looks -> collect；look 自己写的颜色（状态带）
+        // 要在 `run_looks` 的 plain 清理里被清掉。
+        let (mut app, shown) = focused_app();
+        app.insert_resource(Theme::default().without_color());
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_plain", "search"),
+            },
+            ForAgent(shown),
+            Started {
+                at: std::time::SystemTime::now(),
+            },
+        ));
+        app.update();
+        app.update();
+        let rows = app.world().resource::<TranscriptRows>();
+        assert!(!rows.0.is_empty(), "活调用应该产出至少一行");
+        for keyed in &rows.0 {
+            assert_no_colors(&keyed.row.line, "真管线行");
+        }
+    }
+
     #[test]
     fn a_nonzero_exit_in_the_result_facts_reaches_the_header() {
         use rig_core::tool::ExitStatus;
@@ -3908,7 +4298,7 @@ mod tests {
         assert!(header.contains("exit 2"), "header 要说出退出码：{header:?}");
         assert_eq!(
             lines[0].line().style.bg,
-            Some(RTheme::default().call_failed),
+            Some(upstream_theme(&Theme::default()).call_failed),
             "非 0 退出码要走失败色带：{header:?}"
         );
     }

@@ -374,6 +374,13 @@ fn sync_workspace_transcripts(world: &mut World) {
         .0
         .retain(|workspace, _| items.contains(workspace));
 
+    // 当前主题（`FeathersViewPlugin` 用 `Theme::from_env()` 插，`NO_COLOR`
+    // 已折在 `plain` 里）；非聚焦条带和聚焦管线用同一个映射。
+    let theme = world
+        .get_resource::<rig_niri::theme::Theme>()
+        .copied()
+        .unwrap_or_default();
+
     for workspace_entity in items {
         if focused == Some(workspace_entity) {
             continue;
@@ -405,7 +412,7 @@ fn sync_workspace_transcripts(world: &mut World) {
         // 对话：和真管线同一个 `conversation_frame`（纯函数，产物是 owned 的）。
         let Some((batch, texts)) = world
             .get::<Conversation>(agent)
-            .map(|conversation| batch::dialogue_batch(conversation, agent, area.cols))
+            .map(|conversation| batch::dialogue_batch(conversation, agent, area.cols, &theme))
         else {
             continue;
         };

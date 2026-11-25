@@ -315,7 +315,7 @@
 |---|---|---|---|
 | 键位提示裁剪 | `fit_keys` 带首尾空格、按 unicode 宽度、同权重丢最后（`hints.rs:79`–`:100`） | `hints.rs:50`–`:74`：`" · "` 裸 join（无首尾空格）、`chars().count()`、丢第一个 | 中文/emoji 提示行可能多留/少留一个；窄面板先丢的不同 |
 | 提示行何时显示 | 只在输入为空时（`editor::draw_editors`） | 恒显示（`hint_panel_rows` 每帧 `turn_running=false`，`hints.rs:147`） | 输入时底部仍占一行 |
-| 工具卡片事实 | `ToolRender.facts` 给退出码/输出截断/`FilesChanged`（`renderers.rs:118`–`:130`、`result_lines` `:234`） | `facts: None`（`batch.rs:648`/`:674`/`:921` 的 TODO），只显示输出文本 | 命令失败时看不到 `exit status N`；长输出被截断时没有提示行 |
+| 工具卡片事实 | `ToolRender.facts` 给退出码/输出截断/`FilesChanged`（`renderers.rs:118`–`:130`、`result_lines` `:234`） | 已接：结果 entry 里的 `Entry::facts`（`batch.rs::conversation_frame`）和效应上的 `Published`（`record_calls`/`rebuild_batch`/`live_additions`）都进 `ToolRender.facts`，header/结果行据此画退出码与截断标记 | 已无此差异；剩余限制：`KeptFacts` 是 rig-ecs 的 `pub(crate)`，重启后旧调用的 `Published` 事实读不到（只有本进程 `CallHistory`），更早 turn 的 `took` 仍缺 `EffectRecorded` |
 | 主题注入 | `Theme` 是资源，绘制处处读它 | `batch` 用 `RTheme::default()`（`batch.rs:530`/`:739`/`:1243`/`:1492`），我们的 `Theme` 只进 `rich.rs` | 改 `theme.rs` 不会改工具卡片/entry 的默认底色；NO_COLOR 无通路 |
 | turn 级状态项 | `register_required_components::<TurnOf, StatusItems>()`（`status.rs:226`–`:227`） | 只注册 `Agent`（`lib.rs:181`） | 插件放在 turn 上的状态项（token 速率等）不显示 |
 | 空闲 Esc | 停插件想停的东西（rebuild 等，`input.rs:854` 一带） | 没有 turn 在跑时什么也不做（`editor.rs:994`–`:995`，注释说明不空触发） | 插件没有"Esc 停我的后台工作"的入口 |

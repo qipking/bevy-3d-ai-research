@@ -148,7 +148,7 @@ impl Plugin for FeathersViewPlugin {
             )
                 .chain(),
         )
-        .init_resource::<theme::Theme>()
+        .insert_resource(theme::Theme::from_env())
         .init_resource::<selection::Selection>()
         .add_message::<clipboard::Copied>()
         .add_systems(
