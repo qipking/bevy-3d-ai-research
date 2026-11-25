@@ -36,11 +36,18 @@
 //! 情况下渲染行宽都不超过面板列数。
 //!
 //! 可见行数取 `min(折行行数, 输入面板实际能放的行数, [`MOST_LINES`])`：面板
-//! 能放几行从 [`PanelAreas`] 的 [`PanelId::Input`] 区域读（`area.rows` 已经
-//! 扣掉 inset 的 chrome），每个 Update 重算，窗口矮到放不下 [`MOST_LINES`]
+//! 能放几行从 [`PanelAreas`] 的 [`PanelId::Input`] 区域的**像素高度**和
+//! [`INPUT_ROW_HEIGHT`] 算，每个 Update 重算，窗口矮到放不下 [`MOST_LINES`]
 //! 时滚动仍把光标行留在可见段里。[`sync_editor_tile`] 让输入 tile 的高度跟着
 //! 行数走（最少 [`LEAST_ROWS`] 行、最多 [`MOST_LINES`] 行 + 面板上下 chrome），
 //! 右列的总高仍由 Spacer 这个比例子吸收，精确不变。
+//!
+//! 外壳（F5）：输入面板根就是 feathers 输入框那一块——底色 [`crate::theme::INPUT_BG`]
+//! （`textinput.bg`）、圆角 4px、左右内边距 3px；焦点在输入框时边框用
+//! [`FOCUS_BORDER`]（`focus.ring`），焦点在别的面板时用 [`PANEL_BORDER`]
+//! （普通边框 token）。行高 24px、字号 13px 与 feathers text input 一致；多行
+//! 只是同一块输入框里的多行，行本身不带边框（见 [`sync_input_field`] /
+//! [`sync_input_row_height`]）。
 //!
 //! 未接的行为：粘贴图片（Ctrl+V 现在只粘文本；图片见 [`crate::clipboard`]
 //! 模块文档）、转写区滚动/选择（由 `pane.rs` 现有系统负责）。
@@ -51,6 +58,9 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
 use bevy::prelude::*;
+use bevy_feathers::constants::size as feathers_size;
+use bevy_feathers::theme::{ThemeBorderColor, UiTheme};
+use bevy_ui::{px, BorderRadius};
 use rig_core::effect::EffectId;
 use rig_ecs::prelude::{
     ActiveTurn, Decision, Decider, Deliver, DeliveryMode, Effect, ForAgent, Outcome, StopTurn,
@@ -70,9 +80,9 @@ use crate::keys::{
     PendingInput,
 };
 use crate::pane::PaneScroll;
-use crate::panels::{KeyedRow, PanelId, PanelRows};
-use crate::theme::Theme;
-use crate::transcript::{ROW_HEIGHT, Row, row_hash};
+use crate::panels::{KeyedRow, PanelId, PanelRows, RowLayout};
+use crate::theme::{FOCUS_BORDER, PANEL_BORDER, Theme};
+use crate::transcript::{Row, row_hash};
 
 /// 编辑器状态。
 ///
@@ -111,20 +121,61 @@ pub const LEAST_ROWS: f32 = 3.0;
 ///
 /// 从 [`crate::frame::PanelInset::DEFAULT`] 算出来，**不要**写死 20：
 /// 输入面板由 `frame::default_screen_panels` 以 `FramePanel::tree()` spawn，
-/// 用的就是 `PanelInset::DEFAULT`；改 inset 时这里跟着变。
+/// 用的就是 `PanelInset::DEFAULT`；改 inset 时这里跟着变。改的只是输入框的
+/// **水平**内边距（[`INPUT_PADDING_X`]），上下仍然是这里的 pad。
 pub const INPUT_CHROME: f32 = 2.0
     * (crate::frame::PanelInset::DEFAULT.pad as f32
         + crate::frame::PanelInset::DEFAULT.border as f32);
 
+/// 把 feathers 的像素尺寸常量（`Val::Px`）取成 `f32`。
+///
+/// 输入框的行高/字号直接取 feathers 的常量，不在本文件重写数值：feathers 改
+/// 尺寸时这里跟着变。
+const fn pixels(value: bevy_ui::Val) -> f32 {
+    match value {
+        bevy_ui::Val::Px(px) => px,
+        _ => panic!("feathers 的尺寸常量应当是像素"),
+    }
+}
+
+/// 把 feathers 的字号常量（`FontSize::Px`）取成 `f32`。
+const fn font_pixels(size: bevy_text::FontSize) -> f32 {
+    match size {
+        bevy_text::FontSize::Px(px) => px,
+        _ => panic!("feathers 的字号常量应当是像素"),
+    }
+}
+
+/// 输入框水平内边距（左/右）。
+///
+/// 来自 `bevy_feathers::controls::text_input` 的 `FeathersTextInputContainer`：
+/// `padding.left/right = 3px`。feathers 的间距还没有 design token，所以这里
+/// 镜像那一个值；测试钉住它和上游一致。
+pub const INPUT_PADDING_X: f32 = 3.0;
+
+/// 输入框的行高：feathers `constants::size::ROW_HEIGHT`（24px）。
+///
+/// 这也是 `FeathersTextInputContainer` 的高度；多行输入时每一行都按它画，
+/// 整块仍然是一个输入框（行本身没有边框）。
+pub const INPUT_ROW_HEIGHT: f32 = pixels(feathers_size::ROW_HEIGHT);
+
+/// 输入框的字号：feathers `constants::size::COMPACT_FONT`（13px，text input 用）。
+pub const INPUT_FONT_SIZE: f32 = font_pixels(feathers_size::COMPACT_FONT);
+
+/// 输入框的圆角：feathers text input scene 的 `BorderRadius::all(px(4.0))`。
+///
+/// 和面板一样先集中到 [`crate::theme::PANEL_RADIUS`]（feathers 还没有圆角 token）。
+pub const INPUT_RADIUS: f32 = crate::theme::PANEL_RADIUS;
+
 /// 输入 tile 的高度（UI 像素）。
 ///
-/// `max(LEAST_ROWS * ROW_HEIGHT, clamp(行数, 1, MOST_LINES) * ROW_HEIGHT + INPUT_CHROME)`。
+/// `max(LEAST_ROWS * INPUT_ROW_HEIGHT, clamp(行数, 1, MOST_LINES) * INPUT_ROW_HEIGHT + INPUT_CHROME)`。
 /// 超过 [`MOST_LINES`] 后 tile 不再长高，
 /// 多出来的行由 [`EditorLayout`] 滚动露出（上游 `fit_rows` 的
 /// `clamp(1, MOST_LINES) + 2`，我们的 `+2` 是面板 chrome 而不是两行边框）。
 pub fn input_tile_height(lines: usize) -> f32 {
-    let wanted = lines.clamp(1, MOST_LINES) as f32 * ROW_HEIGHT + INPUT_CHROME;
-    wanted.max(LEAST_ROWS * ROW_HEIGHT)
+    let wanted = lines.clamp(1, MOST_LINES) as f32 * INPUT_ROW_HEIGHT + INPUT_CHROME;
+    wanted.max(LEAST_ROWS * INPUT_ROW_HEIGHT)
 }
 
 /// 输入框这一帧的折行结果 + 光标/滚动位置（上游 `editor::Layout`）。
@@ -1326,18 +1377,25 @@ pub fn input_width(roots: Option<&PanelRoots>, areas: Option<&PanelAreas>) -> us
         .map_or(97, |area| usize::from(area.cols.max(1)))
 }
 
-/// 输入框这一帧**能放几行文字**：树给 [`PanelId::Input`] 叶子的
-/// [`crate::frame::PanelArea::rows`]。
+/// 输入框这一帧**能放几行文字**：按输入面板的实际像素高度和
+/// [`INPUT_ROW_HEIGHT`] 算，窗口矮到放不下时滚动仍把光标行留在可见段里。
 ///
-/// `PanelArea::rows` 是文字区行数，`PanelArea::from_tile` 里已经减过
-/// `PanelInset` 的 pad + border（`size - inset.total()`），**不要**再扣一次
-/// chrome。根/区域还没建好（只装 `EditorPlugin` 的最小 App、第一帧）时用
-/// [`MOST_LINES`] 兜底，和 [`input_width`] 的 97 兜底同一套规则。
+/// 有精确 [`crate::frame::PanelArea::size`] 时用 `(size.y - INPUT_CHROME) / INPUT_ROW_HEIGHT`：
+/// 输入行是 24px（feathers text input 的行高），不能再拿面板区域按 18px 行算出的
+/// `rows`。只装 `EditorPlugin` 的最小 App / 测试里 `size` 还是 0 时退回
+/// `area.rows`；根/区域还没建好（第一帧）时用 [`MOST_LINES`] 兜底，和
+/// [`input_width`] 的 97 兜底同一套规则。
 pub fn input_rows(roots: Option<&PanelRoots>, areas: Option<&PanelAreas>) -> usize {
     roots
         .and_then(|roots| roots.entity(PanelId::Input))
         .and_then(|root| areas.and_then(|areas| areas.get(root)))
-        .map_or(MOST_LINES, |area| usize::from(area.rows))
+        .map_or(MOST_LINES, |area| match area.size.y > 0.0 {
+            true => {
+                let usable = (area.size.y - INPUT_CHROME).max(0.0);
+                (usable / INPUT_ROW_HEIGHT).floor().max(1.0) as usize
+            }
+            false => usize::from(area.rows),
+        })
 }
 
 /// 按输入面板的列宽和高度算这一帧的 [`EditorLayout`]（折行、光标行列、
@@ -1403,6 +1461,108 @@ pub fn editor_rows(mut panels: ResMut<PanelRows>, layout: Res<EditorLayout>, the
     panels.set(PanelId::Input, rows);
 }
 
+/// 输入框外壳的标记：整块输入只有一个（面板根），多行时行不各自成框。
+///
+/// 测试用它数"边框节点"：不管输入里有几行，带这个标记的实体只有一个。
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputField;
+
+/// 输入框是否拿到键盘焦点：`KeyFocus(None)` 就是输入框（见 [`KeyFocus`] 的约定）。
+///
+/// 没有 [`KeyFocus`] 资源的最小 App 按"常驻焦点在输入框"处理，和
+/// `frame::default_screen_panels` 把输入框当 composer 的假设一致。
+fn input_is_focused(focus: Option<&KeyFocus>) -> bool {
+    focus.map_or(true, |focus| focus.0.is_none())
+}
+
+/// 输入框外壳：借 feathers `text_input` 的外观（底色/圆角/水平内边距/焦点环）。
+///
+/// * 底色/圆角在生成面板时就来自 feathers token（[`crate::theme::INPUT_BG`]、
+///   [`INPUT_RADIUS`]），这里只补水平内边距和边框的焦点态；
+/// * 焦点在输入框（[`KeyFocus`] 为 `None`）时边框用 [`FOCUS_BORDER`]
+///   （feathers `focus.ring`），焦点在别的面板时用 [`PANEL_BORDER`]
+///   （feathers `border.default`）。feathers 的 `FocusWithinIndicator` 是加
+///   `Outline`；3D 镜像只画 `BorderColor`，所以这里换边框色而不是加 Outline。
+///
+/// 面板根的 [`ThemeBorderColor`] 会被摘掉：`frame::sync_panel_chrome` 每帧把
+/// 带这个组件的边框刷回生成时的 token（输入框生成时是 focus ring），不摘的话
+/// 焦点态永远换不掉。底色仍是 token（`ThemeBackgroundColor` 不动）。
+///
+/// 每个工作区都有自己的输入框：只有**聚焦工作区**的那个（全局
+/// [`PanelRoots`] 里的 [`PanelId::Input`]）能是焦点态，其它工作区的输入框一律
+/// 普通边框——切工作区后不会留下一圈旧 focus ring。
+pub fn sync_input_field(
+    mut commands: Commands,
+    roots: Option<Res<PanelRoots>>,
+    focus: Option<Res<KeyFocus>>,
+    theme: Option<Res<UiTheme>>,
+    mut panels: Query<(
+        Entity,
+        Option<&PanelId>,
+        &mut Node,
+        &mut BorderColor,
+        Option<&ThemeBorderColor>,
+    )>,
+) {
+    // 聚焦工作区的输入框；没有根表的最小 App 按"只有这一个"处理。
+    let focused_input = roots
+        .as_deref()
+        .and_then(|roots| roots.entity(PanelId::Input));
+    let keyboard_focused = input_is_focused(focus.as_deref());
+    let theme = crate::theme::ui_theme_or_default(theme.as_deref());
+    let padding = px(INPUT_PADDING_X);
+    let radius = BorderRadius::all(px(INPUT_RADIUS));
+    for (entity, id, mut node, mut border, themed_border) in &mut panels {
+        // 真实面板根带 `PanelId::Input`；最小测试 App 的根可能没打标签，
+        // 这时只认全局根表里的那个实体。
+        let is_input =
+            id.is_some_and(|id| *id == PanelId::Input) || focused_input == Some(entity);
+        if !is_input {
+            continue;
+        }
+        if themed_border.is_some() {
+            commands.entity(entity).remove::<ThemeBorderColor>();
+        }
+        commands.entity(entity).insert_if_new(InputField);
+        if node.padding.left != padding {
+            node.padding.left = padding;
+        }
+        if node.padding.right != padding {
+            node.padding.right = padding;
+        }
+        if node.border_radius != radius {
+            node.border_radius = radius;
+        }
+        let focused = keyboard_focused && focused_input.map_or(true, |root| root == entity);
+        let token = match focused {
+            true => FOCUS_BORDER,
+            false => PANEL_BORDER,
+        };
+        let color = theme.color(&token);
+        if border.top != color {
+            border.set_all(color);
+        }
+    }
+}
+
+/// 输入行的高度换成 feathers text input 的行高（[`INPUT_ROW_HEIGHT`]）。
+///
+/// 行是 `panels::sync_panels` 生成的（行模型与其它面板共用，行高写死
+/// `transcript::ROW_HEIGHT`），编辑器不改行模型，只把这批输入行的 `Node`
+/// 高度调成输入框的 24px；文字在行内垂直居中（行节点本来就 `align_items:
+/// Center`）。别的面板的行不受影响。
+///
+/// 排在 [`crate::FeathersSystems::Render`] 之后：`sync_panels` 这一帧刚 spawn
+/// 的行也能在同一帧拿到正确高度（延迟命令由调度器在这里之前 apply）。
+pub fn sync_input_row_height(mut rows: Query<(&RowLayout, &mut Node)>) {
+    let height = px(INPUT_ROW_HEIGHT);
+    for (layout, mut node) in &mut rows {
+        if layout.panel == PanelId::Input && node.height != height {
+            node.height = height;
+        }
+    }
+}
+
 pub fn ratatui_span(text: impl Into<String>, style: Style) -> rig_tui::ratatui::text::Span<'static> {
     rig_tui::ratatui::text::Span::styled(text.into(), style)
 }
@@ -1436,6 +1596,15 @@ impl Plugin for EditorPlugin {
         .add_systems(
             Update,
             editor_rows.in_set(crate::FeathersSystems::Draw),
+        )
+        // F5：输入框外壳。排在整个 `Render`（含 `frame::sync_panel_chrome` 和
+        // `panels::sync_panels`）之后，所以同一帧里既能盖掉面板 chrome 的边框
+        // token，也能给刚 spawn 的输入行改高度。
+        .add_systems(
+            Update,
+            (sync_input_field, sync_input_row_height)
+                .chain()
+                .after(crate::FeathersSystems::Render),
         );
     }
 }
@@ -1474,7 +1643,10 @@ mod tests {
     use crate::clipboard::ClipboardText;
     use crate::complete::{Candidate, Completion, CompletionKind, CompletionState};
     use crate::keys::{AppKeyBindingsExt, KeyPress};
+    use crate::panels::PanelsPlugin;
+    use crate::transcript::ROW_HEIGHT;
     use bevy::ecs::event::EntityEvent;
+    use bevy::text::FontSource;
     use rig_ecs::prelude::TurnOf;
 
     fn ed(text: &str) -> Editor {
@@ -3079,15 +3251,33 @@ mod tests {
     #[test]
     fn input_tile_height_grows_with_lines_and_has_a_floor() {
         assert_eq!(INPUT_CHROME, 20.0, "pad 8 + border 2 的上下共 20px");
-        assert_eq!(input_tile_height(0), 3.0 * ROW_HEIGHT, "空输入也保底 3 行");
-        assert_eq!(input_tile_height(1), 3.0 * ROW_HEIGHT, "1 行 + chrome 低于下限");
-        assert_eq!(input_tile_height(1), 54.0);
-        assert_eq!(input_tile_height(2), 2.0 * ROW_HEIGHT + INPUT_CHROME);
-        assert_eq!(input_tile_height(2), 56.0);
-        assert_eq!(input_tile_height(4), 4.0 * ROW_HEIGHT + INPUT_CHROME);
-        assert_eq!(input_tile_height(4), 92.0);
-        assert_eq!(input_tile_height(10), 10.0 * ROW_HEIGHT + INPUT_CHROME);
-        assert_eq!(input_tile_height(10), 200.0);
+        assert_eq!(
+            input_tile_height(0),
+            LEAST_ROWS * INPUT_ROW_HEIGHT,
+            "空输入也保底 3 行"
+        );
+        assert_eq!(
+            input_tile_height(1),
+            LEAST_ROWS * INPUT_ROW_HEIGHT,
+            "1 行 + chrome 低于下限"
+        );
+        assert_eq!(
+            input_tile_height(2),
+            LEAST_ROWS * INPUT_ROW_HEIGHT,
+            "2 行 + chrome 仍低于下限"
+        );
+        assert_eq!(
+            input_tile_height(3),
+            3.0 * INPUT_ROW_HEIGHT + INPUT_CHROME
+        );
+        assert_eq!(
+            input_tile_height(4),
+            4.0 * INPUT_ROW_HEIGHT + INPUT_CHROME
+        );
+        assert_eq!(
+            input_tile_height(10),
+            10.0 * INPUT_ROW_HEIGHT + INPUT_CHROME
+        );
         assert_eq!(
             input_tile_height(99),
             input_tile_height(10),
@@ -3327,6 +3517,351 @@ mod tests {
             "换行只是文本的一部分，Enter 照样整段发送"
         );
         assert_eq!(app.world().resource::<Editor>().text(), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // F5：输入框外壳借 feathers text_input 的外观（多行编辑内核不动）
+    // -----------------------------------------------------------------------
+
+    /// 和 `frame::spawn_panel` 一样的输入面板根节点：8px pad + 2px 边框。
+    fn field_root_node() -> Node {
+        Node {
+            padding: bevy_ui::UiRect::all(px(crate::frame::PANEL_PADDING)),
+            border: bevy_ui::UiRect::all(px(crate::frame::PANEL_BORDER)),
+            border_radius: BorderRadius::all(px(crate::theme::PANEL_RADIUS)),
+            ..default()
+        }
+    }
+
+    /// 只装输入框外壳系统的 App：一个输入面板根 + 一份 feathers 暗色主题。
+    fn field_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<PanelRoots>()
+            .init_resource::<KeyFocus>()
+            .insert_resource(crate::theme::dark_ui_theme())
+            .add_systems(Update, (sync_input_field, sync_input_row_height).chain());
+        let root = app
+            .world_mut()
+            .spawn((
+                field_root_node(),
+                BackgroundColor(Color::BLACK),
+                BorderColor::all(Color::BLACK),
+                ThemeBorderColor(FOCUS_BORDER.clone()),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Input, root);
+        (app, root)
+    }
+
+    fn count_with<C: Component>(app: &mut App) -> usize {
+        let mut query = app.world_mut().query_filtered::<Entity, With<C>>();
+        query.iter(app.world()).count()
+    }
+
+    fn node_height(app: &App, entity: Entity) -> bevy_ui::Val {
+        app.world().get::<Node>(entity).expect("Node").height
+    }
+
+    /// 这个节点是不是真的画边框（`Node.border` 有一边不是 0）。
+    ///
+    /// 不能数 `BorderColor`：bevy 给每个 `Node` 都 required 了一个默认
+    /// `BorderColor`（透明），行/文字节点也有。
+    fn draws_border(app: &App, entity: Entity) -> bool {
+        app.world().get::<Node>(entity).is_some_and(|node| {
+            [
+                node.border.left,
+                node.border.right,
+                node.border.top,
+                node.border.bottom,
+            ]
+            .into_iter()
+            .any(|side| side != px(0.0))
+        })
+    }
+
+    /// 从 `root` 开始的整棵子树（含 root），先序展开。
+    fn subtree(app: &App, root: Entity) -> Vec<Entity> {
+        let mut entities = vec![root];
+        let mut index = 0;
+        while index < entities.len() {
+            if let Some(children) = app.world().get::<Children>(entities[index]) {
+                entities.extend(children.iter());
+            }
+            index += 1;
+        }
+        entities
+    }
+
+    /// 焦点在输入框时边框 = `FOCUS_BORDER`，焦点在别的面板时 = `PANEL_BORDER`；
+    /// 水平内边距/圆角是 feathers text_input 的值。
+    #[test]
+    fn the_input_field_border_uses_the_focus_ring_only_while_focused() {
+        let (mut app, root) = field_app();
+        let (ring, normal) = {
+            let theme = app.world().resource::<UiTheme>();
+            (theme.color(&FOCUS_BORDER), theme.color(&PANEL_BORDER))
+        };
+        assert_ne!(ring, normal, "focus ring 和普通边框必须是两个 token");
+
+        // `KeyFocus(None)` = 焦点在输入框。
+        app.update();
+        let border = app.world().get::<BorderColor>(root).expect("边框");
+        assert_eq!(border.top, ring, "焦点在输入框：边框 = focus ring token");
+        assert!(
+            app.world().get::<ThemeBorderColor>(root).is_none(),
+            "输入框必须摘掉 ThemeBorderColor，否则 frame 每帧把边框刷回 focus ring"
+        );
+        assert_eq!(count_with::<InputField>(&mut app), 1, "整块输入只有一个框");
+        let node = app.world().get::<Node>(root).expect("Node");
+        assert_eq!(node.padding.left, px(INPUT_PADDING_X), "行左侧内边距");
+        assert_eq!(node.padding.right, px(INPUT_PADDING_X), "右侧对称");
+        assert_eq!(node.border_radius, BorderRadius::all(px(INPUT_RADIUS)));
+
+        // 焦点移到别的面板：同一帧换回普通边框 token。
+        let elsewhere = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<KeyFocus>().0 = Some(elsewhere);
+        app.update();
+        let border = app.world().get::<BorderColor>(root).expect("边框");
+        assert_eq!(border.top, normal, "焦点不在输入框：边框 = 普通边框 token");
+
+        // 每个工作区都有自己的输入框；不在全局根表里的那个不是聚焦工作区，
+        // 即使键盘焦点在（全局）输入框，它也只画普通边框。
+        app.world_mut().resource_mut::<KeyFocus>().0 = None;
+        let other_input = app
+            .world_mut()
+            .spawn((
+                field_root_node(),
+                BackgroundColor(Color::BLACK),
+                BorderColor::all(ring),
+                ThemeBorderColor(FOCUS_BORDER.clone()),
+                PanelId::Input,
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            app.world().get::<BorderColor>(root).expect("边框").top,
+            ring,
+            "聚焦工作区的输入框：焦点环"
+        );
+        assert_eq!(
+            app.world()
+                .get::<BorderColor>(other_input)
+                .expect("边框")
+                .top,
+            normal,
+            "非聚焦工作区的输入框：普通边框"
+        );
+        assert!(
+            app.world().get::<ThemeBorderColor>(other_input).is_none(),
+            "别的输入框也要摘掉 ThemeBorderColor"
+        );
+        assert_eq!(count_with::<InputField>(&mut app), 2, "两个工作区各一个输入框");
+    }
+
+    /// 真实接线：`FramePlugin` 每帧都会按生成时的 token 刷面板边框；输入框
+    /// 摘掉 `ThemeBorderColor` 之后，它不能再把边框刷回 focus ring。
+    #[test]
+    fn the_frame_chrome_does_not_take_the_input_field_border_back() {
+        if std::env::var("RF_NIRI_LAYOUT").is_ok() {
+            return; // Niri 模式接管时默认屏幕不 spawn（与 frame 的测试同一条）。
+        }
+        let mut app = App::new();
+        app.init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>()
+            .add_plugins(crate::frame::FramePlugin)
+            .init_resource::<KeyFocus>()
+            .add_systems(
+                Update,
+                (sync_input_field, sync_input_row_height)
+                    .chain()
+                    .after(crate::FeathersSystems::Render),
+            );
+        // 焦点不在输入框：期望普通边框，而不是面板生成时的 focus ring。
+        let elsewhere = app.world_mut().spawn_empty().id();
+        app.world_mut().resource_mut::<KeyFocus>().0 = Some(elsewhere);
+        app.update();
+
+        let theme = crate::theme::dark_ui_theme();
+        let normal = theme.color(&PANEL_BORDER);
+        let roots = app.world().resource::<PanelRoots>();
+        let input = roots.entity(PanelId::Input).expect("输入面板");
+        assert_eq!(
+            app.world().get::<BorderColor>(input).expect("边框").top,
+            normal,
+            "frame 刷过之后，输入框外壳仍然用普通边框 token"
+        );
+        assert!(
+            app.world().get::<ThemeBorderColor>(input).is_none(),
+            "frame 的 chrome 同步不该再管输入框边框"
+        );
+
+        // 再跑一帧：`sync_panel_chrome` 仍然不能把它刷回 focus ring。
+        app.update();
+        assert_eq!(
+            app.world().get::<BorderColor>(input).expect("边框").top,
+            normal,
+            "第二帧保持普通边框"
+        );
+    }
+
+    /// 行高/字号直接来自 feathers 的尺寸常量，左右内边距是 text input scene 的 3px。
+    #[test]
+    fn input_rows_take_the_feathers_text_input_metrics() {
+        let bevy_ui::Val::Px(row_height) = feathers_size::ROW_HEIGHT else {
+            panic!("feathers size::ROW_HEIGHT 应当是像素");
+        };
+        assert_eq!(INPUT_ROW_HEIGHT, row_height);
+        let bevy_text::FontSize::Px(font_size) = feathers_size::COMPACT_FONT else {
+            panic!("feathers size::COMPACT_FONT 应当是像素");
+        };
+        assert_eq!(INPUT_FONT_SIZE, font_size);
+        assert_eq!(
+            crate::transcript::FONT_SIZE,
+            INPUT_FONT_SIZE,
+            "行内字号就是 feathers text input 的字号"
+        );
+        // `FeathersTextInputContainer` 的 scene 里写死 padding left/right 3px、
+        // 圆角 4px；feathers 没有间距/圆角 token，只能钉住这两个上游值。
+        assert_eq!(INPUT_PADDING_X, 3.0);
+        assert_eq!(INPUT_RADIUS, 4.0);
+
+        let (mut app, root) = field_app();
+        let input_row = app
+            .world_mut()
+            .spawn((
+                Node {
+                    height: px(ROW_HEIGHT),
+                    ..default()
+                },
+                RowLayout {
+                    panel: PanelId::Input,
+                    panel_entity: root,
+                    index: 0,
+                },
+            ))
+            .id();
+        let transcript_row = app
+            .world_mut()
+            .spawn((
+                Node {
+                    height: px(ROW_HEIGHT),
+                    ..default()
+                },
+                RowLayout {
+                    panel: PanelId::Transcript,
+                    panel_entity: root,
+                    index: 0,
+                },
+            ))
+            .id();
+        app.update();
+        assert_eq!(
+            node_height(&app, input_row),
+            px(INPUT_ROW_HEIGHT),
+            "输入行高 = feathers ROW_HEIGHT"
+        );
+        assert_eq!(
+            node_height(&app, transcript_row),
+            px(ROW_HEIGHT),
+            "别的面板的行高不变"
+        );
+    }
+
+    /// 多行输入时整块仍然只有一个输入框：三行正文 = 三个行实体，但带边框的
+    /// 实体只有面板根一个，且行高统一是 feathers 的 24px。
+    #[test]
+    fn a_multiline_input_is_still_one_field_box() {
+        let mut app = App::new();
+        app.init_resource::<Editor>()
+            .init_resource::<EditorLayout>()
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelAreas>()
+            .init_resource::<KeyFocus>()
+            .insert_resource(Theme::default())
+            .insert_resource(crate::theme::dark_ui_theme())
+            .insert_resource(crate::transcript::TranscriptFont(FontSource::default()))
+            .configure_sets(
+                Update,
+                (
+                    crate::FeathersSystems::Prepare,
+                    crate::FeathersSystems::Draw,
+                    crate::FeathersSystems::Render,
+                )
+                    .chain(),
+            )
+            .add_plugins(PanelsPlugin);
+        app.add_systems(
+            Update,
+            (layout_editor, sync_editor_tile)
+                .chain()
+                .in_set(crate::FeathersSystems::Prepare),
+        );
+        app.add_systems(Update, editor_rows.in_set(crate::FeathersSystems::Draw));
+        app.add_systems(
+            Update,
+            (sync_input_field, sync_input_row_height)
+                .chain()
+                .after(crate::FeathersSystems::Render),
+        );
+        let root = app
+            .world_mut()
+            .spawn((
+                field_root_node(),
+                BackgroundColor(Color::BLACK),
+                BorderColor::all(Color::BLACK),
+                ThemeBorderColor(FOCUS_BORDER.clone()),
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Input, root);
+        app.world_mut().resource_mut::<PanelAreas>().0.insert(
+            root,
+            crate::frame::PanelArea {
+                cols: 97,
+                rows: MOST_LINES as u16,
+                ..Default::default()
+            },
+        );
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("one\ntwo\nthree");
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<PanelRows>().get(PanelId::Input).len(),
+            3,
+            "三行正文"
+        );
+        assert_eq!(count_with::<InputField>(&mut app), 1, "整块输入只有一个框");
+        let bordered: Vec<Entity> = subtree(&app, root)
+            .into_iter()
+            .filter(|entity| draws_border(&app, *entity))
+            .collect();
+        assert_eq!(bordered, vec![root], "输入行自己不带边框");
+        let children: Vec<Entity> = app
+            .world()
+            .get::<Children>(root)
+            .expect("输入面板的行节点")
+            .iter()
+            .collect();
+        assert_eq!(children.len(), 3, "多行 = 多个行实体");
+        for row in children {
+            assert_eq!(
+                app.world().get::<RowLayout>(row).expect("RowLayout").panel,
+                PanelId::Input
+            );
+            assert_eq!(
+                node_height(&app, row),
+                px(INPUT_ROW_HEIGHT),
+                "输入行高 = feathers ROW_HEIGHT"
+            );
+        }
     }
 }
 

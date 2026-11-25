@@ -44,17 +44,24 @@
 //! 分裂树）读当前行数，resize 后的下一帧就是新尺寸（清选区在
 //! [`crate::selection::clear_selection_on_resize`]）。
 
-use bevy::picking::events::PointerScroll;
+use bevy::picking::Pickable;
+use bevy::picking::events::{PointerDrag, PointerDragEnd, PointerDragStart, PointerScroll};
 use bevy::prelude::*;
+use bevy::ui::{BorderRadius, ComputedNode, Node, percent, px};
+use bevy_feathers::theme::{ThemeBackgroundColor, UiTheme};
+use bevy_feathers::tokens;
 use rig_tui::TranscriptSource;
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
-use crate::frame::{PanelAreas, PanelRoots};
+use crate::frame::{PANEL_PADDING, PanelAreas, PanelRoots};
 use crate::keys::KeyFocus;
 use crate::panels::{KeyedRow, PanelId, PanelRows, RowLayout};
 use crate::selection::{Point, Selection};
-use crate::transcript::{Below, BelowSeen, Row};
+use crate::theme::{
+    SCROLLBAR_MIN_THUMB, SCROLLBAR_RADIUS, SCROLLBAR_WIDTH, ui_theme_or_default,
+};
+use crate::transcript::{Below, BelowSeen, ROW_HEIGHT, Row};
 use crate::FeathersSystems;
 
 /// 整段转写的行（未窗口化）。[`crate::batch`] 写它。
@@ -213,6 +220,381 @@ impl PaneScroll {
                 self.follow = true;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 滚动条（F4）：窗格右侧一条纯 `Node` 的轨道 + 滑块
+// ---------------------------------------------------------------------------
+//
+// 位置/长度都按**像素**算，和 picker 的滚动条（`picker::sync_picker_scrollbar`）
+// 用同一套几何常量：轨道高 = 可见行数 × [`ROW_HEIGHT`]，正好覆盖行栈；宽度 /
+// 圆角 / 最短滑块取 [`crate::theme`] 的 `SCROLLBAR_*`（feathers listview 的
+// 6px / 3px / 8px）。轨道绝对定位在面板**右侧 padding 里**（taffy 里
+// `right: 0` 是 padding box 的右缘），所以**不占转写列宽**：正文的 `area.cols`
+// 不算它，右对齐的 `↓ more below` / `↓ new output` 也不会被盖住。
+//
+// 状态来源只有一份：每块窗格自己的 [`TranscriptPane::scroll`]。窗口化在
+// [`window_transcript`] 里已经把 `top`/`follow` 夹好，[`sync_transcript_scrollbars`]
+// 排在它后面，只读不算；拖拽观察者直接改 `scroll`，下一帧窗口化再夹一次。
+
+/// 滚动条这一帧的几何模型（纯数据，headless 测试直接断言）。
+///
+/// `len`/`offset` 是比例，`track_px`/`thumb_px` 是 UI 逻辑像素。内容放得下时
+/// 滑块铺满轨道（`len == 1`、`offset == 0`），用轨道色画，看起来就是一条
+/// 普通竖条；内容溢出时 `len = 可见/总数`（至少 [`SCROLLBAR_MIN_THUMB`]），
+/// `offset = top / max_top`，`offset == 1` 时滑块贴底。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarModel {
+    /// 整段行数。
+    pub total: usize,
+    /// 这一帧可见的行数（[`crate::frame::PanelArea::rows`] / Niri tile 的行数）。
+    pub visible: usize,
+    /// 实际窗顶：跟随末尾时就是 `max_top`。
+    pub top: usize,
+    /// `total - visible`（不小于 0）。
+    pub max_top: usize,
+    /// 滑块长度 / 轨道长度（0..=1）。
+    pub len: f32,
+    /// 滑块在可滑动行程上的位置（0 = 顶，1 = 底）。
+    pub offset: f32,
+    /// 内容比可见行多：滑块用强调色，否则和轨道同色。
+    pub overflow: bool,
+    /// 轨道长度（UI 逻辑像素）= 可见行数 × [`ROW_HEIGHT`]。
+    pub track_px: f32,
+    /// 滑块长度（UI 逻辑像素）。
+    pub thumb_px: f32,
+}
+
+impl Default for ScrollbarModel {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            visible: 0,
+            top: 0,
+            max_top: 0,
+            len: 0.0,
+            offset: 0.0,
+            overflow: false,
+            track_px: 0.0,
+            thumb_px: 0.0,
+        }
+    }
+}
+
+impl ScrollbarModel {
+    /// 从「总行数 / 可见行数 / 窗顶 / 是否跟随末尾」算这一帧的滑块。
+    pub fn new(total: usize, visible: usize, top: usize, follow: bool) -> Self {
+        let max_top = total.saturating_sub(visible);
+        let top = if follow { max_top } else { top.min(max_top) };
+        let track_px = visible as f32 * ROW_HEIGHT;
+        let overflow = visible > 0 && total > visible;
+        let thumb_px = if !overflow || track_px <= 0.0 {
+            // 放得下：滑块铺满，不画“半个滑块”。
+            track_px
+        } else {
+            (track_px * visible as f32 / total as f32)
+                .max(SCROLLBAR_MIN_THUMB)
+                .min(track_px)
+        };
+        let len = if track_px > 0.0 {
+            thumb_px / track_px
+        } else {
+            0.0
+        };
+        let travel = (track_px - thumb_px).max(0.0);
+        let offset = if max_top == 0 || travel <= 0.0 {
+            0.0
+        } else {
+            (top as f32 / max_top as f32).clamp(0.0, 1.0)
+        };
+        Self {
+            total,
+            visible,
+            top,
+            max_top,
+            len,
+            offset,
+            overflow,
+            track_px,
+            thumb_px,
+        }
+    }
+
+    /// 滑块上边缘距轨道顶部的像素。
+    pub fn thumb_top_px(&self) -> f32 {
+        self.offset * (self.track_px - self.thumb_px).max(0.0)
+    }
+
+    /// 滑块下边缘是否贴住轨道底部（跟随时 / 滚到底）。
+    pub fn is_at_bottom(&self) -> bool {
+        (self.thumb_top_px() + self.thumb_px - self.track_px).abs() < 0.5
+    }
+}
+
+/// 把滑块拖 `distance_y`（屏幕像素，向下为正）后应落的窗顶行。
+///
+/// 按滑块行程比例换算：拖过整段行程 = 从 `0` 滚到 `max_top`，结果夹在
+/// `[0, max_top]`。`distance_y` 是相对按下点的总位移（`PointerDrag::distance`），
+/// 所以起点用按下时的 `start_top`，不做增量累加。
+pub fn dragged_top(model: &ScrollbarModel, start_top: usize, distance_y: f32) -> usize {
+    if model.max_top == 0 {
+        return 0;
+    }
+    let travel = model.track_px - model.thumb_px;
+    if !(travel > 0.0) {
+        return start_top.min(model.max_top);
+    }
+    let delta = distance_y / travel * model.max_top as f32;
+    (start_top as f32 + delta)
+        .round()
+        .clamp(0.0, model.max_top as f32) as usize
+}
+
+/// 转写窗格右侧滚动条的**轨道**（纯 `Node`，挂在窗格根下）。
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct TranscriptScrollbar {
+    /// 这块滚动条属于哪块窗格根。
+    pub pane: Entity,
+    /// 滑块实体。
+    pub thumb: Entity,
+    /// 上一帧算出的几何（拖拽观察者直接复用，不再重复量布局）。
+    pub model: ScrollbarModel,
+}
+
+/// 滚动条滑块实体（`TranscriptScrollbar::thumb`）。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptScrollThumb {
+    /// 这块滑块服务的窗格根。
+    pub pane: Entity,
+    /// 它所在的轨道。
+    pub track: Entity,
+}
+
+/// 正在拖的滑块。
+///
+/// 用资源而不是组件：`PointerDragStart` / `PointerDrag` 由 bevy_picking 在
+/// 同一帧里连续派发，观察者里写资源是**立即**生效的（写组件要等命令队列），
+/// 第一段拖动就不会丢。
+#[derive(Resource, Default, Debug)]
+pub struct TranscriptScrollbarDrag {
+    state: Option<ScrollDrag>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollDrag {
+    thumb: Entity,
+    pane: Entity,
+    start_top: usize,
+    model: ScrollbarModel,
+    /// 屏幕像素 / UI 逻辑像素（高分屏下 `PointerDrag::distance` 是物理像素）。
+    scale: f32,
+}
+
+/// 给新出现的转写窗格（主转写 / `Pane2`）挂一条滚动条。
+///
+/// `spawn_panel`（`frame.rs`）只负责面板本身，这里用 `Add<TranscriptPane>`
+/// 观察者补滚动条：两块转写走同一条路，`panels.rs` 的行渲染不用知道它。
+fn spawn_transcript_scrollbar(
+    added: On<Add<TranscriptPane>>,
+    theme: Option<Res<UiTheme>>,
+    mut commands: Commands,
+) {
+    let theme = ui_theme_or_default(theme.as_deref());
+    let track_bg = theme.color(&tokens::SCROLLBAR_BG);
+    let thumb_bg = theme.color(&tokens::SCROLLBAR_THUMB);
+    let pane = added.entity;
+    let track = commands
+        .spawn((
+            Name::new("transcript:scrollbar"),
+            Node {
+                position_type: PositionType::Absolute,
+                // taffy 的绝对定位以 padding box 为基准：right 0 = 内边框
+                // 右缘，6px 轨道落在右侧 8px padding 里，不压正文列宽。
+                right: px(0.0),
+                top: px(PANEL_PADDING),
+                width: px(SCROLLBAR_WIDTH),
+                // 高度/位置每帧由 `sync_transcript_scrollbars` 按行数写。
+                height: px(0.0),
+                border_radius: BorderRadius::all(px(SCROLLBAR_RADIUS)),
+                ..default()
+            },
+            BackgroundColor(track_bg),
+            ThemeBackgroundColor(tokens::SCROLLBAR_BG),
+            Pickable::default(),
+            ChildOf(pane),
+        ))
+        .id();
+    let thumb = commands
+        .spawn((
+            Name::new("transcript:scrollbar-thumb"),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0.0),
+                top: px(0.0),
+                width: percent(100.0),
+                height: px(0.0),
+                border_radius: BorderRadius::all(px(SCROLLBAR_RADIUS)),
+                ..default()
+            },
+            BackgroundColor(thumb_bg),
+            ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
+            Pickable::default(),
+            ChildOf(track),
+            TranscriptScrollThumb { pane, track },
+        ))
+        .id();
+    commands.entity(track).insert(TranscriptScrollbar {
+        pane,
+        thumb,
+        model: ScrollbarModel::default(),
+    });
+}
+
+/// 每帧把每块窗格的轨道/滑块摆到「`scroll.top` / 总行数 / 可见行数」上。
+///
+/// 排在 [`window_transcript`] 之后（`Fit` 里 chain）：窗口化已经夹好
+/// `scroll.top`，这里只读。`follow` 时 `ScrollbarModel::new` 自己把有效窗顶
+/// 放在 `max_top`，滑块贴底——即使这一帧 `window_transcript` 还没跑。
+#[allow(clippy::too_many_arguments)]
+pub fn sync_transcript_scrollbars(
+    areas: Res<PanelAreas>,
+    full: Res<TranscriptRows>,
+    theme: Option<Res<UiTheme>>,
+    mut tracks: Query<(&mut TranscriptScrollbar, &mut Node, &mut BackgroundColor)>,
+    mut thumbs: Query<
+        (&mut Node, &mut BackgroundColor),
+        (With<TranscriptScrollThumb>, Without<TranscriptScrollbar>),
+    >,
+    panes: Query<&TranscriptPane>,
+    tiles: Query<&crate::niri::Tile>,
+    tiling: Option<Res<crate::niri::Tiling>>,
+) {
+    let theme = ui_theme_or_default(theme.as_deref());
+    let track_color = theme.color(&tokens::SCROLLBAR_BG);
+    let thumb_color = theme.color(&tokens::SCROLLBAR_THUMB);
+    for (mut bar, mut track_node, mut track_bg) in &mut tracks {
+        let Ok(pane) = panes.get(bar.pane) else {
+            continue;
+        };
+        let Some((_, visible)) = pane_size_of(&areas, bar.pane, &tiles, tiling.as_deref()) else {
+            continue;
+        };
+        let model = ScrollbarModel::new(
+            full.len(),
+            usize::from(visible),
+            pane.scroll.top,
+            pane.scroll.follow,
+        );
+        if bar.model != model {
+            bar.model = model;
+        }
+        let track_top = px(PANEL_PADDING);
+        if track_node.top != track_top {
+            track_node.top = track_top;
+        }
+        let track_height = px(model.track_px);
+        if track_node.height != track_height {
+            track_node.height = track_height;
+        }
+        if track_bg.0 != track_color {
+            track_bg.0 = track_color;
+        }
+        let Ok((mut thumb_node, mut thumb_bg)) = thumbs.get_mut(bar.thumb) else {
+            continue;
+        };
+        let thumb_top = px(model.thumb_top_px());
+        if thumb_node.top != thumb_top {
+            thumb_node.top = thumb_top;
+        }
+        let thumb_height = px(model.thumb_px);
+        if thumb_node.height != thumb_height {
+            thumb_node.height = thumb_height;
+        }
+        // 放得下时滑块铺满轨道、和轨道同色，看起来就是一条普通竖条。
+        let want_thumb = if model.overflow {
+            thumb_color
+        } else {
+            track_color
+        };
+        if thumb_bg.0 != want_thumb {
+            thumb_bg.0 = want_thumb;
+        }
+    }
+}
+
+/// 按下滑块：记下起点窗顶与行程，后续 `PointerDrag` 按总位移换算。
+fn begin_scrollbar_drag(
+    drag: On<PointerDragStart>,
+    thumbs: Query<&TranscriptScrollThumb>,
+    bars: Query<&TranscriptScrollbar>,
+    panes: Query<&TranscriptPane>,
+    nodes: Query<&ComputedNode>,
+    mut state: ResMut<TranscriptScrollbarDrag>,
+) {
+    let Ok(thumb) = thumbs.get(drag.entity) else {
+        return;
+    };
+    let Ok(bar) = bars.get(thumb.track) else {
+        return;
+    };
+    let start_top = panes
+        .get(thumb.pane)
+        .map(|pane| {
+            if pane.scroll.follow {
+                bar.model.max_top
+            } else {
+                pane.scroll.top.min(bar.model.max_top)
+            }
+        })
+        .unwrap_or(bar.model.top);
+    // 高分屏上 `PointerDrag::distance` 是屏幕物理像素，模型是 UI 逻辑像素；
+    // 用轨道真实的 `ComputedNode` 高度校正（headless 测试没有布局时为 1）。
+    let scale = nodes
+        .get(thumb.track)
+        .ok()
+        .map(|node| node.size().y / bar.model.track_px)
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0);
+    state.state = Some(ScrollDrag {
+        thumb: drag.entity,
+        pane: thumb.pane,
+        start_top,
+        model: bar.model,
+        scale,
+    });
+}
+
+/// 拖滑块：按 [`dragged_top`] 算窗顶，滚到底恢复跟随（[`PaneScroll::to`]）。
+fn drag_scrollbar(
+    drag: On<PointerDrag>,
+    state: Res<TranscriptScrollbarDrag>,
+    mut panes: Query<&mut TranscriptPane>,
+) {
+    let Some(scroll) = state.state else {
+        return;
+    };
+    if scroll.thumb != drag.entity {
+        return;
+    }
+    let Ok(mut pane) = panes.get_mut(scroll.pane) else {
+        return;
+    };
+    let top = dragged_top(
+        &scroll.model,
+        scroll.start_top,
+        drag.distance.y / scroll.scale,
+    );
+    pane.scroll.to(Some(top), scroll.model.max_top);
+}
+
+/// 松开滑块：忘掉这次拖拽的起点。
+fn end_scrollbar_drag(
+    drag: On<PointerDragEnd>,
+    mut state: ResMut<TranscriptScrollbarDrag>,
+) {
+    if state.state.is_some_and(|scroll| scroll.thumb == drag.entity) {
+        state.state = None;
     }
 }
 
@@ -739,9 +1121,22 @@ fn release_transcript_focus(
 ///
 /// 行实体是拾取目标（`transcript::spawn_row_themed` 给行加了 `Pickable`），
 /// 所以滚轮消息的 `entity` 正常就是某一行；面板根那条只是兜底（背景可拾取时）。
-fn wheel_panel(entity: Entity, roots: &PanelRoots, layouts: &Query<&RowLayout>) -> Option<PanelId> {
+/// 滚动条的轨道/滑块也是 `Pickable`，落在它们上面时同样归它服务的那块窗格。
+fn wheel_panel(
+    entity: Entity,
+    roots: &PanelRoots,
+    layouts: &Query<&RowLayout>,
+    bars: &Query<&TranscriptScrollbar>,
+    thumbs: &Query<&TranscriptScrollThumb>,
+) -> Option<PanelId> {
     if let Ok(layout) = layouts.get(entity) {
         return Some(layout.panel);
+    }
+    if let Ok(bar) = bars.get(entity) {
+        return panel_of(bar.pane, roots);
+    }
+    if let Ok(thumb) = thumbs.get(entity) {
+        return panel_of(thumb.pane, roots);
     }
     roots
         .0
@@ -768,6 +1163,8 @@ pub fn pane_wheel(
     mut scrolls: MessageReader<PointerScroll>,
     roots: Res<PanelRoots>,
     layouts: Query<&RowLayout>,
+    bars: Query<&TranscriptScrollbar>,
+    thumbs: Query<&TranscriptScrollThumb>,
     areas: Res<PanelAreas>,
     full: Res<TranscriptRows>,
     mut panes: Query<&mut TranscriptPane>,
@@ -777,7 +1174,7 @@ pub fn pane_wheel(
 ) {
     for event in scrolls.read() {
         // 横向滚轮（触摸板的左右滑）不是转写的滚动。
-        let Some(panel) = wheel_panel(event.entity, &roots, &layouts) else {
+        let Some(panel) = wheel_panel(event.entity, &roots, &layouts, &bars, &thumbs) else {
             continue;
         };
         if event.y == 0.0 || !matches!(panel, PanelId::Transcript | PanelId::Pane2) {
@@ -842,6 +1239,13 @@ impl Plugin for PanePlugin {
             .init_resource::<PaneScroll>()
             // 兼容旧的读取方；窗口化现在用每块窗格自己的 `TranscriptPane::below`。
             .init_resource::<BelowSeen>()
+            // 拖拽滚动条的按下点/行程；观察者写、`PointerDrag` 读。
+            .init_resource::<TranscriptScrollbarDrag>()
+            // F4：转写窗格一出现就挂轨道 + 滑块（主转写与 Pane2 同一路径）。
+            .add_observer(spawn_transcript_scrollbar)
+            .add_observer(begin_scrollbar_drag)
+            .add_observer(drag_scrollbar)
+            .add_observer(end_scrollbar_drag)
             // 生产里 `PickingPlugin` 已经注册了这个消息；这里补上是为了让不建
             // 窗口的测试 App 也能写 `PointerScroll`（`add_message` 幂等）。
             .add_message::<PointerScroll>()
@@ -862,6 +1266,8 @@ impl Plugin for PanePlugin {
                 Update,
                 (
                     window_transcript,
+                    // 滑块几何读窗口化之后的 `scroll`；排在它后面同一帧刷新。
+                    sync_transcript_scrollbars,
                     sync_item_selection,
                     release_transcript_focus,
                 )
@@ -881,7 +1287,9 @@ mod tests {
     use bevy::input::mouse::MouseScrollUnit;
     use bevy::input::touch::TouchPhase;
     use bevy::picking::backend::HitData;
-    use bevy::picking::events::{Pointer, PointerPress};
+    use bevy::picking::events::{
+        Pointer, PointerDrag, PointerDragStart, PointerPress,
+    };
     use bevy::picking::pointer::{Location, PointerButton, PointerId};
     use bevy::ui::ComputedNode;
     use feathers_in_3d::WorldPanel;
@@ -2537,6 +2945,255 @@ mod tests {
             pane_scroll(&fixture.app, transcript).top,
             20,
             "主窗格不该跟着滚"
+        );
+    }
+
+    // ---- F4：滚动条（纯 Node） ----
+
+    /// 某个窗格根下挂的滚动条：轨道实体 + 轨道组件。
+    fn scrollbar_of(app: &App, pane: Entity) -> (Entity, TranscriptScrollbar) {
+        let track = app
+            .world()
+            .get::<Children>(pane)
+            .expect("窗格根下要有子节点")
+            .iter()
+            .find(|child| app.world().get::<TranscriptScrollbar>(*child).is_some())
+            .expect("每块转写窗格都要有滚动条");
+        let bar = *app
+            .world()
+            .get::<TranscriptScrollbar>(track)
+            .expect("轨道组件");
+        (track, bar)
+    }
+
+    fn bar_model(app: &App, pane: Entity) -> ScrollbarModel {
+        scrollbar_of(app, pane).1.model
+    }
+
+    fn px_value(value: Val) -> f32 {
+        match value {
+            Val::Px(value) => value,
+            other => panic!("期望 Val::Px，得到 {other:?}"),
+        }
+    }
+
+    /// 100 行、可见 20 行：滑块长度 ≈ 20%，位置随 `top` 变，滚到底贴底。
+    #[test]
+    fn a_scrollbar_thumb_shows_the_visible_fraction_position_and_bottom() {
+        let mut fixture = split_app();
+        for root in [fixture.transcript, fixture.pane2] {
+            fixture
+                .app
+                .world_mut()
+                .resource_mut::<PanelAreas>()
+                .0
+                .insert(root, pane_area(20));
+        }
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(0, false));
+        set_pane_scroll(&mut fixture.app, fixture.pane2, view(10, false));
+        fixture.app.update();
+
+        let main = bar_model(&fixture.app, fixture.transcript);
+        assert_eq!(main.total, SPLIT_ROWS, "整段 100 行");
+        assert_eq!(main.visible, 20, "视口 20 行");
+        assert_eq!(main.max_top, 80);
+        assert!(
+            (main.len - 0.2).abs() < 1e-4,
+            "可见 20 / 总 100 → 滑块 20%，实际 {}",
+            main.len
+        );
+        assert!((main.track_px - 20.0 * ROW_HEIGHT).abs() < 1e-4);
+        assert_eq!(main.offset, 0.0, "窗顶 0：滑块在顶部");
+
+        let (_, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        let node = fixture
+            .app
+            .world()
+            .get::<Node>(bar.thumb)
+            .expect("滑块 Node");
+        assert!((px_value(node.height) - main.thumb_px).abs() < 1e-4);
+        assert_eq!(px_value(node.top), 0.0);
+
+        // Pane2 有自己的一份 scroll：滑块位置跟着它，不跟主窗格。
+        let pane2 = bar_model(&fixture.app, fixture.pane2);
+        assert!(
+            (pane2.offset - 10.0 / 80.0).abs() < 1e-4,
+            "Pane2 top=10 / max_top=80 → 行程 12.5%"
+        );
+        let (_, bar2) = scrollbar_of(&fixture.app, fixture.pane2);
+        let node2 = fixture
+            .app
+            .world()
+            .get::<Node>(bar2.thumb)
+            .expect("Pane2 滑块");
+        assert!(
+            (px_value(node2.top) - pane2.thumb_top_px()).abs() < 1e-4,
+            "Pane2 的滑块位置独立"
+        );
+
+        // 主窗格滚到中间：滑块位置 = top / max_top。
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(40, false));
+        fixture.app.update();
+        let mid = bar_model(&fixture.app, fixture.transcript);
+        assert!((mid.offset - 0.5).abs() < 1e-4, "40 / 80 = 一半行程");
+        let (_, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        let node = fixture
+            .app
+            .world()
+            .get::<Node>(bar.thumb)
+            .expect("滑块 Node");
+        assert!(
+            (px_value(node.top) - mid.thumb_top_px()).abs() < 1e-4,
+            "滑块 top 跟着 top 变"
+        );
+        assert!((px_value(node.height) - mid.thumb_px).abs() < 1e-4);
+
+        // 跟随末尾：窗口化把 top 放到 80，滑块贴底。
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(0, true));
+        fixture.app.update();
+        let tail = bar_model(&fixture.app, fixture.transcript);
+        assert_eq!(tail.top, 80, "跟随时有效窗顶 = max_top");
+        assert!(tail.is_at_bottom(), "滚到底/跟随时滑块贴底");
+        let (_, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        let node = fixture
+            .app
+            .world()
+            .get::<Node>(bar.thumb)
+            .expect("滑块 Node");
+        let bottom = px_value(node.top) + px_value(node.height);
+        assert!(
+            (bottom - tail.track_px).abs() < 1e-4,
+            "滑块下沿 {bottom} 要贴住轨道底 {}",
+            tail.track_px
+        );
+
+        // 轨道不占列宽：宽 6px、绝对定位在右侧 padding 里。
+        let (track, _bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        let track_node = fixture.app.world().get::<Node>(track).expect("轨道 Node");
+        assert_eq!(track_node.width, px(crate::theme::SCROLLBAR_WIDTH));
+        assert_eq!(track_node.right, px(0.0));
+        assert_eq!(track_node.position_type, PositionType::Absolute);
+        assert_eq!(
+            track_node.top,
+            px(PANEL_PADDING),
+            "轨道从内容区顶部开始，不占面板列宽"
+        );
+    }
+
+    /// 滚轮落在滑块上时也滚它服务的窗格（走现有的 `PointerScroll` 路径）。
+    #[test]
+    fn a_wheel_over_the_scrollbar_thumb_scrolls_its_pane() {
+        let mut fixture = split_app();
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(20, false));
+        fixture.app.update();
+        let (_, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        fixture.app.world_mut().write_message(PointerScroll {
+            entity: bar.thumb,
+            pointer: mouse_pointer(),
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 1.0,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            phase: TouchPhase::Moved,
+        });
+        fixture.app.update();
+        assert_eq!(
+            pane_scroll(&fixture.app, fixture.transcript).top,
+            17,
+            "滑块上的滚轮一样滚它所服务的窗格（一格 3 行）"
+        );
+    }
+
+    /// 拖滑块：`PointerDragStart` 记起点，`PointerDrag` 按总位移换算并夹在
+    /// `[0, max_top]`；拖到底恢复跟随。
+    #[test]
+    fn dragging_the_scrollbar_thumb_moves_top_and_clamps() {
+        let mut fixture = split_app();
+        for root in [fixture.transcript, fixture.pane2] {
+            fixture
+                .app
+                .world_mut()
+                .resource_mut::<PanelAreas>()
+                .0
+                .insert(root, pane_area(20));
+        }
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(0, false));
+        fixture.app.update();
+        let (_, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        let thumb = bar.thumb;
+        assert_eq!(bar.model.max_top, 80);
+        let travel = bar.model.track_px - bar.model.thumb_px;
+        assert!(travel > 0.0);
+
+        let start = |world: &mut World| {
+            world.trigger(PointerDragStart {
+                entity: thumb,
+                pointer: mouse_pointer(),
+                button: PointerButton::Primary,
+                hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            });
+        };
+        let drag = |world: &mut World, dy: f32| {
+            world.trigger(PointerDrag {
+                entity: thumb,
+                pointer: mouse_pointer(),
+                button: PointerButton::Primary,
+                distance: Vec2::new(0.0, dy),
+                delta: Vec2::new(0.0, dy),
+            });
+        };
+
+        // 拖过半个行程 → 窗顶走到一半。
+        start(fixture.app.world_mut());
+        drag(fixture.app.world_mut(), travel * 0.5);
+        let half = pane_scroll(&fixture.app, fixture.transcript);
+        assert_eq!(half.top, 40);
+        assert!(!half.follow);
+
+        // 再往下猛拖：夹在 max_top，并恢复跟随末尾。
+        start(fixture.app.world_mut());
+        drag(fixture.app.world_mut(), 10_000.0);
+        let bottom = pane_scroll(&fixture.app, fixture.transcript);
+        assert_eq!(bottom.top, 80, "不会超过 max_top");
+        assert!(bottom.follow, "拖到底恢复跟随");
+
+        // 往上猛拖：夹在 0。
+        start(fixture.app.world_mut());
+        drag(fixture.app.world_mut(), -10_000.0);
+        let top = pane_scroll(&fixture.app, fixture.transcript);
+        assert_eq!(top.top, 0, "不会小于 0");
+        assert!(!top.follow);
+    }
+
+    /// 滚动条只是多画一条轨道，不改窗口化：`↓ more below` / 跟随末尾都照旧。
+    #[test]
+    fn the_scrollbar_does_not_change_the_below_marker() {
+        let mut fixture = split_app();
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(20, false));
+        fixture.app.update();
+        let (_track, bar) = scrollbar_of(&fixture.app, fixture.transcript);
+        assert!(bar.model.overflow, "100 行 / 可见 10 行：有可滚行程");
+        let rows = rows_of(&fixture.app, PanelId::Transcript);
+        let last = crate::selection::row_text(&rows.last().expect("有行").row);
+        assert!(
+            last.contains("more below"),
+            "滚上去最后一行仍是 more below：{last:?}"
+        );
+
+        // 跟随末尾：标记消失、滑块贴底。
+        set_pane_scroll(&mut fixture.app, fixture.transcript, view(0, true));
+        fixture.app.update();
+        let rows = rows_of(&fixture.app, PanelId::Transcript);
+        assert!(
+            !rows.iter().any(|keyed| {
+                let text = crate::selection::row_text(&keyed.row);
+                text.contains("PgDn")
+            }),
+            "跟随时不画标记：{rows:?}"
+        );
+        assert!(
+            bar_model(&fixture.app, fixture.transcript).is_at_bottom(),
+            "跟随时滑块贴底"
         );
     }
 }

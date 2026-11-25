@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use bevy::pbr::MeshMaterial3d;
 use bevy::prelude::*;
 use bevy_luma::engine::layout::render::material_3d::UNodeMaterial3d;
-use bevy_ui::{BackgroundColor, BorderColor, ComputedNode, Node, UiGlobalTransform};
+use bevy_ui::{
+    BackgroundColor, BorderColor, ComputedNode, Node, Outline, ResolvedBorderRadius,
+    UiGlobalTransform,
+};
 
 use crate::sort::{PanelSort, SORT_STEP};
 
@@ -103,6 +106,83 @@ pub struct PanelNode {
     pub cached_border_width: f32,
 }
 
+/// One mirrored [`Outline`] ring (feathers' focus indicator uses `Outline`).
+///
+/// An outline is drawn **outside** the node: inner edge at `size + 2 * offset`,
+/// outer edge at `size + 2 * (offset + width)`. We mirror it as a separate
+/// quad the size of the outer box whose SDF material paints only its border
+/// ring (no image, same `UNodeMaterial3d` as the node fills).
+#[derive(Component)]
+pub struct PanelOutlineNode {
+    pub mesh: Handle<Mesh>,
+    pub material: Handle<UNodeMaterial3d>,
+    pub cached_size: Vec2,
+    pub cached_color: Vec4,
+    pub cached_radius: Vec4,
+    pub cached_width: f32,
+}
+
+/// [`outline_to_world`] 的结果（世界米），纯数据方便测试。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MirrorOutline {
+    /// 外框的世界尺寸（节点 + 2*(offset+width)）。
+    pub size: Vec2,
+    /// 描边宽度（世界米）。
+    pub width: f32,
+    /// 外框四角圆角（TR、BR、TL、BL，与 `PanelNode` 的 `cached_radius` 同序）。
+    pub radius: Vec4,
+    /// 描边颜色（线性 RGBA）。
+    pub color: Vec4,
+}
+
+/// 节点四角圆角（物理像素）→ 世界米；顺序与材质 uniform 一致。
+fn radius_to_world(
+    radius: &ResolvedBorderRadius,
+    inverse_scale_factor: f32,
+    units_to_world: f32,
+) -> Vec4 {
+    let len = |corner: Vec2| {
+        physical_len_to_world(
+            corner.x.max(corner.y),
+            inverse_scale_factor,
+            units_to_world,
+        )
+    };
+    Vec4::new(
+        len(radius.top_right),
+        len(radius.bottom_right),
+        len(radius.top_left),
+        len(radius.bottom_left),
+    )
+}
+
+/// Resolve an [`Outline`] into the data its 3D mirror needs.
+///
+/// Width/offset come from the **laid-out** [`ComputedNode`] (the font-relative
+/// and percentage `Val`s are already resolved there, in physical pixels), the
+/// color comes from the [`Outline`] component. A zero-width or transparent
+/// outline mirrors nothing (`update_row_focus_rings` parks the ring at
+/// `Color::NONE` instead of removing it).
+pub fn outline_to_world(
+    node: &ComputedNode,
+    outline: &Outline,
+    inverse_scale_factor: f32,
+    units_to_world: f32,
+) -> Option<MirrorOutline> {
+    let width_px = node.outline_width();
+    let offset_px = node.outline_offset();
+    if width_px <= 0.0 || outline.color.alpha() <= 0.0 {
+        return None;
+    }
+    let outer_px = node.size + Vec2::splat(2.0 * (offset_px + width_px));
+    Some(MirrorOutline {
+        size: physical_size_to_world(outer_px, inverse_scale_factor, units_to_world),
+        width: physical_len_to_world(width_px, inverse_scale_factor, units_to_world),
+        radius: radius_to_world(&node.outline_radius(), inverse_scale_factor, units_to_world),
+        color: LinearRgba::from(outline.color).to_vec4(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sync_mirror(
     mut commands: Commands,
@@ -110,6 +190,7 @@ pub fn sync_mirror(
     mut materials: ResMut<Assets<UNodeMaterial3d>>,
     panels: Query<(Entity, &WorldPanel, Option<&WorldLayer>), With<MirrorRoot>>,
     mut existing: Query<&mut PanelNode>,
+    mut outlines: Query<(Entity, &mut PanelOutlineNode, &mut PanelSort)>,
     all_nodes: Query<
         (
             Entity,
@@ -117,6 +198,7 @@ pub fn sync_mirror(
             &UiGlobalTransform,
             Option<&BackgroundColor>,
             Option<&BorderColor>,
+            Option<&Outline>,
         ),
         With<Node>,
     >,
@@ -132,7 +214,7 @@ pub fn sync_mirror(
         .map(|(e, p, layer)| {
             let inverse_scale_factor = all_nodes
                 .get(e)
-                .map_or(1.0, |(_, cn, _, _, _)| cn.inverse_scale_factor);
+                .map_or(1.0, |(_, cn, _, _, _, _)| cn.inverse_scale_factor);
             (
                 e,
                 (
@@ -153,7 +235,7 @@ pub fn sync_mirror(
     // uniform rows are the rows of the panel's world -> local matrix.
     let mut panel_clip: HashMap<Entity, (Vec4, Vec4, Vec2)> = HashMap::new();
     for root in panel_map.keys() {
-        let Ok((_, cn, _, _, _)) = all_nodes.get(*root) else {
+        let Ok((_, cn, _, _, _, _)) = all_nodes.get(*root) else {
             continue;
         };
         let (units, anchor, _, inverse_scale_factor) = panel_map
@@ -194,6 +276,16 @@ pub fn sync_mirror(
         commands.entity(root).insert(PanelSortRange { max_bias, layer });
     }
 
+    // Outline 是节点**外**的另一圈几何（feathers 的焦点环）。每个节点最多一个
+    // `Outline` 组件，先收成 owner -> 镜像实体；处理节点时认领，处理完还剩下
+    // 的就是这一帧已经不需要的环（颜色 `NONE` / 组件被移除 / 面板不在）。
+    let mut outline_of: HashMap<Entity, Entity> = HashMap::new();
+    for (outline_entity, _, _) in outlines.iter() {
+        if let Ok(child_of) = parents.get(outline_entity) {
+            outline_of.insert(child_of.parent(), outline_entity);
+        }
+    }
+
     for (node, (panel_root, depth, order)) in in_panel.iter() {
         let Some((units_to_world, anchor, layer, inverse_scale_factor)) =
             panel_map.get(panel_root).copied()
@@ -201,7 +293,7 @@ pub fn sync_mirror(
             continue;
         };
         let layer_bias = layer as f32 * LAYER_BIAS;
-        let Ok((entity, cn, ugt, bg, border_color)) = all_nodes.get(*node) else {
+        let Ok((entity, cn, ugt, bg, border_color, outline)) = all_nodes.get(*node) else {
             continue;
         };
 
@@ -220,7 +312,7 @@ pub fn sync_mirror(
 
         let parent_centre_offset = match parents.get(entity) {
             Ok(child_of) => match all_nodes.get(child_of.parent()) {
-                Ok((_, _, pugt, _, _)) => {
+                Ok((_, _, pugt, _, _, _)) => {
                     ugt.affine().translation - pugt.affine().translation
                 }
                 Err(_) => Vec2::ZERO,
@@ -255,6 +347,92 @@ pub fn sync_mirror(
                 bias: layer_bias + *order as f32 * SORT_STEP,
             },
         ));
+        // Outline 镜像：没有底色的节点（例如键盘选中的转写行只有 Outline）
+        // 也要画，所以这段必须在 `!has_fill` 提前返回之前。
+        if let Some(wanted) =
+            outline.and_then(|outline| outline_to_world(cn, outline, inverse_scale_factor, units_to_world))
+        {
+            let bias = layer_bias + *order as f32 * SORT_STEP + SORT_STEP * 0.5;
+            match outline_of.remove(&entity) {
+                Some(outline_entity) => {
+                    if let Ok((_, mut node3d, mut sort)) = outlines.get_mut(outline_entity) {
+                        sort.center = anchor.translation;
+                        sort.bias = bias;
+                        if node3d.cached_size != wanted.size {
+                            let mesh = meshes.add(Rectangle::new(wanted.size.x, wanted.size.y));
+                            node3d.mesh = mesh.clone();
+                            node3d.cached_size = wanted.size;
+                            commands.entity(outline_entity).insert(Mesh3d(mesh));
+                        }
+                        if node3d.cached_color != wanted.color
+                            || node3d.cached_radius != wanted.radius
+                            || !(node3d.cached_width - wanted.width).abs().lt(&1e-9)
+                        {
+                            if let Some(mut mat) = materials.get_mut(&node3d.material) {
+                                apply_panel_clip(&mut mat, panel_clip.get(panel_root));
+                                mat.color = LinearRgba::NONE.to_vec4();
+                                mat.border_color = wanted.color;
+                                mat.radius = wanted.radius;
+                                mat.size = wanted.size;
+                                mat.border_width = wanted.width;
+                                mat.softness = 1.0e-5;
+                                node3d.cached_color = wanted.color;
+                                node3d.cached_radius = wanted.radius;
+                                node3d.cached_width = wanted.width;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let (clip_row0, clip_row1, clip_half) = panel_clip
+                        .get(panel_root)
+                        .copied()
+                        .unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
+                    let material = UNodeMaterial3d {
+                        clip_inv_x: [clip_row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                        clip_inv_y: [clip_row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                        clip_bounds: [
+                            Vec4::new(clip_half.x, clip_half.y, 1.0, 0.0),
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                        ],
+                        // 只画外框的 border 环，中间透明。
+                        color: LinearRgba::NONE.to_vec4(),
+                        radius: wanted.radius,
+                        border_color: wanted.color,
+                        size: wanted.size,
+                        border_width: wanted.width,
+                        softness: 1.0e-5,
+                        roughness: 0.55,
+                        ..default()
+                    };
+                    let mesh = meshes.add(Rectangle::new(wanted.size.x, wanted.size.y));
+                    let material = materials.add(material);
+                    commands.spawn((
+                        PanelOutlineNode {
+                            mesh: mesh.clone(),
+                            material: material.clone(),
+                            cached_size: wanted.size,
+                            cached_color: wanted.color,
+                            cached_radius: wanted.radius,
+                            cached_width: wanted.width,
+                        },
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material),
+                        // 挂在节点下：节点自己的 Transform 是相对 UI 父层的局部位姿，
+                        // 零位移的环正好和节点同心。
+                        Transform::default(),
+                        ChildOf(entity),
+                        PanelSort {
+                            center: anchor.translation,
+                            bias,
+                        },
+                    ));
+                }
+            }
+        }
+
         if !has_fill {
             continue;
         }
@@ -268,28 +446,7 @@ pub fn sync_mirror(
         let b_width = physical_len_to_world(border_px, inverse_scale_factor, units_to_world);
 
         let r = &cn.border_radius;
-        let radius_vec = Vec4::new(
-            physical_len_to_world(
-                r.top_right.x.max(r.top_right.y),
-                inverse_scale_factor,
-                units_to_world,
-            ),
-            physical_len_to_world(
-                r.bottom_right.x.max(r.bottom_right.y),
-                inverse_scale_factor,
-                units_to_world,
-            ),
-            physical_len_to_world(
-                r.top_left.x.max(r.top_left.y),
-                inverse_scale_factor,
-                units_to_world,
-            ),
-            physical_len_to_world(
-                r.bottom_left.x.max(r.bottom_left.y),
-                inverse_scale_factor,
-                units_to_world,
-            ),
-        );
+        let radius_vec = radius_to_world(r, inverse_scale_factor, units_to_world);
 
         let color4 = base_color.to_vec4();
         let border4 = b_color.to_vec4();
@@ -308,16 +465,7 @@ pub fn sync_mirror(
                 || !(node3d.cached_border_width - b_width).abs().lt(&1e-9)
             {
                 if let Some(mut mat) = materials.get_mut(&node3d.material) {
-                    if let Some((row0, row1, half)) = panel_clip.get(panel_root) {
-                        mat.clip_inv_x = [*row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
-                        mat.clip_inv_y = [*row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
-                        mat.clip_bounds = [
-                            Vec4::new(half.x, half.y, 1.0, 0.0),
-                            Vec4::ZERO,
-                            Vec4::ZERO,
-                            Vec4::ZERO,
-                        ];
-                    }
+                    apply_panel_clip(&mut mat, panel_clip.get(panel_root));
                     mat.color = color4;
                     mat.border_color = border4;
                     mat.radius = radius_vec;
@@ -371,10 +519,31 @@ pub fn sync_mirror(
             ));
         }
     }
+
+    // 这一帧没认领的环（焦点走了 / 颜色变 NONE / 节点不再要 Outline）：拆掉。
+    for (_, outline_entity) in outline_of {
+        commands.entity(outline_entity).despawn();
+    }
+}
+
+/// 把面板的裁剪 uniform 写进材质（节点与 Outline 环共用）。
+fn apply_panel_clip(mat: &mut UNodeMaterial3d, clip: Option<&(Vec4, Vec4, Vec2)>) {
+    if let Some((row0, row1, half)) = clip {
+        mat.clip_inv_x = [*row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
+        mat.clip_inv_y = [*row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
+        mat.clip_bounds = [
+            Vec4::new(half.x, half.y, 1.0, 0.0),
+            Vec4::ZERO,
+            Vec4::ZERO,
+            Vec4::ZERO,
+        ];
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use bevy::ecs::system::RunSystemOnce;
+
     use super::*;
 
     /// `WorldPanel::units_to_world` 按逻辑像素标定（与 `frame::UNITS_TO_WORLD` 同值）。
@@ -446,5 +615,152 @@ mod tests {
 
         let border = physical_len_to_world(3.0, inverse_scale_factor, UNITS);
         assert!((border - 2.0 * UNITS).abs() < 1e-6, "3 物理像素 = 2 逻辑像素");
+    }
+
+    // ---- Outline 镜像（feathers 焦点环） ----
+
+    fn focus_ring_color() -> Color {
+        Color::srgb(0.2, 0.6, 1.0).with_alpha(0.5)
+    }
+
+    /// 纯换算：外框 = 节点 + 2*(offset+width)，描边宽度 = width，颜色来自 Outline。
+    #[test]
+    fn outline_geometry_is_the_outer_ring_feathers_draws() {
+        let mut node = ComputedNode {
+            size: Vec2::new(100.0, 20.0),
+            ..default()
+        };
+        node.outline_width = 2.0;
+        node.outline_offset = 2.0;
+        node.border_radius = ResolvedBorderRadius {
+            top_left: Vec2::splat(4.0),
+            top_right: Vec2::splat(4.0),
+            bottom_right: Vec2::splat(4.0),
+            bottom_left: Vec2::splat(4.0),
+        };
+        let color = focus_ring_color();
+        let outline = Outline::new(Val::Px(2.0), Val::Px(2.0), color);
+
+        let ring = outline_to_world(&node, &outline, 1.0, UNITS).expect("有宽度的环要生成");
+        assert_eq!(
+            ring.size,
+            Vec2::new(108.0, 28.0) * UNITS,
+            "外框 = 节点 + 2*(2px offset + 2px width)"
+        );
+        assert!(
+            (ring.width - 2.0 * UNITS).abs() < 1e-9,
+            "描边宽度 = Outline width"
+        );
+        assert_eq!(
+            ring.radius,
+            Vec4::splat(8.0 * UNITS),
+            "外框圆角 = 节点圆角 4px + offset+width 4px"
+        );
+        assert_eq!(ring.color, LinearRgba::from(color).to_vec4());
+
+        // 透明 / 零宽不镜像（`update_row_focus_rings` 用 Color::NONE 关环）。
+        let hidden = Outline::new(Val::Px(2.0), Val::Px(2.0), Color::NONE);
+        assert!(outline_to_world(&node, &hidden, 1.0, UNITS).is_none());
+        node.outline_width = 0.0;
+        assert!(outline_to_world(&node, &outline, 1.0, UNITS).is_none());
+    }
+
+    /// 组件级：给一个**没有底色**的节点加 Outline，`sync_mirror` 要挂一个
+    /// 独立的描边实体（带材质和世界尺寸）；移除 Outline 后它要被拆掉。
+    #[test]
+    fn sync_mirror_spawns_a_ring_even_when_the_node_has_no_fill() {
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<UNodeMaterial3d>::default());
+
+        let panel = world
+            .spawn((
+                MirrorRoot,
+                WorldPanel {
+                    units_to_world: UNITS,
+                    anchor: Transform::from_xyz(0.0, 0.0, -1.0),
+                },
+                WorldLayer(0),
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(200.0, 100.0),
+                    ..default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+
+        let mut cn = ComputedNode {
+            size: Vec2::new(100.0, 20.0),
+            ..default()
+        };
+        cn.outline_width = 2.0;
+        cn.outline_offset = 2.0;
+        let color = focus_ring_color();
+        let node = world
+            .spawn((
+                Node::default(),
+                cn,
+                UiGlobalTransform::from_translation(Vec2::new(50.0, 30.0)),
+                BackgroundColor(Color::NONE),
+                BorderColor::default(),
+                Outline::new(Val::Px(2.0), Val::Px(2.0), color),
+                ChildOf(panel),
+            ))
+            .id();
+
+        world.run_system_once(sync_mirror).unwrap();
+
+        // 没底色：节点自己不生成填充 mesh，但环要生成。
+        assert!(
+            world.get::<PanelNode>(node).is_none(),
+            "透明节点不该有填充 mesh"
+        );
+        let ring_entity = world
+            .get::<Children>(node)
+            .expect("节点下挂着环")
+            .iter()
+            .find(|child| world.get::<PanelOutlineNode>(*child).is_some())
+            .expect("应该有一个 PanelOutlineNode");
+        assert_eq!(
+            world.get::<ChildOf>(ring_entity).map(ChildOf::parent),
+            Some(node),
+            "环挂在被描边的节点下"
+        );
+
+        let ring = world.get::<PanelOutlineNode>(ring_entity).expect("环数据");
+        let expected_size = Vec2::new(108.0, 28.0) * UNITS;
+        assert!(
+            (ring.cached_size - expected_size).length() < 1e-9,
+            "环的世界尺寸 {:?}（期望 {expected_size:?}）",
+            ring.cached_size
+        );
+        assert_eq!(ring.cached_color, LinearRgba::from(color).to_vec4());
+        {
+            let materials = world.resource::<Assets<UNodeMaterial3d>>();
+            let material = materials.get(&ring.material).expect("环材质");
+            assert_eq!(
+                material.color,
+                LinearRgba::NONE.to_vec4(),
+                "中间透明，只画 border 环"
+            );
+            assert_eq!(material.border_color, LinearRgba::from(color).to_vec4());
+            assert!(
+                (material.border_width - 2.0 * UNITS).abs() < 1e-9,
+                "border 宽度 = Outline width"
+            );
+            assert!(
+                (material.size - expected_size).length() < 1e-9,
+                "材质外框尺寸"
+            );
+        }
+
+        // 焦点走了：Outline 移除后，环实体也要消失。
+        world.entity_mut(node).remove::<Outline>();
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(
+            world.get_entity(ring_entity).is_err(),
+            "没有 Outline 的节点不该留着环"
+        );
     }
 }

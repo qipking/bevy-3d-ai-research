@@ -21,6 +21,13 @@
 //! 过滤 / 列表 / 键位行）和可选的 [`PanelId::Preview`]。关掉时把这一列摘掉、
 //! despawn 三块面板、清掉行槽。这就是 niri 的"新窗口 = 右边新加一列"。
 //!
+//! 列表右侧有一条纯 `Node` 的滚动条：轨道/滑块的几何来自 [`crate::theme`] 的
+//! `SCROLLBAR_*`（照 feathers listview 的 6px / 4px / 3px），颜色是 feathers 的
+//! `SCROLLBAR_BG`/`SCROLLBAR_THUMB` token；滑块高度/位置跟着 [`PickerInput::scroll`]，
+//! 滚轮和拖滑块也回写 `scroll`。feathers 自带的 `controls::scrollbar` 滑块**没有
+//! `Node`**（`feathers_in_3d` 的镜像不画），而且依赖真实的 `ScrollPosition` /
+//! 内容高度——窗口化列表没有那份高度，所以用同一套外观自己驱动。
+//!
 //! 同时有多个 picker 时只有一个列：它们按 [`PickerQueue`] 里的创建顺序排队，
 //! 一次显示队首，关掉（`Pick` 之后 harness despawn）或被外部回收后队首接上，
 //! 队列空了才把列摘掉——和上游 `pick::queue_choices` 的顺序一致。`Ask` 不进
@@ -29,16 +36,26 @@
 use bevy::prelude::*;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
+use bevy::picking::Pickable;
+use bevy::picking::events::{PointerDrag, PointerDragStart, PointerScroll};
+use bevy_feathers::theme::{ThemeBackgroundColor, ThemeToken, UiTheme};
+use bevy_feathers::tokens;
+use bevy_ui::{BorderRadius, Node as UiNode, percent, px};
 use rig_harness::pick::{PickItem, PickPreview, TickBox, Ticked};
 use rig_harness::prelude::{Chosen, Highlighted, Pick, Picker};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
-use crate::frame::{FramePanel, FrameTree, Look, PanelAreas, PanelRoots, spawn_panel};
+use crate::frame::{
+    FramePanel, FrameTree, Look, PANEL_PADDING, PanelAreas, PanelRoots, spawn_panel,
+};
 use crate::keys::Modifiers;
 use crate::layout::{Child, Node, NO_GAP, Size, Split};
-use crate::panels::{KeyedRow, PanelId, PanelRows, PanelSpawned};
-use crate::theme::Theme;
+use crate::panels::{KeyedRow, PanelId, PanelRows, PanelSpawned, RowLayout};
+use crate::theme::{
+    PANEL_BG, PANEL_BORDER, SCROLLBAR_GUTTER, SCROLLBAR_INSET, SCROLLBAR_MIN_THUMB,
+    SCROLLBAR_RADIUS, SCROLLBAR_WIDTH, Theme,
+};
 use crate::transcript::Row;
 use crate::workspaces::{Workspace, WorkspaceSet};
 use crate::FeathersSystems;
@@ -153,6 +170,10 @@ pub struct PickerInput {
     pub list_panel: Option<Entity>,
     /// 列里的 preview tile（[`PanelId::Preview`]，`PickPreview` 在时才有）。
     pub preview_panel: Option<Entity>,
+    /// 列表右侧滚动条的轨道（[`PickerScrollbar`]；纯 Node，见 [`spawn_scrollbar`]）。
+    pub scrollbar: Option<Entity>,
+    /// 滚动条滑块（[`PickerScrollbarThumb`]）：高度/位置跟着 [`PickerInput::scroll`]。
+    pub scrollbar_thumb: Option<Entity>,
     /// 打进去的过滤词。
     pub filter: String,
     /// 树上展开的分支（rig 的 `open`）。
@@ -180,6 +201,46 @@ impl PickerInput {
     pub fn is_open(&self) -> bool {
         self.picker.is_some()
     }
+}
+
+/// picker 列表右侧滚动条的**轨道**（纯 `Node`）。
+///
+/// feathers 的 `controls::scrollbar` 是 Node 实现（`BackgroundColor` +
+/// `BorderRadius`，没有图片/图标），3D 镜像能画；但它的滑块同步绑在
+/// `ScrollPosition` + `ComputedNode` 的真实内容高度上，而 picker 的列表是
+/// 窗口化的（只生成可见行，滚动量在 [`PickerInput::scroll`]），没有那份高度。
+/// 所以这里用**同一套 token / 几何常量**（[`SCROLLBAR_WIDTH`] 等）自己驱动
+/// 滑块，见 [`sync_picker_scrollbar`]。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PickerScrollbar;
+
+/// 滚动条滑块：一个绝对定位的纯 `Node`，高度/`top` 每帧按可见行比例写。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PickerScrollbarThumb;
+
+/// 列表这一帧的滚动窗口（[`picker_rows`] 在 `Draw` 写，[`sync_picker_scrollbar`]
+/// 在 `Fit` 读）。
+///
+/// `head` 是列表体上面的标题/说明/过滤行数，`visible` 是列表体能放几行，
+/// `total` 是列表体的总行数（含展开的 `more` 说明行）。
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PickerScrollMetrics {
+    /// 列表体上面已经用掉的固定行数（标题 / 说明 / 过滤 / 空行）。
+    pub head: usize,
+    /// 列表体这一帧能显示的行数（至少 1）。
+    pub visible: usize,
+    /// 列表体的总行数（`state.rows.len()` + 展开的 `more` 行数）。
+    pub total: usize,
+}
+
+/// 拖动滚动条滑块时的起点：`PointerDrag::distance` 是从按下点算的**总位移**，
+/// 所以每次 `PointerDragStart` 记下当时的 `scroll`，拖动时按位移换算行号。
+#[derive(Resource, Default, Debug)]
+pub struct PickerScrollbarDrag {
+    /// 正在拖滑块（下一次 `PointerDrag` 按 [`PickerScrollbarDrag::origin`] 算）。
+    active: bool,
+    /// 按下滑块时的 [`PickerInput::scroll`]。
+    origin: usize,
 }
 
 /// 打开着的 picker 的显示顺序（rig-tui `TuiView::queue` 的收窄版）：一次只显示
@@ -645,6 +706,98 @@ fn enqueue_picker(add: On<Add<Picker>>, mut queue: ResMut<PickerQueue>) {
     queue.push(add.entity);
 }
 
+/// 取一个 feathers token 的颜色；没有 `UiTheme` 资源时用 feathers 暗色主题兜底。
+fn scrollbar_color(token: &ThemeToken) -> Color {
+    crate::theme::ui_theme_or_default(None).color(token)
+}
+
+/// 在列表 tile 里 spawn 滚动条：绝对定位的轨道 + 滑块（都是纯 `Node`）。
+///
+/// 几何/圆角来自 [`crate::theme`] 的 `SCROLLBAR_*` 常量（feathers listview 的
+/// 6px 轨道 / 4px 间距 / 3px 圆角），颜色来自 feathers 的 `SCROLLBAR_BG` /
+/// `SCROLLBAR_THUMB` token。滑块带 `Pickable`，拖动走 [`picker_scrollbar_drag`]。
+fn spawn_scrollbar(commands: &mut Commands, list: Entity) -> (Entity, Entity) {
+    let track_bg = scrollbar_color(&tokens::SCROLLBAR_BG);
+    let thumb_bg = scrollbar_color(&tokens::SCROLLBAR_THUMB);
+    let mut track = Entity::PLACEHOLDER;
+    let mut thumb = Entity::PLACEHOLDER;
+    commands.entity(list).with_children(|parent| {
+        let track_entity = parent
+            .spawn((
+                Name::new("picker:scrollbar"),
+                PickerScrollbar,
+                UiNode {
+                    // 列表体右侧、贴着 panel 的内容区；`top`/`height` 每帧按
+                    // 可见行数写（见 `sync_picker_scrollbar`）。
+                    position_type: PositionType::Absolute,
+                    right: px(SCROLLBAR_INSET),
+                    top: px(0.0),
+                    width: px(SCROLLBAR_WIDTH),
+                    height: px(0.0),
+                    border_radius: BorderRadius::all(px(SCROLLBAR_RADIUS)),
+                    ..default()
+                },
+                BackgroundColor(track_bg),
+                ThemeBackgroundColor(tokens::SCROLLBAR_BG),
+                // 轨道不做拾取目标：它和滑块重叠，而 3D 拾取索引的 order 不是
+                // 树序；让滑块独占拾取，拖动才总是命中滑块。
+            ))
+            .with_children(|parent| {
+                thumb = parent
+                    .spawn((
+                        Name::new("picker:scrollbar-thumb"),
+                        PickerScrollbarThumb,
+                        UiNode {
+                            position_type: PositionType::Absolute,
+                            left: px(0.0),
+                            top: px(0.0),
+                            width: percent(100.0),
+                            height: px(0.0),
+                            border_radius: BorderRadius::all(px(SCROLLBAR_RADIUS)),
+                            ..default()
+                        },
+                        BackgroundColor(thumb_bg),
+                        ThemeBackgroundColor(tokens::SCROLLBAR_THUMB),
+                        Pickable::default(),
+                    ))
+                    .id();
+            })
+            .id();
+        track = track_entity;
+    });
+    (track, thumb)
+}
+
+/// 把 picker 滚到 `target`（第几行是窗口第一行），并让选中行留在可见窗口里。
+///
+/// 滚轮/拖滚动条都走这里：窗口动、选中项跟着夹进窗口（滚轮只滚列表不选是
+/// 终端惯例，但我们的选中项必须可见，所以夹住），再把 `Picker.selected` /
+/// `picked` 同步回插件。
+fn apply_scroll(
+    state: &mut PickerInput,
+    picker: &mut Picker,
+    metrics: &PickerScrollMetrics,
+    target: usize,
+) {
+    let visible = metrics.visible.max(1);
+    let total = metrics.total.max(visible);
+    let scroll = target.min(total.saturating_sub(visible));
+    state.scroll = scroll;
+    let last = state.rows.len().saturating_sub(1);
+    if state.selected < scroll {
+        state.selected = scroll;
+    }
+    if state.selected >= scroll.saturating_add(visible) {
+        state.selected = scroll + visible - 1;
+    }
+    state.selected = state.selected.min(last);
+    if let Some(Some(index)) = state.rows.get(state.selected).copied() {
+        picker.selected = index;
+    }
+    let picked = identity_of(state, picker);
+    state.picked = picked;
+}
+
 /// 有 picker 就在条带最右边加一列；没有就关掉。顺便按过滤词和折叠状态算可见行。
 ///
 /// 开：根 `Split::Horizontal` 末尾追加 `Child`（`Picker` 容器 + 列内 `List`，
@@ -663,6 +816,8 @@ pub fn sync_picker(
     mut spawned: ResMut<PanelSpawned>,
     mut state: ResMut<PickerInput>,
     mut queue: ResMut<PickerQueue>,
+    mut metrics: ResMut<PickerScrollMetrics>,
+    mut drag: ResMut<PickerScrollbarDrag>,
     mut tree: Option<ResMut<FrameTree>>,
     set: Option<Res<WorkspaceSet>>,
     mut workspaces: Query<&mut Workspace>,
@@ -700,11 +855,9 @@ pub fn sync_picker(
                 &mut commands,
                 PanelId::Picker,
                 FramePanel::tree(),
-                Look::new(
-                    Color::srgb(0.07, 0.085, 0.12),
-                    Color::srgb(0.95, 0.82, 0.35),
-                    12.0,
-                ),
+                // 和面板同一套 feathers token：pane body 底 + subpane body 边框，
+                // 圆角 PANEL_RADIUS。不再用旧的硬编码深底/黄边。
+                Look::panel(PANEL_BG, PANEL_BORDER),
             );
             // 列表 tile 透明：底色和边框由容器面板给，行只负责文字。
             let list = spawn_panel(
@@ -713,12 +866,20 @@ pub fn sync_picker(
                 FramePanel::tree().layer(1),
                 Look::new(Color::NONE, Color::NONE, 0.0),
             );
+            // 行是 100% 宽：右边 reserve 滚动条的空隙，否则选中行的实心底会盖住
+            // 滑块（feathers listview 的 `ScrollbarGutter` 做同一件事）。
+            commands.entity(list).entry::<UiNode>().and_modify(|mut node| {
+                node.padding.right = px(PANEL_PADDING + SCROLLBAR_GUTTER);
+            });
+            let (scrollbar, scrollbar_thumb) = spawn_scrollbar(&mut commands, list);
             roots.0.insert(PanelId::Picker, column);
             roots.0.insert(PanelId::List, list);
             rows.0.entry(PanelId::List).or_default();
             state.picker = Some(picker_entity);
             state.column = Some(column);
             state.list_panel = Some(list);
+            state.scrollbar = Some(scrollbar);
+            state.scrollbar_thumb = Some(scrollbar_thumb);
             state.filter.clear();
             state.ticked.clear();
             state.touched = false;
@@ -773,6 +934,8 @@ pub fn sync_picker(
                     spawned.forget(id);
                 }
             }
+            *metrics = PickerScrollMetrics::default();
+            *drag = PickerScrollbarDrag::default();
             *state = PickerInput::default();
         }
         (None, None) => {}
@@ -808,11 +971,8 @@ pub fn sync_preview_panel(
                 &mut commands,
                 PanelId::Preview,
                 FramePanel::tree().layer(1),
-                Look::new(
-                    Color::srgb(0.06, 0.07, 0.10),
-                    Color::srgb(0.45, 0.55, 0.75),
-                    10.0,
-                ),
+                // preview 和面板同一套 token（pane body 底 + subpane body 边框）。
+                Look::panel(PANEL_BG, PANEL_BORDER),
             );
             roots.0.insert(PanelId::Preview, panel);
             rows.0.entry(PanelId::Preview).or_default();
@@ -1079,25 +1239,204 @@ pub fn picker_keys(
     }
 }
 
-/// 把当前 picker 画成浮层的行：标题、说明、输入行、列表、键位行。
+/// picker 显示时的滚轮：在 picker 列上滚一格就是列表体滚一行。
+///
+/// 和 `pane::pane_wheel` 一样用 `PointerScroll`（带命中实体），不抢转写的
+/// 滚轮（`pane_wheel` 自己让开 picker）；命中范围是列表 tile / picker 列 /
+/// 列表行 / 滚动条本身。滚动后选中项夹进可见窗口（见 [`apply_scroll`]）。
+pub fn picker_wheel(
+    mut scrolls: MessageReader<PointerScroll>,
+    mut state: ResMut<PickerInput>,
+    metrics: Res<PickerScrollMetrics>,
+    roots: Res<PanelRoots>,
+    layouts: Query<&RowLayout>,
+    bars: Query<(), Or<(With<PickerScrollbar>, With<PickerScrollbarThumb>)>>,
+    mut pickers: Query<&mut Picker>,
+) {
+    let Some(picker_entity) = state.picker else {
+        return;
+    };
+    if metrics.visible == 0 {
+        return;
+    }
+    let Ok(mut picker) = pickers.get_mut(picker_entity) else {
+        return;
+    };
+    let list = roots.entity(PanelId::List);
+    let column = roots.entity(PanelId::Picker);
+    for event in scrolls.read() {
+        if event.y == 0.0 {
+            continue;
+        }
+        let on_picker = list == Some(event.entity)
+            || column == Some(event.entity)
+            || bars.get(event.entity).is_ok()
+            || layouts
+                .get(event.entity)
+                .is_ok_and(|layout| layout.panel == PanelId::List);
+        if !on_picker {
+            continue;
+        }
+        // 滚轮向上（y > 0）看更前面的行。
+        let target = match event.y > 0.0 {
+            true => state.scroll.saturating_sub(1),
+            false => state.scroll.saturating_add(1),
+        };
+        apply_scroll(&mut state, &mut picker, &metrics, target);
+    }
+}
+
+/// 拖滚动条滑块：`PointerDrag::distance` 是从按下点算的总位移（屏幕像素），
+/// 按 [`crate::transcript::ROW_HEIGHT`] 折成行数，从按下时的 `scroll` 起算。
+///
+/// 用消息而不是 observer：`PointerDrag*` 在 bevy_picking 里既 trigger 也
+/// write message，读消息在 headless 测试里能直接写事件模拟。
+pub fn picker_scrollbar_drag(
+    mut starts: MessageReader<PointerDragStart>,
+    mut drags: MessageReader<PointerDrag>,
+    mut drag: ResMut<PickerScrollbarDrag>,
+    mut state: ResMut<PickerInput>,
+    metrics: Res<PickerScrollMetrics>,
+    thumbs: Query<(), With<PickerScrollbarThumb>>,
+    mut pickers: Query<&mut Picker>,
+) {
+    for start in starts.read() {
+        match thumbs.get(start.entity) {
+            Ok(_) => {
+                drag.active = true;
+                drag.origin = state.scroll;
+            }
+            Err(_) => drag.active = false,
+        }
+    }
+    let mut picker = state
+        .picker
+        .and_then(|entity| pickers.get_mut(entity).ok());
+    for event in drags.read() {
+        if !drag.active || thumbs.get(event.entity).is_err() {
+            continue;
+        }
+        let Some(picker) = picker.as_deref_mut() else {
+            drag.active = false;
+            continue;
+        };
+        if metrics.visible == 0 {
+            continue;
+        }
+        let rows = (event.distance.y / crate::transcript::ROW_HEIGHT).round();
+        let target = (drag.origin as f32 + rows).max(0.0) as usize;
+        apply_scroll(&mut state, picker, &metrics, target);
+    }
+}
+
+/// 每帧把滚动条的轨道/滑块摆到「`scroll` / 可见行 / 总行数」对应的位置。
+///
+/// 轨道只覆盖列表体（标题/说明/过滤行下面），高度 = 可见行 ×
+/// [`crate::transcript::ROW_HEIGHT`]；滑块长度按「可见 / 总行数」比例，
+/// `top` 按 `scroll / (总行数 - 可见行数)` 比例。内容放得下时轨道收成 0 高、
+/// 透明（feathers 的 auto-hide 同一效果；3D 镜像不看 `Visibility`，所以用
+/// 几何/透明度表达）。
+pub fn sync_picker_scrollbar(
+    state: Res<PickerInput>,
+    metrics: Res<PickerScrollMetrics>,
+    theme: Option<Res<UiTheme>>,
+    mut tracks: Query<
+        (&mut UiNode, &mut BackgroundColor),
+        (With<PickerScrollbar>, Without<PickerScrollbarThumb>),
+    >,
+    mut thumbs: Query<
+        (&mut UiNode, &mut BackgroundColor),
+        (With<PickerScrollbarThumb>, Without<PickerScrollbar>),
+    >,
+) {
+    if state.picker.is_none() {
+        return;
+    }
+    let theme = crate::theme::ui_theme_or_default(theme.as_deref());
+    let visible = metrics.visible.max(1);
+    let total = metrics.total.max(visible);
+    let scrollable = metrics.visible > 0 && total > metrics.visible;
+    let scroll = state.scroll.min(total.saturating_sub(visible));
+    let row = crate::transcript::ROW_HEIGHT;
+
+    let track_top = PANEL_PADDING + metrics.head as f32 * row;
+    let track_len = match scrollable {
+        true => visible as f32 * row,
+        false => 0.0,
+    };
+    let thumb_len = match scrollable {
+        true => (track_len * visible as f32 / total as f32)
+            .max(SCROLLBAR_MIN_THUMB)
+            .min(track_len),
+        false => 0.0,
+    };
+    let travel = (track_len - thumb_len).max(0.0);
+    let max_scroll = total.saturating_sub(visible);
+    let thumb_top = match scrollable && max_scroll > 0 {
+        true => travel * scroll as f32 / max_scroll as f32,
+        false => 0.0,
+    };
+    let track_bg = match scrollable {
+        true => theme.color(&tokens::SCROLLBAR_BG),
+        false => Color::NONE,
+    };
+    let thumb_bg = match scrollable {
+        true => theme.color(&tokens::SCROLLBAR_THUMB),
+        false => Color::NONE,
+    };
+
+    for (mut node, mut background) in &mut tracks {
+        let (top, height) = (px(track_top), px(track_len));
+        if node.top != top {
+            node.top = top;
+        }
+        if node.height != height {
+            node.height = height;
+        }
+        if background.0 != track_bg {
+            background.0 = track_bg;
+        }
+    }
+    for (mut node, mut background) in &mut thumbs {
+        let (top, height) = (px(thumb_top), px(thumb_len));
+        if node.top != top {
+            node.top = top;
+        }
+        if node.height != height {
+            node.height = height;
+        }
+        if background.0 != thumb_bg {
+            background.0 = thumb_bg;
+        }
+    }
+}
+
+/// 产 picker 列表 tile 的行：标题、说明、输入行、列表、键位行。
+///
+/// 同时把这一帧的滚动窗口（固定行数 / 可见行数 / 总行数）写进
+/// [`PickerScrollMetrics`]，给 `Fit` 里的 [`sync_picker_scrollbar`] 用。
 pub fn picker_rows(
     mut panels: ResMut<PanelRows>,
     mut state: ResMut<PickerInput>,
+    mut metrics: ResMut<PickerScrollMetrics>,
     pickers: Query<&Picker>,
     theme: Res<Theme>,
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
 ) {
     let Some(picker_entity) = state.picker else {
+        *metrics = PickerScrollMetrics::default();
         return;
     };
     let Ok(picker) = pickers.get(picker_entity) else {
+        *metrics = PickerScrollMetrics::default();
         return;
     };
     let Some(area) = roots
         .entity(PanelId::List)
         .and_then(|root| areas.get(root))
     else {
+        *metrics = PickerScrollMetrics::default();
         return;
     };
 
@@ -1169,13 +1508,27 @@ pub fn picker_rows(
     // 选中行下面；窗口把第一行也尽量露出来（`tail`），再大就只保住选中行。
     let more = match (state.more, state.rows.get(state.selected).copied().flatten()) {
         (true, Some(index)) => more_text(&picker, index)
-            .map(|text| more_lines(text, usize::from(area.cols), dim))
+            .map(|text| {
+                // 右侧给滚动条留的空隙也从折行宽度里扣掉，展开的说明不会被滑块裁掉。
+                // 空隙 10px 不到两格；扣掉整格（向下取整），剩下的零头由面板
+                // `cols` 本身向下取整的余量吸收。
+                let gutter = (SCROLLBAR_GUTTER / crate::frame::CELL.x).floor() as usize;
+                more_lines(
+                    text,
+                    usize::from(area.cols).saturating_sub(gutter),
+                    dim,
+                )
+            })
             .unwrap_or_default(),
         _ => Vec::new(),
     };
     let total = state.rows.len() + more.len();
     // 列表体的第一行（rig 的 `scroll`）：选中行一定在窗口里，首尾都夹住。
     let first = scroll_to_selected(&mut state, visible, total, usize::from(!more.is_empty()));
+    // 滚动条要的窗口：上面固定几行、列表体能放几行、总共几行。
+    metrics.head = used;
+    metrics.visible = visible;
+    metrics.total = total;
     let mut drawn = 0usize;
     for (row_index, item_index) in state.rows.iter().enumerate().skip(first) {
         if drawn >= visible {
@@ -1377,13 +1730,21 @@ impl Plugin for PickerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PickerInput>()
             .init_resource::<PickerQueue>()
+            .init_resource::<PickerScrollMetrics>()
+            .init_resource::<PickerScrollbarDrag>()
             .add_message::<ChoiceKeyPressed>()
+            // 滚轮 / 拖滚动条（`add_message` 幂等；最小 App 也能写这些事件）。
+            .add_message::<PointerScroll>()
+            .add_message::<PointerDragStart>()
+            .add_message::<PointerDrag>()
             .add_systems(
                 Update,
                 (
                     sync_picker,
                     sync_preview_panel,
                     picker_keys,
+                    picker_wheel,
+                    picker_scrollbar_drag,
                     mark_highlighted,
                 )
                     .chain()
@@ -1393,6 +1754,11 @@ impl Plugin for PickerPlugin {
                 Update,
                 (picker_rows, preview_rows).in_set(FeathersSystems::Draw),
             )
+            // 滚动条的几何在行列产出之后（Draw）算，`Fit` 里写回 Node。
+            .add_systems(
+                Update,
+                sync_picker_scrollbar.in_set(FeathersSystems::Fit),
+            )
             .add_observer(answer_picker)
             .add_observer(enqueue_picker);
     }
@@ -1401,8 +1767,16 @@ impl Plugin for PickerPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::camera::NormalizedRenderTarget;
     use bevy::input::ButtonState;
     use bevy::input::keyboard::KeyCode;
+    use bevy::input::mouse::MouseScrollUnit;
+    use bevy::input::touch::TouchPhase;
+    use bevy::picking::backend::HitData;
+    use bevy::picking::events::Pointer;
+    use bevy::picking::pointer::{Location, PointerButton, PointerId};
+    use bevy::ui::UiRect;
+    use bevy_feathers::theme::ThemeBorderColor;
 
     use crate::frame::{CELL, CellRect, PanelArea, PanelInset, UNITS_TO_WORLD};
     use crate::niri::TileRect;
@@ -1741,6 +2115,87 @@ mod tests {
         )
     }
 
+    // ---- 滚动条：几何、滚轮、拖动 ----
+
+    fn mouse_pointer() -> Pointer {
+        Pointer::new(
+            PointerId::Mouse,
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1280,
+                    height: 800,
+                },
+                position: Vec2::ZERO,
+            },
+        )
+    }
+
+    /// 往 `entity` 上滚一格：`y > 0` 向上，`y < 0` 向下（和 `pane.rs` 的测试同一手法）。
+    fn wheel_over(app: &mut App, entity: Entity, y: f32) {
+        app.world_mut().write_message(PointerScroll {
+            entity,
+            pointer: mouse_pointer(),
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            phase: TouchPhase::Moved,
+        });
+        app.update();
+    }
+
+    /// 拖滚动条滑块：先发 `PointerDragStart` 再发总位移 `distance` 的 `PointerDrag`。
+    fn drag_thumb(app: &mut App, thumb: Entity, distance_y: f32) {
+        app.world_mut().write_message(PointerDragStart {
+            pointer: mouse_pointer(),
+            entity: thumb,
+            button: PointerButton::Primary,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+        });
+        app.world_mut().write_message(PointerDrag {
+            pointer: mouse_pointer(),
+            entity: thumb,
+            button: PointerButton::Primary,
+            distance: Vec2::new(0.0, distance_y),
+            delta: Vec2::new(0.0, distance_y),
+        });
+        app.update();
+    }
+
+    fn scrollbar_entities(app: &App) -> (Entity, Entity) {
+        let state = app.world().resource::<PickerInput>();
+        (
+            state.scrollbar.expect("滚动条轨道"),
+            state.scrollbar_thumb.expect("滚动条滑块"),
+        )
+    }
+
+    fn node_of(app: &App, entity: Entity) -> UiNode {
+        app.world()
+            .get::<UiNode>(entity)
+            .unwrap_or_else(|| panic!("实体 {entity} 没有 UI Node"))
+            .clone()
+    }
+
+    fn px_value(value: Val) -> f32 {
+        match value {
+            Val::Px(value) => value,
+            other => panic!("期望 px，实际 {other:?}"),
+        }
+    }
+
+    /// 10 项 picker + 只放得下 4 行的列表体（标题 1 行、上下各 2 行固定开销）。
+    fn open_scrolled_picker(app: &mut App) -> Entity {
+        let labels: Vec<String> = (0..10).map(|index| format!("item{index}")).collect();
+        let items: Vec<(&str, Option<&str>)> =
+            labels.iter().map(|label| (label.as_str(), None)).collect();
+        let picker = spawn_picker(app, picker(&items, false));
+        // 9 行 - 2 行面板装饰 = 7 个文字行；列表体 = 7 - 标题 1 - 键位行 2 = 4。
+        give_list_area(app, CellRect::new(64, 0, 32, 9));
+        app.update();
+        picker
+    }
+
     /// 打开 picker：条带最右边多一列（叶子 +1），列宽 1/3、已有列等比缩到 2/3。
     #[test]
     fn opening_a_picker_appends_a_third_width_column_at_the_right() {
@@ -1837,6 +2292,7 @@ mod tests {
         let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
         let (column, list, _) = column_entities(&app);
         let (column, list) = (column.expect("容器"), list.expect("列表"));
+        let (scrollbar, scrollbar_thumb) = scrollbar_entities(&app);
         assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 8);
 
         app.world_mut().entity_mut(picker).despawn();
@@ -1850,6 +2306,17 @@ mod tests {
         assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 7);
         assert!(app.world().get_entity(column).is_err(), "容器已 despawn");
         assert!(app.world().get_entity(list).is_err(), "列表已 despawn");
+        assert!(
+            app.world().get_entity(scrollbar).is_err(),
+            "滚动条随列表 despawn"
+        );
+        assert!(
+            app.world().get_entity(scrollbar_thumb).is_err(),
+            "滑块随列表 despawn"
+        );
+        let state = app.world().resource::<PickerInput>();
+        assert!(state.scrollbar.is_none(), "状态里的滚动条要清掉");
+        assert!(state.scrollbar_thumb.is_none());
         let roots = app.world().resource::<PanelRoots>();
         assert!(roots.entity(PanelId::Picker).is_none());
         assert!(roots.entity(PanelId::List).is_none());
@@ -2073,6 +2540,285 @@ mod tests {
                 .expect("底色")
                 .0,
             normal
+        );
+    }
+
+    // ---- F3：picker chrome / 滚动条 / 行外观 ----
+
+    /// picker 容器和 preview 的底/边框/圆角都来自 feathers token，不再有旧的
+    /// 硬编码深底 + 黄边。
+    #[test]
+    fn the_picker_chrome_comes_from_the_ui_theme_tokens() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, titled_picker("模型", "gpt"));
+        let theme = crate::theme::default_ui_theme();
+        let column = column_entities(&app).0.expect("picker 容器");
+
+        let background = app
+            .world()
+            .get::<ThemeBackgroundColor>(column)
+            .expect("token 底色");
+        assert_eq!(background.0, PANEL_BG, "容器底 = feathers pane body token");
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(column)
+                .expect("底色")
+                .0,
+            theme.color(&PANEL_BG),
+            "实际颜色 == UiTheme.color(PANEL_BG)"
+        );
+        let border = app
+            .world()
+            .get::<ThemeBorderColor>(column)
+            .expect("token 边框");
+        assert_eq!(border.0, PANEL_BORDER, "容器边框 = feathers border token");
+        assert_eq!(
+            app.world().get::<BorderColor>(column).expect("边框").top,
+            theme.color(&PANEL_BORDER),
+            "实际边框色 == UiTheme.color(PANEL_BORDER)"
+        );
+        assert_eq!(
+            node_of(&app, column).border_radius,
+            BorderRadius::all(px(crate::theme::PANEL_RADIUS)),
+            "圆角 == PANEL_RADIUS"
+        );
+
+        // preview 是同一套 token（旧版是硬编码深蓝底 + 蓝边 + 10px 圆角）。
+        app.world_mut()
+            .entity_mut(picker)
+            .insert(PickPreview::Text("hello".to_owned()));
+        app.update();
+        let preview = column_entities(&app).2.expect("preview 面板");
+        assert_eq!(
+            app.world()
+                .get::<ThemeBackgroundColor>(preview)
+                .expect("token 底色")
+                .0,
+            PANEL_BG
+        );
+        assert_eq!(
+            app.world()
+                .get::<ThemeBorderColor>(preview)
+                .expect("token 边框")
+                .0,
+            PANEL_BORDER
+        );
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(preview)
+                .expect("底色")
+                .0,
+            theme.color(&PANEL_BG)
+        );
+        assert_eq!(
+            node_of(&app, preview).border_radius,
+            BorderRadius::all(px(crate::theme::PANEL_RADIUS))
+        );
+    }
+
+    /// 10 项、可见 4 行：滚动条存在，长度/位置按可见比例；PgDn 后滑块跟着走。
+    #[test]
+    fn the_scrollbar_reflects_the_scroll_window_and_pgdn_moves_it() {
+        let mut app = tiled_app();
+        let _picker = open_scrolled_picker(&mut app);
+
+        let metrics = *app.world().resource::<PickerScrollMetrics>();
+        assert_eq!(metrics.visible, 4, "可见 4 行");
+        assert_eq!(metrics.total, 10, "10 项");
+        assert_eq!(metrics.head, 1, "列表体上面只有标题 1 行");
+        assert_eq!(app.world().resource::<PickerInput>().scroll, 0);
+
+        let (track, thumb) = scrollbar_entities(&app);
+        let track_node = node_of(&app, track);
+        assert_eq!(
+            px_value(track_node.height),
+            4.0 * crate::transcript::ROW_HEIGHT,
+            "轨道高度 = 可见行 × 行高"
+        );
+        assert_eq!(
+            px_value(track_node.top),
+            PANEL_PADDING + crate::transcript::ROW_HEIGHT,
+            "轨道从列表体顶开始（标题下面）"
+        );
+        assert_eq!(
+            app.world()
+                .get::<ThemeBackgroundColor>(track)
+                .expect("轨道 token")
+                .0,
+            tokens::SCROLLBAR_BG
+        );
+        assert_eq!(
+            app.world()
+                .get::<ThemeBackgroundColor>(thumb)
+                .expect("滑块 token")
+                .0,
+            tokens::SCROLLBAR_THUMB
+        );
+        let theme = crate::theme::default_ui_theme();
+        let thumb_node = node_of(&app, thumb);
+        let track_len = 4.0 * crate::transcript::ROW_HEIGHT;
+        let want_thumb = track_len * 4.0 / 10.0;
+        assert!(
+            close(px_value(thumb_node.height), want_thumb),
+            "滑块长度 = 轨道 × 可见/总数（{} vs {want_thumb}）",
+            px_value(thumb_node.height)
+        );
+        assert_eq!(px_value(thumb_node.top), 0.0, "顶部时滑块贴轨道顶");
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(thumb)
+                .expect("滑块底色")
+                .0,
+            theme.color(&tokens::SCROLLBAR_THUMB),
+            "滑块颜色 == UiTheme.color(SCROLLBAR_THUMB)"
+        );
+
+        // PgDn：选中第 10 项 → 窗口滚到 6；滑块位置跟着变。
+        press(&mut app, KeyCode::PageDown, Key::PageDown);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 9);
+            assert_eq!(state.scroll, 6);
+        }
+        let thumb_node = node_of(&app, thumb);
+        let travel = track_len - want_thumb;
+        assert!(
+            close(px_value(thumb_node.top), travel),
+            "滚到末尾时滑块贴轨道底（{} vs {travel}）",
+            px_value(thumb_node.top)
+        );
+        // 滑块仍然只有可见比例的长度。
+        assert!(close(px_value(thumb_node.height), want_thumb));
+
+        // PgUp 回到顶部：滑块回顶。
+        press(&mut app, KeyCode::PageUp, Key::PageUp);
+        assert_eq!(app.world().resource::<PickerInput>().scroll, 0);
+        assert_eq!(px_value(node_of(&app, thumb).top), 0.0);
+
+        // 过滤到 1 项（放得下）：滚动条收起（轨道 0 高、透明）。
+        type_text(&mut app, "item0", KeyCode::KeyI);
+        assert_eq!(app.world().resource::<PickerScrollMetrics>().total, 1);
+        let track_node = node_of(&app, track);
+        assert_eq!(px_value(track_node.height), 0.0, "放得下时轨道收成 0 高");
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(track)
+                .expect("轨道底色")
+                .0,
+            Color::NONE,
+            "不可滚时轨道透明（3D 镜像不看 Visibility）"
+        );
+    }
+
+    /// 滚轮在 picker 上滚一格 = 列表体滚一行；选中项始终留在可见窗口里。
+    #[test]
+    fn the_wheel_scrolls_the_picker_and_keeps_the_selection_visible() {
+        let mut app = tiled_app();
+        let _picker = open_scrolled_picker(&mut app);
+        let list = column_entities(&app).1.expect("列表面板");
+        let (_, thumb) = scrollbar_entities(&app);
+        let visible = app.world().resource::<PickerScrollMetrics>().visible;
+
+        // 向下滚一格：窗口到 1，选中项跟着夹进窗口。
+        wheel_over(&mut app, list, -1.0);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.scroll, 1, "滚轮改变 PickerInput.scroll");
+            assert!(
+                (state.scroll..state.scroll + visible).contains(&state.selected),
+                "滚动后选中项仍在可见区：scroll={} selected={}",
+                state.scroll,
+                state.selected
+            );
+        }
+        let track_len = 4.0 * crate::transcript::ROW_HEIGHT;
+        let thumb_len = track_len * 4.0 / 10.0;
+        let travel = track_len - thumb_len;
+        assert!(
+            close(px_value(node_of(&app, thumb).top), travel / 6.0),
+            "滑块位置跟着 scroll 走"
+        );
+
+        // 向上滚一格回顶部。
+        wheel_over(&mut app, list, 1.0);
+        assert_eq!(app.world().resource::<PickerInput>().scroll, 0);
+        let state = app.world().resource::<PickerInput>();
+        assert!(
+            (state.scroll..state.scroll + visible).contains(&state.selected),
+            "回滚后选中项仍可见"
+        );
+    }
+
+    /// 拖滚动条滑块：位移按行高折成行数，滚动量跟着变，选中项留在可见区。
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_the_picker() {
+        let mut app = tiled_app();
+        let _picker = open_scrolled_picker(&mut app);
+        let (_, thumb) = scrollbar_entities(&app);
+        let visible = app.world().resource::<PickerScrollMetrics>().visible;
+
+        // 往下拖 2 行。
+        drag_thumb(&mut app, thumb, 2.0 * crate::transcript::ROW_HEIGHT);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.scroll, 2, "拖滑块改变 PickerInput.scroll");
+            assert!(
+                (state.scroll..state.scroll + visible).contains(&state.selected),
+                "拖动后选中项仍在可见区：scroll={} selected={}",
+                state.scroll,
+                state.selected
+            );
+        }
+        let track_len = 4.0 * crate::transcript::ROW_HEIGHT;
+        let thumb_len = track_len * 4.0 / 10.0;
+        let travel = track_len - thumb_len;
+        assert!(
+            close(px_value(node_of(&app, thumb).top), travel * 2.0 / 6.0),
+            "滑块位置跟 PickerInput.scroll 同步"
+        );
+
+        // 拖过头：夹在末尾（scroll=6），滑块贴轨道底。
+        drag_thumb(&mut app, thumb, 50.0 * crate::transcript::ROW_HEIGHT);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.scroll, 6, "夹在最后一屏");
+            assert!((state.scroll..state.scroll + visible).contains(&state.selected));
+        }
+        assert!(close(px_value(node_of(&app, thumb).top), travel));
+    }
+
+    /// 列表条目行沿用 F2 的按钮几何：圆角 4、水平内边距 8、占满行宽；
+    /// 列表根给滚动条留出右侧空隙，行不会被滑块盖住。
+    #[test]
+    fn picker_item_rows_keep_the_f2_button_geometry() {
+        let mut app = tiled_app_with_rows();
+        spawn_picker(&mut app, picker(&[("gpt", None), ("claude", None)], false));
+        let list = give_list_an_area(&mut app);
+        app.update();
+
+        let row = spawned_list_rows(&app)
+            .into_iter()
+            .find(|entity| app.world().get::<PickerChoice>(*entity).is_some())
+            .expect("条目行");
+        let node = node_of(&app, row);
+        assert_eq!(
+            node.border_radius,
+            BorderRadius::all(px(crate::transcript::ROW_BUTTON_RADIUS)),
+            "条目行圆角 == F2 按钮的 4"
+        );
+        assert_eq!(
+            node.padding,
+            UiRect::horizontal(px(crate::transcript::ROW_BUTTON_PADDING)),
+            "条目行水平内边距 == F2 按钮的 8"
+        );
+        assert_eq!(node.width, percent(100.0), "条目行占满行宽");
+
+        // 列表根右边 reserve 滚动条空隙（feathers listview 的 gutter）。
+        let list_node = node_of(&app, list);
+        assert_eq!(
+            list_node.padding.right,
+            px(PANEL_PADDING + SCROLLBAR_GUTTER),
+            "行宽让出滚动条，滑块不会被选中行的底色盖住"
         );
     }
 

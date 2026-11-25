@@ -115,6 +115,31 @@ pub const FOCUS_BORDER: ThemeToken = tokens::FOCUS_RING;
 /// 等 feathers 出圆角 token 时只改这里。
 pub const PANEL_RADIUS: f32 = 4.0;
 
+// ---------------------------------------------------------------------------
+// 滚动条：feathers `controls::scrollbar` / `listview` 的几何常量
+// ---------------------------------------------------------------------------
+//
+// feathers 的滚动条是**纯 Node**（`BackgroundColor` + `BorderRadius`，没有图片/
+// 图标），3D 镜像能画；但它的滑块同步绑在 `ScrollPosition` + `ComputedNode` 的
+// 真实内容高度上。picker 的列表是**窗口化**的（只生成可见行，滚动量在
+// `PickerInput.scroll`），没有那份真实内容高度，所以 picker 用同一套 token /
+// 几何常量自己驱动滑块（见 `picker::sync_picker_scrollbar`）。这几个值照抄
+// feathers 的 listview：轨道 6px、离右缘 4px、圆角 3px、滑块最短 8px。
+
+/// 滚动条轨道宽度（feathers `listview` 的 `width: px(6)`）。
+pub const SCROLLBAR_WIDTH: f32 = 6.0;
+/// 滚动条离列表右缘的距离（feathers `listview` 的 `right: px(4)`）。
+pub const SCROLLBAR_INSET: f32 = 4.0;
+/// 滚动条（轨道和滑块）的圆角（feathers scrollbar scene 的 3px）。
+pub const SCROLLBAR_RADIUS: f32 = 3.0;
+/// 滑块最短长度（feathers scrollbar scene 的 `min_thumb_length: 8.0`）。
+pub const SCROLLBAR_MIN_THUMB: f32 = 8.0;
+/// 列表右边要给滚动条多留的空隙（轨道 + 靠右的间距；左边由面板内边距给）。
+///
+/// 行是 100% 宽，不 reserve 的话选中行的实心底会盖住滑块；feathers 的
+/// `listview` 用 `ScrollbarGutter` 做同一件事。
+pub const SCROLLBAR_GUTTER: f32 = SCROLLBAR_WIDTH + SCROLLBAR_INSET;
+
 /// 一份 feathers 标准暗色主题（`dark_theme::create_dark_theme`）。
 ///
 /// `FeathersViewPlugin` 用它初始化 `UiTheme`；没有 UI 库/没插资源的最小 App
@@ -632,6 +657,28 @@ mod tests {
         assert_ne!(theme.color(&BAR_BG), theme.color(&PANEL_BG));
         // 输入框（field 底）比面板体亮一档。
         assert_ne!(theme.color(&INPUT_BG), theme.color(&PANEL_BG));
+    }
+
+    /// 滚动条的几何常量照 feathers `listview` / scrollbar scene 的值；
+    /// `SCROLLBAR_BG` / `SCROLLBAR_THUMB` 在 feathers 暗色主题里都查得到。
+    #[test]
+    fn scrollbar_geometry_matches_the_feathers_scene() {
+        assert_eq!(SCROLLBAR_WIDTH, 6.0, "feathers listview 的轨道宽");
+        assert_eq!(SCROLLBAR_INSET, 4.0, "feathers listview 的 right: 4");
+        assert_eq!(SCROLLBAR_RADIUS, 3.0, "feathers scrollbar scene 的圆角");
+        assert_eq!(SCROLLBAR_MIN_THUMB, 8.0, "feathers min_thumb_length");
+        assert_eq!(SCROLLBAR_GUTTER, SCROLLBAR_WIDTH + SCROLLBAR_INSET);
+
+        let theme = dark_ui_theme();
+        let error: Color = bevy::color::palettes::basic::FUCHSIA.into();
+        for token in [tokens::SCROLLBAR_BG, tokens::SCROLLBAR_THUMB] {
+            assert_ne!(theme.color(&token), error, "{token} 没有在主题里赋值");
+        }
+        assert_ne!(
+            theme.color(&tokens::SCROLLBAR_BG),
+            theme.color(&tokens::SCROLLBAR_THUMB),
+            "轨道和滑块不是同一个颜色"
+        );
     }
 
     /// 没有 `UiTheme` 时退到 feathers 暗色主题；有资源时用资源的颜色。
