@@ -20,8 +20,9 @@ pub use pick::{PanelPickIndex, PickRect};
 pub use sort::{PanelSort, SORT_STEP};
 pub use text3d::{GlyphMaterials, GlyphMeshChild, PanelTextMeshes, TextDirty, mark_text_dirty, sync_panel_text};
 pub use world3d::{
-    ClipUniform, LAYER_BIAS, MirrorRoot, PanelNode, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL,
-    effective_clip, panel_world_rect, sync_mirror,
+    ClipUniform, LAYER_BIAS, MirrorRoot, PanelImageNode, PanelNode, WorldLayer, WorldPanel,
+    Z_BIAS_PER_LEVEL, effective_clip, image_quad_rect, image_tint, image_uv_rect,
+    panel_world_rect, sync_mirror, tint_sample, uv_lookup,
 };
 
 use bevy::prelude::*;

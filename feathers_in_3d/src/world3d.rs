@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy_luma::engine::layout::render::material_3d::UNodeMaterial3d;
 use bevy_ui::{
     BackgroundColor, BorderColor, ComputedNode, Node, Outline, ResolvedBorderRadius,
-    UiGlobalTransform,
+    UiGlobalTransform, widget::ImageNode,
 };
 
 use crate::sort::{PanelSort, SORT_STEP};
@@ -175,6 +175,96 @@ pub struct MirrorOutline {
     pub color: Vec4,
 }
 
+/// One mirrored [`ImageNode`] texture quad.
+///
+/// [`ImageNode`] is a *separate* quad from the node's fill, not a flag on
+/// [`PanelNode`]: a feathers icon button usually has a transparent background
+/// and an image above it, and a text row can have both. The quad is a child of
+/// the UI node (so it inherits the node's transform), reuses the node's
+/// `UNodeMaterial3d` texture path and the same `clip_*` uniforms as the fill.
+#[derive(Component)]
+pub struct PanelImageNode {
+    pub mesh: Handle<Mesh>,
+    pub material: Handle<UNodeMaterial3d>,
+    pub cached_size: Vec2,
+    /// `ImageNode::color` as a linear tint (multiplied with the texel in the shader).
+    pub cached_color: Vec4,
+    pub cached_radius: Vec4,
+    /// `(u0, v0, u1, v1)` written to the material's `uv_rect`.
+    pub cached_uv: Vec4,
+    pub cached_texture: AssetId<Image>,
+    /// 上次写进材质的裁剪 uniform（和 [`PanelNode::cached_clip`] 同口径）。
+    pub cached_clip: Option<ClipUniform>,
+}
+
+/// UV rect `(u0, v0, u1, v1)` for an [`ImageNode`]'s texture lookup.
+///
+/// `rect` is `ImageNode::rect` in **texture pixels** (top-left origin), so it is
+/// normalised by the texture size. `flip_x`/`flip_y` swap the U/V ends; the
+/// shader then does `mix(xy, zw, body_uv)`, which flips the sampled image but
+/// leaves the SDF geometry (which uses the same `body_uv`) untouched.
+///
+/// A missing/invalid rect or texture size falls back to the full `0..1` texture;
+/// zero-size rectangles never panic.
+pub fn image_uv_rect(
+    rect: Option<Rect>,
+    texture_size: Vec2,
+    flip_x: bool,
+    flip_y: bool,
+) -> Vec4 {
+    let mut uv = match rect {
+        Some(rect)
+            if texture_size.x > 0.0
+                && texture_size.y > 0.0
+                && rect.width() > 0.0
+                && rect.height() > 0.0 =>
+        {
+            Vec4::new(
+                (rect.min.x / texture_size.x).clamp(0.0, 1.0),
+                (rect.min.y / texture_size.y).clamp(0.0, 1.0),
+                (rect.max.x / texture_size.x).clamp(0.0, 1.0),
+                (rect.max.y / texture_size.y).clamp(0.0, 1.0),
+            )
+        }
+        _ => Vec4::new(0.0, 0.0, 1.0, 1.0),
+    };
+    if flip_x {
+        uv = Vec4::new(uv.z, uv.y, uv.x, uv.w);
+    }
+    if flip_y {
+        uv = Vec4::new(uv.x, uv.w, uv.z, uv.y);
+    }
+    uv
+}
+
+/// `ImageNode::color` as the material's linear tint.
+pub fn image_tint(color: Color) -> Vec4 {
+    LinearRgba::from(color).to_vec4()
+}
+
+/// The shader's texture tint: `sample * tint` (kept as a pure function so the
+/// CPU-side contract is testable without a GPU).
+pub fn tint_sample(texture_sample: Vec4, tint: Vec4) -> Vec4 {
+    texture_sample * tint
+}
+
+/// `mix(uv_rect.xy, uv_rect.zw, uv)` — the shader's `uv_rect` lookup.
+pub fn uv_lookup(uv_rect: Vec4, uv: Vec2) -> Vec2 {
+    uv_rect.xy() + (uv_rect.zw() - uv_rect.xy()) * uv
+}
+
+/// World-space rectangle of an image quad, or `None` when the node has no area
+/// (zero/negative/non-finite size or centre). No panic path.
+pub fn image_quad_rect(center: Vec2, size_world: Vec2) -> Option<Rect> {
+    if !center.is_finite() || !size_world.is_finite() {
+        return None;
+    }
+    if size_world.x <= 0.0 || size_world.y <= 0.0 {
+        return None;
+    }
+    Some(Rect::from_center_size(center, size_world))
+}
+
 /// 节点四角圆角（物理像素）→ 世界米；顺序与材质 uniform 一致。
 fn radius_to_world(
     radius: &ResolvedBorderRadius,
@@ -228,9 +318,14 @@ pub fn sync_mirror(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<UNodeMaterial3d>>,
+    images: Res<Assets<Image>>,
     panels: Query<(Entity, &WorldPanel, Option<&WorldLayer>), With<MirrorRoot>>,
     mut existing: Query<&mut PanelNode>,
-    mut outlines: Query<(Entity, &mut PanelOutlineNode, &mut PanelSort)>,
+    mut outlines: Query<(Entity, &mut PanelOutlineNode, &mut PanelSort), Without<PanelImageNode>>,
+    mut image_quads: Query<
+        (Entity, &ChildOf, &mut PanelImageNode, &mut PanelSort),
+        Without<PanelOutlineNode>,
+    >,
     all_nodes: Query<
         (
             Entity,
@@ -239,6 +334,7 @@ pub fn sync_mirror(
             Option<&BackgroundColor>,
             Option<&BorderColor>,
             Option<&Outline>,
+            Option<&ImageNode>,
         ),
         With<Node>,
     >,
@@ -254,7 +350,7 @@ pub fn sync_mirror(
         .map(|(e, p, layer)| {
             let inverse_scale_factor = all_nodes
                 .get(e)
-                .map_or(1.0, |(_, cn, _, _, _, _)| cn.inverse_scale_factor);
+                .map_or(1.0, |(_, cn, _, _, _, _, _)| cn.inverse_scale_factor);
             (
                 e,
                 (
@@ -275,8 +371,11 @@ pub fn sync_mirror(
     // transcript needs once it scrolls. A panel may additionally carry a strip viewport
     // (`WorldPanel::clip`, world-axis-aligned); the effective clip is the intersection.
     let mut panel_clip: HashMap<Entity, ClipUniform> = HashMap::new();
+    // 面板可见区（世界矩形 ∩ `WorldPanel::clip`）：`ImageNode` 的四边形只在
+    // 与它相交时生成；完全滚出去/被裁掉的图片不占实体。
+    let mut panel_visible: HashMap<Entity, Rect> = HashMap::new();
     for root in panel_map.keys() {
-        let Ok((_, cn, _, _, _, _)) = all_nodes.get(*root) else {
+        let Ok((_, cn, _, _, _, _, _)) = all_nodes.get(*root) else {
             continue;
         };
         let (units, anchor, _, inverse_scale_factor, clip) = panel_map
@@ -286,6 +385,10 @@ pub fn sync_mirror(
         // bounds are in the *clip space* the shader works in: metres, not UI pixels
         let half = physical_size_to_world(cn.size * 0.5, inverse_scale_factor, units);
         panel_clip.insert(*root, panel_clip_uniform(&anchor, half, clip));
+        panel_visible.insert(
+            *root,
+            effective_clip(panel_world_rect(&anchor, half * 2.0), clip),
+        );
     }
 
     // Depth-first pre-order gives every node a painter index: a node always comes
@@ -323,6 +426,13 @@ pub fn sync_mirror(
         }
     }
 
+    // 图片 quad 同理：一个节点最多一个 `ImageNode`，先收 owner -> quad；
+    // 这一帧没被认领的（图片被移除、资产没加载、节点被裁掉）在末尾 despawn。
+    let mut image_of: HashMap<Entity, Entity> = HashMap::new();
+    for (image_entity, child_of, _, _) in image_quads.iter() {
+        image_of.insert(child_of.parent(), image_entity);
+    }
+
     for (node, (panel_root, depth, order)) in in_panel.iter() {
         let Some((units_to_world, anchor, layer, inverse_scale_factor, _)) =
             panel_map.get(panel_root).copied()
@@ -330,8 +440,12 @@ pub fn sync_mirror(
             continue;
         };
         let clip = panel_clip.get(panel_root).copied();
+        let visible = panel_visible
+            .get(panel_root)
+            .copied()
+            .unwrap_or(Rect::EMPTY);
         let layer_bias = layer as f32 * LAYER_BIAS;
-        let Ok((entity, cn, ugt, bg, border_color, outline)) = all_nodes.get(*node) else {
+        let Ok((entity, cn, ugt, bg, border_color, outline, image)) = all_nodes.get(*node) else {
             continue;
         };
 
@@ -350,7 +464,7 @@ pub fn sync_mirror(
 
         let parent_centre_offset = match parents.get(entity) {
             Ok(child_of) => match all_nodes.get(child_of.parent()) {
-                Ok((_, _, pugt, _, _, _)) => {
+                Ok((_, _, pugt, _, _, _, _)) => {
                     ugt.affine().translation - pugt.affine().translation
                 }
                 Err(_) => Vec2::ZERO,
@@ -472,6 +586,139 @@ pub fn sync_mirror(
             }
         }
 
+        // `ImageNode` 镜像是节点**上**的另一张四边形（和 Outline 一样不塞进
+        // 节点自己的填充材质）：feathers 的图标按钮通常没有底色，转写/对话里
+        // 的截图也可能落在有底色的行上。它挂在节点下，所以继承节点的 Transform；
+        // 材质复用 `UNodeMaterial3d` 的 `texture` + `uv_rect`，并共用同一套
+        // `clip_*` uniform（面板自身裁剪 + `WorldPanel::clip` 都生效）。
+        //
+        // 资产还没加载、tint 全透明、尺寸为 0、或四边形完全离开可见区时这一帧
+        // 不生成（已存在的由末尾的“未认领”清理拆掉）；加载后下一帧 `sync_mirror`
+        // 再看到 `Assets<Image>` 就会补上，不需要额外的 AssetEvent。
+        let wanted_image = image.and_then(|image_node| {
+            let texture = image_node.image.clone();
+            let texture_size = images.get(&texture)?.size().as_vec2();
+            let tint = image_tint(image_node.color);
+            if tint.w <= 0.0 {
+                return None;
+            }
+            let root_ugt = all_nodes
+                .get(*panel_root)
+                .map(|(_, _, root_ugt, _, _, _, _)| *root_ugt)
+                .unwrap_or_default();
+            // 节点中心相对面板中心（物理像素）→ 面板局部米 → 世界（anchor 的
+            // 旋转/缩放由矩阵带上）。UI y 朝下，世界 y 朝上。
+            let offset_px = ugt.affine().translation - root_ugt.affine().translation;
+            let centre = anchor
+                .to_matrix()
+                .transform_point3(Vec3::new(offset_px.x, -offset_px.y, 0.0) * units_to_world)
+                .truncate();
+            let rect = image_quad_rect(centre, size_world)?;
+            if visible.intersect(rect).is_empty() {
+                return None;
+            }
+            let uv = image_uv_rect(
+                image_node.rect,
+                texture_size,
+                image_node.flip_x,
+                image_node.flip_y,
+            );
+            Some((texture, uv, tint))
+        });
+        if let Some((texture, uv, tint)) = wanted_image {
+            // 填充在 `order`、图片 +0.25、Outline +0.5；文字在整块面板之后。
+            let bias = layer_bias + *order as f32 * SORT_STEP + SORT_STEP * 0.25;
+            let radius =
+                radius_to_world(&cn.border_radius, inverse_scale_factor, units_to_world);
+            match image_of.remove(&entity) {
+                Some(image_entity) => {
+                    if let Ok((_, _, mut node3d, mut sort)) = image_quads.get_mut(image_entity) {
+                        sort.center = anchor.translation;
+                        sort.bias = bias;
+                        if node3d.cached_size != size_world {
+                            let mesh = meshes.add(Rectangle::new(size_world.x, size_world.y));
+                            node3d.mesh = mesh.clone();
+                            node3d.cached_size = size_world;
+                            commands.entity(image_entity).insert(Mesh3d(mesh));
+                        }
+                        if node3d.cached_color != tint
+                            || node3d.cached_radius != radius
+                            || node3d.cached_uv != uv
+                            || node3d.cached_texture != texture.id()
+                            || node3d.cached_clip != clip
+                        {
+                            if let Some(mut mat) = materials.get_mut(&node3d.material) {
+                                apply_panel_clip(&mut mat, clip.as_ref());
+                                mat.color = tint;
+                                mat.radius = radius;
+                                mat.border_color = Vec4::ZERO;
+                                mat.size = size_world;
+                                mat.border_width = 0.0;
+                                mat.softness = 1.0e-5;
+                                mat.use_texture = 1;
+                                mat.texture = Some(texture.clone());
+                                mat.uv_rect = uv;
+                                node3d.cached_color = tint;
+                                node3d.cached_radius = radius;
+                                node3d.cached_uv = uv;
+                                node3d.cached_texture = texture.id();
+                                node3d.cached_clip = clip;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let (clip_row0, clip_row1, clip_half) =
+                        clip.unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
+                    let material = UNodeMaterial3d {
+                        clip_inv_x: [clip_row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                        clip_inv_y: [clip_row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
+                        clip_bounds: [
+                            Vec4::new(clip_half.x, clip_half.y, 1.0, 0.0),
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                            Vec4::ZERO,
+                        ],
+                        // 贴图 × tint；SDF 仍按节点圆角/尺寸裁剪。
+                        color: tint,
+                        radius,
+                        border_color: Vec4::ZERO,
+                        size: size_world,
+                        border_width: 0.0,
+                        softness: 1.0e-5,
+                        roughness: 0.55,
+                        use_texture: 1,
+                        texture: Some(texture.clone()),
+                        uv_rect: uv,
+                        ..default()
+                    };
+                    let mesh = meshes.add(Rectangle::new(size_world.x, size_world.y));
+                    let material = materials.add(material);
+                    commands.spawn((
+                        PanelImageNode {
+                            mesh: mesh.clone(),
+                            material: material.clone(),
+                            cached_size: size_world,
+                            cached_color: tint,
+                            cached_radius: radius,
+                            cached_uv: uv,
+                            cached_texture: texture.id(),
+                            cached_clip: clip,
+                        },
+                        Mesh3d(mesh),
+                        MeshMaterial3d(material),
+                        // 挂在节点下、零位移：正好覆盖节点矩形。
+                        Transform::default(),
+                        ChildOf(entity),
+                        PanelSort {
+                            center: anchor.translation,
+                            bias,
+                        },
+                    ));
+                }
+            }
+        }
+
         if !has_fill {
             continue;
         }
@@ -563,6 +810,10 @@ pub fn sync_mirror(
     // 这一帧没认领的环（焦点走了 / 颜色变 NONE / 节点不再要 Outline）：拆掉。
     for (_, outline_entity) in outline_of {
         commands.entity(outline_entity).despawn();
+    }
+    // 没认领的图片 quad（资产缺失/被移除、节点被裁掉、ImageNode 被移除）：拆掉。
+    for (_, image_entity) in image_of {
+        commands.entity(image_entity).despawn();
     }
 }
 
@@ -753,6 +1004,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(Assets::<UNodeMaterial3d>::default());
+        world.insert_resource(Assets::<Image>::default());
 
         let panel = world
             .spawn((
@@ -846,6 +1098,317 @@ mod tests {
         );
     }
 
+    // ---- ImageNode 镜像（feathers 图标 / 对话里的截图） ----
+
+    /// 找出挂在 `owner` 下面的图片 quad（最多一个）。
+    fn image_quad_entity(world: &World, owner: Entity) -> Option<Entity> {
+        world
+            .get::<Children>(owner)?
+            .iter()
+            .find(|child| world.get::<PanelImageNode>(*child).is_some())
+    }
+
+    /// `ImageNode::rect` 归一到 0..1，`flip_x`/`flip_y` 交换 UV 两端；
+    /// shader 的 `mix(xy, zw, body_uv)` 就是 [`uv_lookup`]。
+    #[test]
+    fn image_uv_rect_crops_and_flips_the_texture_lookup() {
+        let size = Vec2::new(64.0, 32.0);
+
+        let full = image_uv_rect(None, size, false, false);
+        assert_eq!(full, Vec4::new(0.0, 0.0, 1.0, 1.0));
+        assert_eq!(uv_lookup(full, Vec2::ZERO), Vec2::ZERO);
+        assert_eq!(uv_lookup(full, Vec2::ONE), Vec2::ONE);
+
+        // 翻转只交换 U/V 两端：几何（body_uv）不变，采样反向。
+        let flip_x = image_uv_rect(None, size, true, false);
+        assert_eq!(flip_x, Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(
+            uv_lookup(flip_x, Vec2::new(0.0, 0.5)),
+            Vec2::new(1.0, 0.5)
+        );
+        assert_eq!(
+            uv_lookup(flip_x, Vec2::new(1.0, 0.5)),
+            Vec2::new(0.0, 0.5)
+        );
+
+        let flip_y = image_uv_rect(None, size, false, true);
+        assert_eq!(flip_y, Vec4::new(0.0, 1.0, 1.0, 0.0));
+        let both = image_uv_rect(None, size, true, true);
+        assert_eq!(both, Vec4::new(1.0, 1.0, 0.0, 0.0));
+
+        // rect 单位是纹理像素，按纹理尺寸归一化。
+        let crop = image_uv_rect(Some(Rect::new(16.0, 8.0, 48.0, 24.0)), size, false, false);
+        assert_eq!(crop, Vec4::new(0.25, 0.25, 0.75, 0.75));
+        let crop_flip = image_uv_rect(Some(Rect::new(16.0, 8.0, 48.0, 24.0)), size, true, true);
+        assert_eq!(crop_flip, Vec4::new(0.75, 0.75, 0.25, 0.25));
+
+        // 空 rect / 零纹理尺寸：退回整张纹理，不 panic。
+        let empty = Some(Rect::new(5.0, 5.0, 5.0, 5.0));
+        assert_eq!(image_uv_rect(empty, size, false, false), full);
+        assert_eq!(image_uv_rect(empty, Vec2::ZERO, false, false), full);
+    }
+
+    /// 材质 tint 与纹理采样逐分量相乘（shader 里的 `tex_sample * body_color`）。
+    #[test]
+    fn image_tint_multiplies_the_texture_sample() {
+        let white = image_tint(Color::WHITE);
+        assert_eq!(white, LinearRgba::from(Color::WHITE).to_vec4());
+        assert_eq!(tint_sample(Vec4::ONE, white), Vec4::ONE);
+
+        let tint = image_tint(Color::srgba(0.5, 0.25, 1.0, 0.5));
+        let texel = Vec4::new(0.8, 0.4, 0.2, 0.6);
+        assert_eq!(tint_sample(texel, tint), texel * tint);
+        assert_eq!(
+            tint_sample(texel, tint).w,
+            texel.w * LinearRgba::from(Color::srgba(0.5, 0.25, 1.0, 0.5)).alpha
+        );
+    }
+
+    /// 零/负/NaN 尺寸给出 `None`；矩形与可见区无交集时不生成。
+    #[test]
+    fn image_quad_rect_rejects_degenerate_geometry_without_panicking() {
+        assert!(image_quad_rect(Vec2::ZERO, Vec2::ZERO).is_none());
+        assert!(image_quad_rect(Vec2::ZERO, Vec2::new(0.0, 1.0)).is_none());
+        assert!(image_quad_rect(Vec2::ZERO, Vec2::new(-1.0, 1.0)).is_none());
+        assert!(image_quad_rect(Vec2::new(f32::NAN, 0.0), Vec2::ONE).is_none());
+        assert!(image_quad_rect(Vec2::ZERO, Vec2::new(f32::INFINITY, 1.0)).is_none());
+
+        let rect = image_quad_rect(Vec2::new(1.0, 2.0), Vec2::new(4.0, 6.0)).expect("有面积");
+        assert_eq!(rect, Rect::new(-1.0, -1.0, 3.0, 5.0));
+        assert!(
+            rect.intersect(Rect::new(10.0, 10.0, 11.0, 11.0)).is_empty(),
+            "离屏：与可见区无交集"
+        );
+        assert!(!rect.intersect(Rect::new(0.0, 0.0, 1.0, 1.0)).is_empty());
+    }
+
+    /// 组件级：`ImageNode` 生成一张带贴图的 quad（材质里 texture/uv_rect/tint/
+    /// clip 都在）；资产缺失时跳过，资产插回来后下一帧补上，再删掉又收起。
+    #[test]
+    fn sync_mirror_spawns_a_textured_quad_when_the_image_asset_is_loaded() {
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<UNodeMaterial3d>::default());
+        world.insert_resource(Assets::<Image>::default());
+
+        // 模拟“图片还在加载”：handle 已存在，但 `Assets<Image>` 里没有。
+        let texture = {
+            let mut images = world.resource_mut::<Assets<Image>>();
+            let handle = images.add(Image::default());
+            images.remove(handle.id());
+            handle
+        };
+
+        let panel = world
+            .spawn((
+                MirrorRoot,
+                WorldPanel {
+                    units_to_world: UNITS,
+                    anchor: Transform::default(),
+                    clip: None,
+                },
+                WorldLayer(0),
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(200.0, 100.0),
+                    ..default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+
+        let icon = world
+            .spawn((
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(64.0, 64.0),
+                    ..default()
+                },
+                UiGlobalTransform::from_translation(Vec2::new(10.0, 20.0)),
+                ImageNode {
+                    image: texture.clone(),
+                    color: Color::WHITE,
+                    flip_x: true,
+                    ..default()
+                },
+                ChildOf(panel),
+            ))
+            .id();
+
+        // 资产没加载：不生成 quad（也没有 panic）。
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(
+            image_quad_entity(&world, icon).is_none(),
+            "Image 资产缺失时先跳过"
+        );
+
+        // 加载完成后（同一帧之后的下一次 sync）补上。
+        world
+            .resource_mut::<Assets<Image>>()
+            .insert(texture.id(), Image::default())
+            .unwrap();
+        world.run_system_once(sync_mirror).unwrap();
+        let quad = image_quad_entity(&world, icon).expect("资产加载后生成 quad");
+        let node3d = world.get::<PanelImageNode>(quad).expect("quad 数据");
+        assert!(
+            (node3d.cached_size - Vec2::splat(64.0) * UNITS).length() < 1e-9,
+            "quad 尺寸 = 节点世界尺寸：{:?}",
+            node3d.cached_size
+        );
+        assert_eq!(
+            node3d.cached_uv,
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+            "flip_x 翻 U"
+        );
+        assert_eq!(node3d.cached_texture, texture.id());
+        {
+            let materials = world.resource::<Assets<UNodeMaterial3d>>();
+            let material = materials.get(&node3d.material).expect("图片材质");
+            assert_eq!(material.use_texture, 1);
+            assert_eq!(material.texture.as_ref(), Some(&texture));
+            assert_eq!(material.uv_rect, Vec4::new(1.0, 0.0, 0.0, 1.0));
+            assert_eq!(material.color, LinearRgba::from(Color::WHITE).to_vec4());
+            assert!(
+                (material.size - Vec2::splat(64.0) * UNITS).length() < 1e-9,
+                "材质尺寸 = 节点世界尺寸"
+            );
+            // 复用面板裁剪：200x100 面板的半尺寸（世界米），active = 1。
+            assert!(
+                (material.clip_bounds[0] - Vec4::new(100.0 * UNITS, 50.0 * UNITS, 1.0, 0.0))
+                    .length()
+                    < 1e-6,
+                "图片 quad 与节点共用 panel_clip_uniform：{:?}",
+                material.clip_bounds[0]
+            );
+        }
+
+        // 改 flip_y + tint：复用同一实体/材质，uniform 跟上。
+        {
+            let mut image = world.get_mut::<ImageNode>(icon).expect("ImageNode");
+            image.flip_x = false;
+            image.flip_y = true;
+            image.color = Color::srgb(0.5, 0.25, 1.0);
+        }
+        world.run_system_once(sync_mirror).unwrap();
+        assert_eq!(
+            image_quad_entity(&world, icon),
+            Some(quad),
+            "样式变化复用 quad"
+        );
+        let node3d = world.get::<PanelImageNode>(quad).expect("quad 数据");
+        assert_eq!(node3d.cached_uv, Vec4::new(0.0, 1.0, 1.0, 0.0));
+        assert_eq!(
+            node3d.cached_color,
+            LinearRgba::from(Color::srgb(0.5, 0.25, 1.0)).to_vec4()
+        );
+
+        // 资产被卸掉：quad 收起，不 panic。
+        world.resource_mut::<Assets<Image>>().remove(texture.id());
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(
+            image_quad_entity(&world, icon).is_none(),
+            "资产移除后 quad 收起"
+        );
+    }
+
+    /// 零尺寸的 `ImageNode` 不生成 quad，也不会 panic。
+    #[test]
+    fn sync_mirror_skips_a_zero_sized_image_node() {
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<UNodeMaterial3d>::default());
+        world.insert_resource(Assets::<Image>::default());
+
+        let texture = world
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+
+        let panel = world
+            .spawn((
+                MirrorRoot,
+                WorldPanel {
+                    units_to_world: UNITS,
+                    anchor: Transform::default(),
+                    clip: None,
+                },
+                WorldLayer(0),
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(200.0, 100.0),
+                    ..default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+
+        let icon = world
+            .spawn((
+                Node::default(),
+                ComputedNode::default(),
+                UiGlobalTransform::from_translation(Vec2::new(10.0, 20.0)),
+                ImageNode::new(texture),
+                ChildOf(panel),
+            ))
+            .id();
+
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(
+            image_quad_entity(&world, icon).is_none(),
+            "零尺寸节点不生成图片 quad"
+        );
+    }
+
+    /// 完全离开面板可见区的 `ImageNode` 不生成 quad（不 panic）。
+    #[test]
+    fn sync_mirror_skips_an_image_node_outside_the_visible_panel() {
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<UNodeMaterial3d>::default());
+        world.insert_resource(Assets::<Image>::default());
+
+        let texture = world
+            .resource_mut::<Assets<Image>>()
+            .add(Image::default());
+
+        let panel = world
+            .spawn((
+                MirrorRoot,
+                WorldPanel {
+                    units_to_world: UNITS,
+                    anchor: Transform::default(),
+                    clip: None,
+                },
+                WorldLayer(0),
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(200.0, 100.0),
+                    ..default()
+                },
+                UiGlobalTransform::default(),
+            ))
+            .id();
+
+        let icon = world
+            .spawn((
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(64.0, 64.0),
+                    ..default()
+                },
+                // 面板半宽 100px；节点中心在 500px，图片整个在面板右侧外面。
+                UiGlobalTransform::from_translation(Vec2::new(500.0, 0.0)),
+                ImageNode::new(texture),
+                ChildOf(panel),
+            ))
+            .id();
+
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(
+            image_quad_entity(&world, icon).is_none(),
+            "离屏节点不生成图片 quad"
+        );
+    }
+
     // ---- 条带视口裁剪（L2） ----
 
     /// 有效裁剪 = 面板 ∩ clip；`None` 就是面板自身；完全在外时是空矩形。
@@ -914,6 +1477,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(Assets::<UNodeMaterial3d>::default());
+        world.insert_resource(Assets::<Image>::default());
 
         let panel = world
             .spawn((
@@ -941,6 +1505,13 @@ mod tests {
             .resource::<Assets<UNodeMaterial3d>>()
             .get(&node.material)
             .expect("材质");
+        // 非图片节点仍走原来的纯色路径：不采样纹理，UV 保持 identity。
+        assert_eq!(material.use_texture, 0, "纯色节点不采样纹理");
+        assert_eq!(
+            material.uv_rect,
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+            "加 uv_rect 后非图片材质的默认值必须是 identity"
+        );
         assert!(
             (material.clip_bounds[0] - Vec4::new(0.09, 0.09, 1.0, 0.0)).length() < 1e-6,
             "可见半尺寸 = 交集的一半：{:?}",

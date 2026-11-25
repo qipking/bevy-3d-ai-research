@@ -7,6 +7,7 @@
 > **原话**：「用不着像素级还原，这样工作量太大，而 rig-tui 本来就只是终端 UI，可修改性很大，
 > 用 feathers 的标准 UI 库来重新组装界面就行了，不然成本太大了。」
 > **配套**：布局按 [`NIRI_SCROLL.md`](NIRI_SCROLL.md)；**L1（列宽模型）正在进行中，不算完成**。
+> **F8 已完成**（2026-11-26）：3D 镜像支持 `ImageNode`（tint/flip/rect/裁剪），**SVG 图标未做**，见 §2.6。
 > 行号是 2026-11-26 00:5x 的快照，函数名/常量名是稳定锚。
 
 ## 1. 口径
@@ -16,13 +17,13 @@
 | 行为/数据：agent、会话、工具卡、补全、历史、剪贴板、键位语义、选择 | **保留**（`rig_ecs` + `rig_harness` + `rig_niri` 的引擎），测试就是资产 |
 | 视觉：面板外观、按钮、列表、输入框、状态行、滚动条、配色/圆角/间距 | **改用 `bevy_feathers` 的标准组件与 token**，不再逐像素对齐终端 |
 | 布局 | niri 式（`NIRI_SCROLL.md`），列宽/滚动/聚焦；L1 进行中 |
-| 3D | `feathers_in_3d` 镜像 bevy_ui（Node 背景/边框/圆角 + 文字 + **Outline**；**不**支持图标图片） |
+| 3D | `feathers_in_3d` 镜像 bevy_ui（Node 背景/边框/圆角 + 文字 + **Outline** + **`ImageNode`**；SVG 图标未做） |
 
 **明确不做的**：终端格对齐、`keep/min_width` 的逐字节复刻、任何"和终端像素一致"的验收；
 hints `fit_keys` 的裁剪细节与 `status` 的阶段拆分也不再作为验收项（代码现在恰好对齐，但不为它返工）。
 具体见 §6。
 
-## 2. 已完成：F1–F5 实际用了什么
+## 2. 已完成：F1–F5 + F8 实际用了什么
 
 | 步 | 结果 | 主要落点 |
 |---|---|---|
@@ -94,6 +95,35 @@ hints `fit_keys` 的裁剪细节与 `status` 的阶段拆分也不再作为验�
 - 多行仍是**一块框**：`sync_input_row_height`（`:1557`）只把输入行的高度换成 24px，
   编辑器行模型不动；空输入保底 3 行 = 72px，10 行上限 260px（`input_tile_height` `:176`）。
 
+### 2.6 F8：`ImageNode` 镜像（SVG 图标未做）
+
+`feathers_in_3d` 现在把 `bevy_ui::widget::ImageNode` 镜像成一张**贴图四边形**
+（`world3d::PanelImageNode`），feathers 控件里的勾/展开箭头/icon button 和转写里贴的截图
+在 3D 里都能画出来：
+
+- **独立 quad**：图片不是塞进节点自己的填充材质，而是节点下另挂一张同尺寸 quad。这样
+  "透明底图标按钮"和"有底色行里的截图"都正确；quad 继承节点的 Transform，材质复用
+  `UNodeMaterial3d` 的 `texture` + 新增的 `uv_rect`，并和填充/Outline/文字共用同一套
+  `clip_*` uniform——`WorldPanel::clip`（工作区条带视口）与面板自身裁剪对图片同样生效。
+- **UV/flip**：`flip_x`/`flip_y` 只交换 `uv_rect` 的 U/V 两端（`(1,0,0,1)` / `(0,1,1,0)`），
+  shader 做 `mix(xy, zw, body_uv)`，几何（SDF）不受影响；`ImageNode::rect` 按纹理像素
+  归一到 0..1，可裁子图。
+- **tint**：`ImageNode::color` 转线性后作为材质 `color`，shader 里与 texel 逐分量相乘。
+- **加载**：`Assets<Image>` 里还没有的图片先跳过；加载后的下一帧 `sync_mirror` 检查到就会
+  补上（`sync_mirror` 每帧跑，不需要 AssetEvent）。资产卸载、`ImageNode` 移除、节点被裁掉
+  或尺寸为 0 时 quad 收起；零尺寸/离屏不生成、不 panic。
+- **层级**：文字仍由 `text3d` 按面板批量画（在整块面板之后），所以同一节点里**文字总在
+  图片之上**；"图片盖在文字上"这种真正按 UI 树的交错需要把字形拆到节点层，本轮没做。
+- **未覆盖**：`ImageNode::image_mode`/`visual_box` 的 fit/cover/content-box 规则没抄，
+  图片按节点世界矩形拉伸（图标/截图通常节点尺寸就是图片尺寸，够用）；`texture_atlas`
+  没接（`ImageNode::rect` 子图已支持）。
+- 测试：`feathers_in_3d` **9 → 15**（UV/flip/rect 纯函数、tint 乘法、空矩形/零尺寸/
+  离屏、资产缺失→加载→卸载的 ECS 用例）。
+
+**SVG 图标未做**：SVG 需要 `bevy_ui` 的 `svg` feature（当前 `bevy` 依赖没开；注意本仓锁定
+的 bevy 0.20.1 的 `bevy_ui/Cargo.toml` 里没有 `svg` feature，真要支持得先确认上游的
+SVG loader/feature 形态）。本轮只处理已栅格化、在 `Assets<Image>` 里的 `Handle<Image>`。
+
 ## 3. 仍是常量 / 直接颜色的地方
 
 feathers 只有**颜色**是 design token；间距、边框宽度、圆角、字号/行高在
@@ -141,7 +171,7 @@ feathers token：转写/diff/工具卡的颜色是 rig-tui 的语义，feathers 
 - F2/F3 的交互与换皮前等价（点击/键盘/Alt+1..9 都能选，`Row`/`Pick` 形状不变）；
 - `cargo test --workspace --offline` 全绿：`rig_niri` **526**（F1–F5 基线；L1 并行时 528）+ app lib 20
   + app bin 5 + `feathers_in_3d` 5（2026-11-26 00:5x 实测）；
-- 3D 镜像里不出现图标（镜像不支持 image），按钮一律文字。
+- 3D 镜像支持 `ImageNode`（图标/截图，见 §2.6）；**SVG 图标仍未做**（当前依赖没开对应 feature）。
 
 ## 6. 明确不做
 
@@ -153,4 +183,5 @@ feathers token：转写/diff/工具卡的颜色是 rig-tui 的语义，feathers 
 - 动画/补间不在本阶段（niri 的滚动插值另算，见 `NIRI_SCROLL.md` L5）；
 - 不替换转写行模型、不重写多行编辑器、不给 picker 换 `ListView`（理由见 §4）；
 - `RF_NIRI_LAYOUT=1` 的 niri 默认屏幕不在这五步里（仍是直色，等 L1）；
-- 不做图标：3D 镜像不镜像 `ImageNode`，feathers 组件里的图标一律不显示，按钮只用文字。
+- 不做 SVG 图标：`ImageNode` 已镜像（§2.6），但 SVG 需要 `bevy_ui` 的 `svg` feature
+  （当前没开），feathers 的 SVG 图标仍不显示；位图图标/截图可以。

@@ -76,6 +76,7 @@ pub use rig_niri::prelude::*;
 pub mod notice;
 pub mod workspaces_demo;
 pub mod settings;
+pub mod show;
 pub mod status;
 
 pub use notice::NoticeHistory;
@@ -298,6 +299,8 @@ impl Plugin for HarnessExtPlugin {
     fn build(&self, app: &mut App) {
         // `[view]`：路径/默认值/降级都在 settings 模块里；必须在其他系统之前。
         settings::register(app);
+        // `/show`：把活动转写窗格的来源切到 agent / 已保存会话（S3/S4）。
+        app.add_plugins(show::ShowPlugin);
 
         app.init_resource::<NoticeHistory>()
             // 视图层通常已经初始化；单独用本插件时也要能跑。
@@ -402,7 +405,10 @@ pub trait BusinessPlugin: Plugin {}
 
 /// 前端模块的再导出，业务代码只从这里拿。
 pub mod prelude {
-    pub use crate::{HarnessExt, HarnessExtPlugin, NoticeHistory, SettingsPath, ViewSettings, hello};
+    pub use crate::{
+        HarnessExt, HarnessExtPlugin, NoticeHistory, SettingsPath, ViewSettings, hello,
+    };
+    pub use crate::show::ShowPlugin;
     pub use rig_niri::{
         batch::{BatchPlugin, CompletedCalls},
         editor::{Editor, PromptSubmitted, SubmittedPrompts},

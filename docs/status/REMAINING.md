@@ -185,29 +185,38 @@
 
 ---
 
-## 6. 看不了别的会话：子 agent、已保存会话、被压缩掉的条目、重启前的调用事实（S1 已完成，S2–S6 未做）
+## 6. 看不了别的会话：子 agent、已保存会话、被压缩掉的条目、重启前的调用事实（S1–S4 已完成，S5–S6 未做）
 
 - **用户会看到什么**：转写永远只显示"当前 agent 的当前对话"：不能切到子 agent 看它干了什么，
   不能把已保存的会话读进来对照，压缩（compaction）移出对话的条目直接消失，重启后旧调用卡片
   没有时长/调用树，"N messages above were compacted" 也没有。拆窗（Alt+S）只是把同一份转写
   复制成两列（`panels.rs:156`）。
-- **进展（2026-11-26）**：`SHOW_AGENT.md` 的 **S1 已完成**——`TranscriptPane` 组件
-  （`pane.rs:608`，带 `source: TranscriptSource` / `title` / 每窗格 `scroll` / `selected` /
-  `below`）+ `ActiveTranscript`（`:657`）；`Pane2` **仍然镜像**（`panels.rs:156`），所以画面零变化。
-  **S2–S6 未做**：`dialogue_batch_of`/`source_rows`/`ShowAgent`/`Replaced`/`PastEffects`
-  在 `grep -rnE 'dialogue_batch_of|fn source_rows|ShowAgent|Replaced|PastEffects' rig_niri/src`
-  里仍然 0 命中（只剩 `batch.rs:104`/`:2516` 的 TODO/注释）。
+- **进展（2026-11-26）**：`SHOW_AGENT.md` 的 **S1–S4 已完成**。
+  - **S1/S2**：`TranscriptPane` 组件（`source` / `title` / 每窗格 `scroll` / `selected` /
+    `below`）+ `ActiveTranscript`；`batch::source_rows` 支持 `Shown`/`Agent`/`Value`，
+    `pane::window_transcript` 按每块窗格自己的来源取行、各自窗口化，`Pane2` 不再镜像。
+  - **S3**：应用层 `show.rs` 注册 `/show`（`HarnessExtPlugin`，和 `/hello`/`/setting`
+    同一张命令表）：无参数弹 `Picker`（`shown` + 每个活 agent + 已保存会话）；
+    `/show <id>`、`/show agent <id>`、`/show session <id|名字>`、`/show shown`。
+    它只改**聚焦工作区活动窗格**（`ActiveTranscript` → 主转写）的 `TranscriptPane.source`/
+    `title`，**不移动 `ShownAgent`**，所以主列看 `Agent`/`Value` 时全局 `Shown` 管线不受影响。
+    `title` 非空时 `window_transcript` 在窗格第一行画 dim 标题（key `u64::MAX - 2`，
+    不参与滚动、不占条目；`item_rows` 跳过），`shown`/空标题不占行。
+  - **S4**：`/show` 的 picker 用 `Home::saved_sessions` + `StoreOpener::open` +
+    `SessionMeta` 列最近 8 个；`/show session` 用 `read_conversation` 读成
+    `TranscriptSource::Value`（只读，不动 `ShownAgent`/`Conversation`）。
+  **S5–S6 未做**：压缩条目（`Replaced`/`summarized_in_log`）与重启前的调用事实
+  （`CallFact` 落盘/`PastEffects` 替代）仍缺；`grep -rnE 'Replaced|PastEffects' rig_niri/src`
+  只剩注释/TODO。
 - **上游 API / 我们的落点**：上游 `pane::{TranscriptPane, TranscriptSource::{Shown,Agent,Value}}`
   （`pane.rs:57`/`:84`）、`view::ShowAgent`（`view.rs:49`）、`transcript::Replaced`
   （`transcript.rs:723`）、`transcript::PastEffects`（`:434`）、`render::compacted_line`
-  （`render.rs:797`）。我们：组件与类型已经就位（S1），但两块窗格的 `source` 都是 `Shown`
-  （`pane.rs:626`），`Pane2` 的可见行仍由 `mirror_pane2_rows` 每帧复制（`panels.rs:156`）；
-  `TranscriptSource::{Agent,Value}` 还没有产行路径；`PastEffects` 只有 `batch.rs:104` 的 TODO；
-  `compacted_line` 0 命中（`grep -rn 'above were compacted' rig_niri/src` 只命中
-  `batch.rs:2516` 的注释和断言它不出现的测试）。
+  （`render.rs:797`）。我们：来源/标题/滚动已经按窗格拆开（S1/S2/S3），存档走公开 API
+  （S4）；还缺的是 `Replaced` 的行生成与 `CallFact` 落盘，两者都不改 `TranscriptSource`
+  的形状。
 
-- **工作量**：**L**（要先把转写从"全局一份"改成"窗格带来源"，再接 `Replaced`/`PastEffects`
-  两条数据源；`TranscriptSource::Value` 还要读会话存档）。
+- **工作量**：S5–S6 剩余 **L**（`Replaced` 两条数据源 + 行生成约 M；`CallFact` 落盘 +
+  `Effects::continue_after` 约 L）。
 - **依赖**：§7 的条目身份（已有 `Selection::item`，但没有公开 `TranscriptView`）；`PastEffects`
   要看 rig-harness 的效应日志是否可读（只读服务）。
 

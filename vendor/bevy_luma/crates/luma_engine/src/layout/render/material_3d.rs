@@ -127,6 +127,16 @@ pub struct UNodeMaterial3d {
     #[uniform(0)]
     pub clip_radius: [Vec4; 4],
 
+    /// UV rect applied to the node's `body_uv` before sampling `texture`:
+    /// `xy = (u0, v0)`, `zw = (u1, v1)`.
+    ///
+    /// The identity `(0, 0, 1, 1)` is the historical mapping (and the only one
+    /// the generic 2D/3D graph path uses). Feathers' mirrored `ImageNode`s set
+    /// it to `(1, 0, 0, 1)` for `flip_x`, `(0, 1, 1, 0)` for `flip_y`, or to a
+    /// sub-rect for `ImageNode::rect`.
+    #[uniform(0)]
+    pub uv_rect: Vec4,
+
     // --- texture bindings ---
     /// Optional texture to draw inside the node bounds.
     #[texture(1)]
@@ -170,6 +180,8 @@ impl Default for UNodeMaterial3d {
             clip_inv_y: [Vec4::ZERO; 4],
             clip_bounds: [Vec4::ZERO; 4],
             clip_radius: [Vec4::ZERO; 4],
+            // Identity: existing image nodes keep sampling the whole texture.
+            uv_rect: Vec4::new(0.0, 0.0, 1.0, 1.0),
             texture: None,
             custom_shader: None,
         }

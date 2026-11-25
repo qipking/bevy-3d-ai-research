@@ -111,13 +111,14 @@ impl ItemRows {
 /// `batch::live_key` 的 `段标记 | part 哈希 << 32 | index`。所以一条消息 /
 /// 一次调用 / 一段流式回复各自一个条目，Alt+↑/↓ 一下一条。
 ///
-/// “下面还有”标记行的 key 是 `u64::MAX`、不属于任何块，跳过它。
+/// “下面还有”标记行的 key 是 `u64::MAX`、标题行是 `u64::MAX - 2`，都不属于任何
+/// 块，跳过它们（S3 起标题行会出现在 `PanelRows` 顶部）。
 /// 可见窗口可能从一块的中间开始（滚动后），这时第一组也从窗口的第 0 行算起；
 /// 组是相对**传入切片**的下标。
 pub fn item_rows(rows: &[KeyedRow]) -> Vec<ItemRows> {
     let mut items: Vec<ItemRows> = Vec::new();
     for (index, keyed) in rows.iter().enumerate() {
-        if keyed.key == BELOW_MARKER_KEY {
+        if keyed.key >= TITLE_ROW_KEY {
             continue;
         }
         let ordinal = (keyed.key >> 32) as u32;
@@ -480,9 +481,12 @@ pub fn sync_transcript_scrollbars(
         let Some((_, visible)) = pane_size_of(&areas, bar.pane, &tiles, tiling.as_deref()) else {
             continue;
         };
+        // 标题行占掉窗格第一行：滑块按正文行数（window_transcript 的
+        // `max_top` 也是这个口径）。
+        let visible = body_height(pane_title(&pane).is_some(), usize::from(visible));
         let model = ScrollbarModel::new(
             full.len(),
-            usize::from(visible),
+            visible,
             pane.scroll.top,
             pane.scroll.follow,
         );
@@ -722,6 +726,44 @@ pub const BELOW_MARKER: &str = crate::transcript::MORE_BELOW;
 /// “下面还有”标记行的 key：`u64::MAX`，不属于任何块（[`item_rows`] 跳过它）。
 const BELOW_MARKER_KEY: u64 = u64::MAX;
 
+/// 标题行的 key：`u64::MAX - 2`，不属于任何块（[`item_rows`] 跳过它）。
+///
+/// 和 [`BELOW_MARKER_KEY`] 同一套“特殊行”约定：高 32 位也是 `u32::MAX`，但
+/// 低 32 位不同；`item_rows` 按 `>= TITLE_ROW_KEY` 一次跳过标题、工作区占位
+/// （`u64::MAX - 1`）和“下面还有”标记。
+pub const TITLE_ROW_KEY: u64 = u64::MAX - 2;
+
+/// 窗格标题（`Some("")` / 全空白也算没有标题：不占行）。
+fn pane_title(pane: &TranscriptPane) -> Option<&str> {
+    pane.title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+}
+
+/// 标题行占一行时，正文还能放几行。
+fn body_height(has_title: bool, height: usize) -> usize {
+    if has_title {
+        height.saturating_sub(1)
+    } else {
+        height
+    }
+}
+
+/// 窗格顶部那一行标题：dim 文字，key 用 [`TITLE_ROW_KEY`]。
+///
+/// 标题**不参与滚动**（正文的 `max_top` 由 [`body_height`] 扣掉这一行），所以
+/// 看长对话时它始终在窗格第一行；`title = None` 时一行都不占。
+fn title_row(title: &str, style: Style) -> KeyedRow {
+    let row = Row::new(Line::from(Span::styled(format!(" {title}"), style)));
+    let hash = crate::transcript::row_hash(&row);
+    KeyedRow {
+        key: TITLE_ROW_KEY,
+        hash,
+        row,
+    }
+}
+
 /// 最后一行右端的标记行；`text` 是 [`Below::marker`] 给的那句话（窗格太窄时
 /// 传空串：上游仍把最后一行留给标记，只是不画字）。
 ///
@@ -768,9 +810,9 @@ fn below_marker(text: &'static str) -> KeyedRow {
 /// 这是独占系统：`Agent`/`Value` 来源的 [`crate::batch::source_rows`] 要读内核
 /// （`live_additions` 在 world 上跑查询），普通系统参数拿不到 `&mut World`。
 ///
-/// TODO(S3/title)：`TranscriptPane::title = Some(..)` 时在窗口顶部插一行 dim
-/// 标题（设计用 key `u64::MAX - 2`，`item_rows` 跳过它）。S2 不做：`title`
-/// 默认 `None`，保证主窗格的行数与改动前逐行一致。
+/// S3/title：`TranscriptPane::title = Some(..)` 时窗口第一行是 dim 标题
+/// （key [`TITLE_ROW_KEY`]，[`item_rows`] 跳过它）；正文少放一行，标题不参与
+/// 滚动。`title = None`（默认）时行数与 S2 逐行一致。
 pub fn window_transcript(world: &mut World, mut first_frame: Local<bool>) {
     // 旧签名里这四样是系统参数：缺任何一个时系统本来就会被跳过。
     if !world.contains_resource::<PanelRows>()
@@ -844,6 +886,12 @@ pub fn window_transcript(world: &mut World, mut first_frame: Local<bool>) {
     // 窗口化会改窗格自己的 `scroll`/`below`；先算在局部的克隆上，最后写回，
     // 这样取整段时可以放心地借 world 的资源。
     let mut states: Vec<(Entity, PaneScroll, BelowSeen)> = Vec::new();
+    // 标题行的颜色：和面板正文同一个主题的 dim 文字（没有主题的 headless
+    // App 用默认值，不会 panic）。
+    let title_style = world
+        .get_resource::<crate::theme::Theme>()
+        .map(|theme| theme.dim)
+        .unwrap_or_default();
 
     // 1) 非 `Shown` 的来源：各自现取整段（独占 world，必须在借 `TranscriptRows`
     //    之前做完）。
@@ -855,7 +903,7 @@ pub fn window_transcript(world: &mut World, mut first_frame: Local<bool>) {
             continue;
         };
         let all = crate::batch::source_rows(world, &pane.pane.source, width as u16);
-        let visible = window_pane(&all, &mut pane.pane, width, height);
+        let visible = window_pane(&all, &mut pane.pane, width, height, title_style);
         updates.push((pane.id, visible));
         states.push((pane.entity, pane.pane.scroll, pane.pane.below));
     }
@@ -870,7 +918,7 @@ pub fn window_transcript(world: &mut World, mut first_frame: Local<bool>) {
             let Some((width, height)) = pane.size else {
                 continue;
             };
-            let visible = window_pane(&full.0, &mut pane.pane, width, height);
+            let visible = window_pane(&full.0, &mut pane.pane, width, height, title_style);
             updates.push((pane.id, visible));
             states.push((pane.entity, pane.pane.scroll, pane.pane.below));
         }
@@ -898,14 +946,21 @@ struct PaneWindow {
 }
 
 /// 一块窗格的窗口化（[`window_transcript`] 的主体；每块窗格各用自己的滚动）。
+///
+/// `title` 有值时在窗口第一行插一行标题，正文按 [`body_height`] 少放一行；标题
+/// 不参与滚动（`max_top` 也按正文高度算），所以滚上滚下时它都钉在顶部。
 fn window_pane(
     full: &[KeyedRow],
     pane: &mut TranscriptPane,
     width: usize,
     height: usize,
+    title_style: Style,
 ) -> Vec<KeyedRow> {
+    // 先克隆标题：下面要改 `pane.scroll`/`pane.below`，不能再借着组件。
+    let title = pane_title(pane).map(str::to_owned);
+    let body = body_height(title.is_some(), height);
     let len = full.len();
-    let max_top = len.saturating_sub(height);
+    let max_top = len.saturating_sub(body);
     if pane.scroll.follow {
         pane.scroll.top = max_top;
     }
@@ -915,14 +970,14 @@ fn window_pane(
     }
     // 先让窗格自己的 `BelowSeen` 看到这一帧的 follow/total/top/height：跟随
     // 末尾就复位，刚离开末尾就记下"已经看到哪里"。
-    let below = pane.below.of(pane.scroll.follow, len, top, height);
+    let below = pane.below.of(pane.scroll.follow, len, top, body);
     // 只有一行的窗格把那一行留给正文（上游 `text_rows` 的同一个分支）。
-    let below = if height > 1 { below } else { Below::Nothing };
+    let below = if body > 1 { below } else { Below::Nothing };
     let marker = below.marker();
     let marker_fits = marker.is_some_and(|text| Span::from(text).width() <= width);
     let rows_shown = match below {
-        Below::Nothing => height,
-        Below::More | Below::New => height - 1,
+        Below::Nothing => body,
+        Below::More | Below::New => body - 1,
     };
     let end = (top + rows_shown).min(len);
     let mut rows = full[top..end].to_vec();
@@ -932,6 +987,9 @@ fn window_pane(
         } else {
             ""
         }));
+    }
+    if let Some(title) = title.as_deref() {
+        rows.insert(0, title_row(title, title_style));
     }
     rows
 }
@@ -989,14 +1047,17 @@ fn select_pane_item(
         scroll.to(Some(item.start), max_top);
     }
     // 选区落在**当前可见行**上（和鼠标拖选同一套下标）：整段里的行号减窗口
-    // 顶。条目比窗口高时只亮露出来的部分；`to` 用下一行的行首（左闭右开）。
+    // 顶，再加上标题行（它占可见窗口的第一行）。条目比窗口高时只亮露出来的
+    // 部分；`to` 用下一行的行首（左闭右开）。
     let top = scroll.top.min(max_top);
     let shown = text_rows(scroll.follow, top, height, max_top);
-    let from = item.start.saturating_sub(top);
+    let title_offset = usize::from(pane_title(pane).is_some());
+    let from = item.start.saturating_sub(top) + title_offset;
     let to = item
         .end
         .min(top.saturating_add(shown))
-        .saturating_sub(top);
+        .saturating_sub(top)
+        + title_offset;
     pane.selected = Some(item.ordinal);
     selection.select_item(panel, from, to, item.ordinal);
     if let Some(focus) = focus {
@@ -1059,6 +1120,8 @@ pub fn pane_keys(
     let Some((_, height)) = pane_size_of(&areas, root, &tiles, tiling.as_deref()) else {
         return;
     };
+    // 标题行占掉可用高度：滚动/选条目都只按正文行数算。
+    let height = body_height(pane_title(&pane).is_some(), usize::from(height));
     let max_top = full.len().saturating_sub(height);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);

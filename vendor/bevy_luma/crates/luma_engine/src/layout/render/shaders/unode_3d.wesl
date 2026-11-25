@@ -41,6 +41,9 @@ struct UNodeMaterial3d {
     clip_inv_y: array<vec4<f32>, 4>,
     clip_bounds: array<vec4<f32>, 4>,
     clip_radius: array<vec4<f32>, 4>,
+
+    // xy = (u0, v0), zw = (u1, v1); identity (0, 0, 1, 1) samples the whole texture.
+    uv_rect: vec4<f32>,
 }
 
 @group(3) @binding(0) var<uniform> material: UNodeMaterial3d;
@@ -305,7 +308,12 @@ fn fragment(
     }
 
     if (material.use_texture > 0u) {
-        let tex_uv = clamp(body_uv, vec2<f32>(0.0), vec2<f32>(1.0));
+        // `body_uv` is derived from the mesh UV, so it is also the SDF's local
+        // coordinate. Remap it only for the texture lookup: this is how a
+        // mirrored `ImageNode`'s flip_x/flip_y/rect reach the sampler without
+        // flipping the geometry itself.
+        let body_uv_clamped = clamp(body_uv, vec2<f32>(0.0), vec2<f32>(1.0));
+        let tex_uv = mix(material.uv_rect.xy, material.uv_rect.zw, body_uv_clamped);
         let tex_sample = textureSample(base_texture, base_sampler, tex_uv);
         body_color = tex_sample * body_color;
     }
