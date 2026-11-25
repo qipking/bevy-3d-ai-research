@@ -1654,21 +1654,20 @@ fn push_ask_block(
         // 次要信息用主题的 dim 色（和 `Theme::default().dim` 同一色值）。
         title.push(Span::styled(
             format!("({index}/{total}) "),
-            Style::new().fg(RColor::Rgb(120, 128, 145)),
+            Style::new().dim(),
         ));
     }
-    title.push(Span::styled("? ", Style::new().fg(RColor::Magenta)));
+    // 前景继承主题：浅色主题下洋红/浅灰会糊掉，用"粗体 + 问号"表达"这是个闸门"。
+    title.push(Span::styled("? ", Style::new().add_modifier(Modifier::BOLD)));
     title.push(Span::styled(
         question.title.clone(),
-        Style::new()
-            .fg(RColor::LightMagenta)
-            .add_modifier(Modifier::BOLD),
+        Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     ));
     push_ask_rows(rows, ask, "title", vec![Line::from(title)], width, None);
     for (index, body_line) in question.body.lines().enumerate() {
         let line = Line::from(Span::styled(
             format!("    {body_line}"),
-            Style::new().fg(RColor::Rgb(200, 206, 220)),
+            Style::new(),
         ));
         push_ask_rows(
             rows,
@@ -2203,10 +2202,12 @@ fn search_product_look(mut batch: ResMut<RenderBatch>) {
 fn search_product_lines(call: &ToolRender) -> Vec<LookLine> {
     // header 的底色来自调用的状态 band，不再写死状态词的前景色。
     let band = theme_band(&call.theme, call_band(call));
-    let dim = Style::default().fg(RColor::Rgb(120, 128, 145));
-    let secondary = Style::default().fg(RColor::Rgb(165, 175, 195));
-    let price_style = Style::default().fg(RColor::Green);
-    let rate = Style::default().fg(RColor::LightYellow);
+    // 不写死前景色：span 没设 fg 时会继承当前 `Theme::fg`，浅色/深色主题都读得清。
+    // （之前这里是深色主题调过的 RGB/ANSI 色，浅色主题下会糊在底上。）
+    let dim = Style::default().dim();
+    let secondary = Style::default().italic();
+    let price_style = Style::default().add_modifier(Modifier::BOLD);
+    let rate = Style::default().dim();
     let state = match &call.state {
         CallState::Streaming => "(streaming)".to_string(),
         CallState::Running(_) => "(running)".to_string(),

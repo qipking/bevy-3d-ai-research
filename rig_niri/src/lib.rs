@@ -141,7 +141,7 @@ pub mod prelude {
     pub use crate::status::{
         AppStatusPartsExt, StatusLine, StatusPart, StatusParts, StatusPlugin, StatusSettings,
     };
-    pub use crate::theme::Theme;
+    pub use crate::theme::{Theme, ThemeKind, create_light_theme, light_ui_theme};
     pub use crate::title::WindowTitle;
     pub use crate::transcript::{Row, RowText, TranscriptFont};
     pub use crate::{FeathersFrontPlugin, FeathersSystems, FeathersViewPlugin};
@@ -162,19 +162,11 @@ pub struct FeathersViewPlugin;
 
 impl Plugin for FeathersViewPlugin {
     fn build(&self, app: &mut App) {
-        // feathers 的 `UiTheme`：面板 chrome（底/边框）的颜色来源。
-        //
-        // `bevy_feathers::FeathersPlugins` 会 `init_resource::<UiTheme>()` 插一个
-        // **空** `ThemeProps`（所有 token 查不到 → fuchsia）。这里只在"缺失或
-        // 空"时换成 `dark_theme::create_dark_theme()`：调用方自己配好的主题
-        // 不会被覆盖；没装 UI 库的最小 App 也有一份能查的暗色主题。
-        let configured = app
-            .world()
-            .get_resource::<bevy_feathers::theme::UiTheme>()
-            .is_some_and(|ui_theme| !theme::is_unconfigured(ui_theme));
-        if !configured {
-            app.insert_resource(theme::dark_ui_theme());
-        }
+        // 主题：`RF_THEME=light` 时插浅色 `UiTheme`（面板 chrome）+ 浅色
+        // `Theme`（内容 17 band），否则仍是原来的 feathers 暗色。`install_theme`
+        // 只在 `UiTheme` 缺失/为空时覆盖，调用方自己配好的主题不受影响；
+        // `NO_COLOR` 也在里面处理。`RF_FRAME` 的确定性覆盖是同一个路子。
+        theme::install_theme(app, theme::ThemeKind::from_env());
 
         app.configure_sets(
             Update,
@@ -187,8 +179,8 @@ impl Plugin for FeathersViewPlugin {
             )
                 .chain(),
         )
-        .insert_resource(theme::Theme::from_env())
         .init_resource::<selection::Selection>()
+        .add_systems(Update, theme::sync_clear_color)
         .add_message::<clipboard::Copied>()
         .add_systems(
             Update,
@@ -259,6 +251,39 @@ mod tests {
         assert_eq!(
             theme.color(&crate::theme::PANEL_BG),
             crate::theme::dark_ui_theme().color(&crate::theme::PANEL_BG)
+        );
+    }
+
+    /// `RF_THEME=light` 的启动路径（headless：直接调 `install_theme`，不改进程
+    /// 环境）：`UiTheme` 是浅色、`Theme` 是浅色、当前 `ThemeKind` 记成 Light。
+    #[test]
+    fn the_view_plugin_can_start_in_the_light_theme() {
+        let mut app = App::new();
+        crate::theme::install_theme(&mut app, crate::theme::ThemeKind::Light);
+
+        let ui = app.world().resource::<UiTheme>();
+        let light = crate::theme::light_ui_theme();
+        for token in [
+            crate::theme::PANEL_BG,
+            crate::theme::BAR_BG,
+            crate::theme::INPUT_BG,
+            crate::theme::CONFIRM_BG,
+            crate::theme::PANEL_BORDER,
+            crate::theme::FOCUS_BORDER,
+        ] {
+            assert_eq!(
+                ui.color(&token),
+                light.color(&token),
+                "RF_THEME=light 的 {token} 不是浅色主题"
+            );
+        }
+        assert_eq!(
+            *app.world().resource::<crate::theme::ThemeKind>(),
+            crate::theme::ThemeKind::Light
+        );
+        assert_eq!(
+            app.world().resource::<crate::theme::Theme>().band,
+            crate::theme::Theme::light().band
         );
     }
 

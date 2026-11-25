@@ -78,6 +78,7 @@ pub mod workspaces_demo;
 pub mod settings;
 pub mod show;
 pub mod status;
+pub mod theme_cmd;
 
 pub use notice::NoticeHistory;
 pub use settings::{SettingsPath, ViewSettings};
@@ -301,6 +302,8 @@ impl Plugin for HarnessExtPlugin {
         settings::register(app);
         // `/show`：把活动转写窗格的来源切到 agent / 已保存会话（S3/S4）。
         app.add_plugins(show::ShowPlugin);
+        // `/theme`：dark / light，同时换 `Theme` 与 `UiTheme`。
+        app.add_plugins(theme_cmd::ThemePlugin);
 
         app.init_resource::<NoticeHistory>()
             // 视图层通常已经初始化；单独用本插件时也要能跑。
@@ -409,6 +412,8 @@ pub mod prelude {
         HarnessExt, HarnessExtPlugin, NoticeHistory, SettingsPath, ViewSettings, hello,
     };
     pub use crate::show::ShowPlugin;
+    pub use crate::theme_cmd::ThemePlugin;
+    pub use rig_niri::theme::ThemeKind;
     pub use rig_niri::{
         batch::{BatchPlugin, CompletedCalls},
         editor::{Editor, PromptSubmitted, SubmittedPrompts},

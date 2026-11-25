@@ -574,10 +574,21 @@ pub fn span_style_color(style: &Style, theme: &Theme) -> Color {
         srgb.blue = srgb.blue * (1.0 - k) + band.blue * k;
     }
     if style.add_modifier.contains(Modifier::BOLD) {
+        // 粗体没有字形可用，只能调亮度。方向要看主题：深色主题往白提亮，浅色主题
+        // 往黑压暗（否则白底上的粗体反而更淡）。判据是"底色比前景亮"——浅色主题
+        // 的 band 亮度高、fg 亮度低。
         let k = 0.25;
-        srgb.red += (1.0 - srgb.red) * k;
-        srgb.green += (1.0 - srgb.green) * k;
-        srgb.blue += (1.0 - srgb.blue) * k;
+        let band = style::color(Some(theme.band)).to_srgba();
+        let light_theme = 0.2126 * band.red + 0.7152 * band.green + 0.0722 * band.blue > 0.5;
+        if light_theme {
+            srgb.red *= 1.0 - k;
+            srgb.green *= 1.0 - k;
+            srgb.blue *= 1.0 - k;
+        } else {
+            srgb.red += (1.0 - srgb.red) * k;
+            srgb.green += (1.0 - srgb.green) * k;
+            srgb.blue += (1.0 - srgb.blue) * k;
+        }
     }
     Color::srgb(srgb.red, srgb.green, srgb.blue)
 }

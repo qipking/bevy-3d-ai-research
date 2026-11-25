@@ -19,7 +19,7 @@
 
 **现在的分布**：已完成 5 项（#1 #2 #3 #5 #7）；部分完成 3 项（#4 #8 #9）；
 未开始 2 项（#6 #10，其中 #10 只剩插件命令绑定）；UI 重组（feathers）另见 §11
-（F6 切片 1/2、F10 已完成，F7–F9 未开始）。
+（F6 切片 1/2、F7、F10 已完成，F8–F9 未开始）。
 
 ---
 
@@ -413,7 +413,7 @@
 | 步 | 内容 | 工作量 | 依赖 / 现状 |
 |---|---|---|---|
 | **F6** | 开放面板画布：**切片 1、2 已完成（2026-11-26）**——注册表 + `PanelId::Plugin(..)` + `add_panel_column` + `drawn_row`；切片 2 的 `StatusLine`（任意面板底部状态行、输入框不额外占行）、`PanelAuto::AllWorkspaces` 自动工作区（已有 + 新建）、`remove_panel_*` / `unregister_panel` 整树移除、`ActivePanelColumn` 插件列焦点（见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）；**只剩**插件命令绑定入口（§10） | **剩余 M（命令绑定）** | 同 §10；`PanelId` 只扩了一个变体，内置面板行为不变（`rig_niri` lib 595 → 602 测试） |
-| **F7** | 主题切换 UI：`/theme` 与持久化（浅色/高对比），`UiTheme` 已是资源、面板/行/滚动条都按 token 解析（`theme.rs:98`–`:141`、`lib.rs:151`–`:159`），缺入口与 `[view] theme` 设置 | **S** | 无；`Settings`/`add_setting` 的先例已在（`status.rs:64`/`:281`） |
+| **F7** | 主题切换 UI：**暗/浅切换已完成（2026-11-26），持久化未做**——`/theme` 无参数报当前/可选值，`/theme dark|light` 同时替换 `Theme` + `UiTheme`，非法参数只写可见 notice；`RF_THEME=light` 启动走 `theme::install_theme`（与 `RF_FRAME` 同一路子）；浅色 17 band 与 `create_light_theme()` 的 feathers token 都在 `theme.rs`；**未做** `[view] theme` 落盘、高对比/自定义主题 | **S（仅持久化）** | 无；`Settings`/`add_setting` 的先例已在（`status.rs:64`/`:281`） |
 | **F8** | 3D 镜像图标/图片：feathers 组件里的 `ImageNode` 现在不镜像，按钮只能文字（`FEATHERS_UI.md` §5）；要做就得给 `feathers_in_3d` 加图片/图标层 | **M** | 无；影响所有带图标的 feathers 控件 |
 | **F9** | 过渡/补间：动作现在当帧生效，niri 的 `scroll` 插值与面板切换没有动画 | **S–M** | 依赖 L1/L5；先做 `scroll` 插值再谈按钮过渡 |
 | **F10** | 转写选区键盘复制：**已完成（2026-11-26）**——`Ctrl+Shift+C`（`InputAction::CopySelection`，独立系统 `clipboard::copy_selection_keys`，不占 `editor::keys` 的 16 参数上限）复制活动转写窗格的鼠标拖选或 Alt+↑/↓ 选中的条目（条目按整条的所有视觉行、`\n` 连接），写 `Copied N lines`；没有选中时不写剪贴板、状态行给 `NOTHING_SELECTED`。原列的“输入框 Shift+方向键选区”仍**未做**：`Editor` 只有光标、没有锚点 | **S（复制）/ 原输入框选区 M** | 鼠标松手复制、Alt+↑↓ 选条目、`Ctrl+C` 清空都不变 |
@@ -439,7 +439,8 @@
 > **工具卡片事实**——`ToolRender.facts` 已接（`batch.rs::published_facts` `:539`，
 > 三处填充 `:505`/`:664`/`:789`）；
 > **主题注入**——batch 已用 `upstream_theme(&Theme)`（`batch.rs:628`/`:915`/`:1530`/`:1782`），
-> `NO_COLOR` 走 `Theme::from_env`（`theme.rs:420`）；
+> `NO_COLOR` 与 `RF_THEME` 走 `Theme::from_env` / `ThemeKind::from_env`（`theme.rs` 的
+> `from_env` 一带）；
 > **turn 级状态项**——`TurnOf` 的 `StatusItems` 已注册（`lib.rs:205`–`:206`），
 > 状态行按 `ActiveTurn` 读 turn 的条目（`status.rs:186`，测试 `:426`）；
 > 以及更早移除的 **Ctrl+D 退出**、**Alt+↑↓ 条目选择**。
@@ -473,8 +474,8 @@
    提示行已如实写 `Ctrl+V paste`，做完再改回 `image`。
 2. **§9 输入框内作答（`in_input`/`draft`）+ `ChoiceSystems` 收尾**（M）——`ChoiceKeys`
    已能用，插件还差调度；输入框作答和 §5 是同一块地基。
-3. **§11 F7 主题切换**（S）——`UiTheme` 已经驱动所有 token，缺 `/theme` 入口与持久化，
-   是最便宜的"看得见"。
+3. **§11 F7 主题切换的持久化**（S）——切换已做（`/theme` + `RF_THEME`），只剩把选择
+   写进 `[view] theme` 并在启动时读回；`UiTheme`/`Theme` 两个资源已经是唯一入口。
 4. **§6 多来源转写**（L）——S1 已完成，S2–S6（`dialogue_batch_of`/`source_rows`/`ShowAgent`/
    `Replaced`/`PastEffects`）是用户能看见的最大一块；§8 的压缩提示等它的 `Replaced`。
 5. **§11 F6 面板画布 + §10 插件扩展点**（切片 1/2 已完成，剩命令绑定 M）——

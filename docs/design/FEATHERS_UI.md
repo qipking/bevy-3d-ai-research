@@ -7,6 +7,8 @@
 > **原话**：「用不着像素级还原，这样工作量太大，而 rig-tui 本来就只是终端 UI，可修改性很大，
 > 用 feathers 的标准 UI 库来重新组装界面就行了，不然成本太大了。」
 > **配套**：布局按 [`NIRI_SCROLL.md`](NIRI_SCROLL.md)；**L1（列宽模型）正在进行中，不算完成**。
+> **F7 已完成（2026-11-26）**：`/theme dark|light` + `RF_THEME=light` 已能同时换面板 chrome
+> 与内容 band；**持久化（`[view] theme`）与自定义/高对比主题未做**，见 §2.7。
 > **F8 已完成**（2026-11-26）：3D 镜像支持 `ImageNode`（tint/flip/rect/裁剪），**SVG 图标未做**，见 §2.6。
 > 行号是 2026-11-26 00:5x 的快照，函数名/常量名是稳定锚。
 
@@ -23,7 +25,7 @@
 hints `fit_keys` 的裁剪细节与 `status` 的阶段拆分也不再作为验收项（代码现在恰好对齐，但不为它返工）。
 具体见 §6。
 
-## 2. 已完成：F1–F5 + F8 实际用了什么
+## 2. 已完成：F1–F5 + F7/F8 实际用了什么
 
 | 步 | 结果 | 主要落点 |
 |---|---|---|
@@ -32,6 +34,7 @@ hints `fit_keys` 的裁剪细节与 `status` 的阶段拆分也不再作为验�
 | **F3** | picker 面板 token 化 + 纯 Node 滚动条 | `picker.rs:861`（容器 `Look::panel`）、`spawn_scrollbar`（`:719`）、`sync_picker_scrollbar`（`:1340`）；测试 `picker.rs:2634`/`:2767`（picker 正被 L1 并行改，行号会漂） |
 | **F4** | 转写滚动条（含拖拽） | `pane.rs::ScrollbarModel`（`:248`）、`sync_transcript_scrollbars`（`:460`）、拖拽观察者（`:527`/`:569`/`:592`）；测试 `pane.rs:2982`/`:3085`/`:3110`/`:3170` |
 | **F5** | 输入框外壳换 feathers 外观 | `editor.rs::sync_input_field`（`:1494`）、`sync_input_row_height`（`:1557`）、常量 `:154`–`:168`；测试 `editor.rs:3601` |
+| **F7** | dark/light 主题切换 | `theme.rs::ThemeKind` / `Theme::light` / `create_light_theme` / `install_theme`；app 侧 `theme_cmd` 的 `/theme`、`RF_THEME`；测试 `theme.rs`、`theme_cmd.rs`、`lib.rs` |
 | 附加 | `feathers_in_3d` 支持 `Outline` 镜像（焦点环） | `world3d.rs:109`/`:127`/`:166`/`:279`–`:356` |
 
 ### 2.1 F1：面板 chrome 的 token
@@ -124,6 +127,32 @@ hints `fit_keys` 的裁剪细节与 `status` 的阶段拆分也不再作为验�
 的 bevy 0.20.1 的 `bevy_ui/Cargo.toml` 里没有 `svg` feature，真要支持得先确认上游的
 SVG loader/feature 形态）。本轮只处理已栅格化、在 `Assets<Image>` 里的 `Handle<Image>`。
 
+### 2.7 F7：主题切换（dark / light）
+
+**主题切换已做，持久化未做。** 面板 chrome 与内容色是两套资源，所以切换一次换两个：
+
+- `ThemeKind { Dark, Light }` 是唯一入口；`Theme::light()` 给 17 个语义 band 的浅色版
+  （浅底 + 深色前景 token），`create_light_theme()` 从 `create_dark_theme()` 的 token
+  分配表换语义色：表面 = `WHITE`/`LIGHT_GRAY_MIX`/`LIGHT_GRAY_1`，文字 =
+  `GRAY_0`/`GRAY_2`，边框 = `GRAY_2`；并把暗色主题里指向 `TEXT_ON_ACCENT`（白）的
+  `BUTTON_TEXT`/`TEXT_INPUT_TEXT`/`LISTROW_TEXT`/`MENUITEM_TEXT` 改回 `TEXT_DEFAULT`，
+  否则浅底白字。
+- `install_theme(app, kind)` 是启动装配：`UiTheme` 缺失/为空时插 `kind` 的 chrome
+  （调用方自配的不覆盖），记录 `ThemeKind`，并插入 `kind` 的 `Theme`（`NO_COLOR` 仍生效）。
+  `FeathersViewPlugin` 用 `ThemeKind::from_env()` 调它，即 `RF_THEME=light`；
+  和 `RF_FRAME` 一样，坏值警告后回退 `dark`。
+- `/theme`（`rig_harness_in_3d/src/theme_cmd.rs`，由 `HarnessExtPlugin` 注册）：
+  无参数报当前值与可选值；`/theme dark` / `/theme light` 同时
+  `insert_resource(Theme::from_kind(..))` 与 `insert_resource(UiTheme(kind.props()))`，
+  下一帧 `frame::sync_panel_chrome` / `sync_picker_scrollbar` / `sync_input_field` 与
+  `batch` 的 `upstream_theme` 都按新值解析；非法参数写一条 warn notice，不改主题。
+- 测试：`Theme::light` 的 17 band 亮度方向/对比、`create_light_theme` 的
+  `SURFACE_*`/`TEXT_DEFAULT`/`BORDER`、`/theme` 双向切换与非法参数、`install_theme`
+  的 light 启动（都断言资源/token，不跑 GUI）。
+
+**未做**：`[view] theme` 持久化（下一轮，`Settings`/`add_setting` 已有先例）、
+高对比/自定义主题、图标色（`feathers_in_3d` 的图标仍取图像自身颜色）。
+
 ## 3. 仍是常量 / 直接颜色的地方
 
 feathers 只有**颜色**是 design token；间距、边框宽度、圆角、字号/行高在
@@ -173,13 +202,21 @@ feathers token：转写/diff/工具卡的颜色是 rig-tui 的语义，feathers 
   + app bin 5 + `feathers_in_3d` 5（2026-11-26 00:5x 实测）；
 - 3D 镜像支持 `ImageNode`（图标/截图，见 §2.6）；**SVG 图标仍未做**（当前依赖没开对应 feature）。
 
+## 5.5 已知观感限制（浅色主题）
+
+`/theme light` 功能可用（`UiTheme` + 17 band 一起换、面板/按钮/滚动条都跟着走），但**3D 里
+小字号对比偏弱**：3D 文本是字形网格，13px 在 3D 缩放后笔画覆盖约 60%，深色在浅底上会糊成
+中灰；深色主题"亮字暗底"看起来更清楚。改进方向（未做）：浅色主题下加大字号 / 换 bold 字面、
+或给文本材质单独做不透明处理。默认仍是 dark。
+
 ## 6. 明确不做
 
 - 不追终端格对齐、`keep`/`min_width` 的逐字节复刻、`status` 的阶段拆分、
   hints `fit_keys` 的裁剪细节（状态行/hints 现在**行为恰好已经对齐**——`hints.rs:73` 按上游
   的宽/权重规则、`status.rs:186` 直接调 `rig_tui::status::line`——但以后不把这些当验收项返工）；
 - 不引入弹层/对话框（`feathers::controls::dialog` 不用，闸门是 tile）；
-- **本阶段不做主题切换 UI**（`/theme`、浅色主题；`UiTheme` 已可换，见 `REMAINING.md` §11 F7）；
+- **主题切换已做（F7）**：`/theme dark|light` + `RF_THEME`，见 §2.7；**持久化
+  （`[view] theme`）与高对比/自定义主题仍未做**（`REMAINING.md` §11 F7）；
 - 动画/补间不在本阶段（niri 的滚动插值另算，见 `NIRI_SCROLL.md` L5）；
 - 不替换转写行模型、不重写多行编辑器、不给 picker 换 `ListView`（理由见 §4）；
 - `RF_NIRI_LAYOUT=1` 的 niri 默认屏幕不在这五步里（仍是直色，等 L1）；

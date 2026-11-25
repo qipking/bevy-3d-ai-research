@@ -42,3 +42,6 @@ render/final_check/
 
 # 解包的上游 crate 源码（可重新解包，不进仓库）
 reference/rig-tui-inspect/
+
+# 浅色主题的验证截图（不进仓库，和 shots/ 一样只在本机看）
+render/light/
