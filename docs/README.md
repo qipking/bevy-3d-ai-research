@@ -25,6 +25,7 @@
 | 文档 | 一句话 | 状态 |
 |---|---|---|
 | [`HANDOFF.md`](status/HANDOFF.md) | 交接页（含 jj 事故记录与规则） | 当前 |
+| [`ARCHITECTURE.md`](status/ARCHITECTURE.md) | **实现架构**：五层栈、四条数据链、帧内顺序、状态归属 | **当前，先读** |
 | [`archive/PLAN.md`](archive/PLAN.md) | 旧的实施顺序与进度表 | **已归档**（进度看 `PARITY.md`，布局看 `WORKSPACE_MODEL.md` + `design/NIRI_SCROLL.md`） |
 | [`PARITY.md`](status/PARITY.md) | 逐模块移植审计：谁已移植、谁部分、谁没开始、缺哪个公开 API | **当前，查进度看它**（口径已改：内容对照 rig-tui，视觉/布局以 feathers+niri 为准） |
 | [`REMAINING.md`](status/REMAINING.md) | 还没做的事，按用户能感知的价值排序（含依赖与工作量） | **当前，排期看它** |
