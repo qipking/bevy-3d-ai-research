@@ -82,7 +82,7 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 
 1. 新工作区出现 **不能** 改变已有工作区的位姿或尺寸（niri 第一原则）。
 2. 聚焦 / 取消聚焦 **不改变任何位姿、也不改任何 `Visibility`**，只决定"新内容写哪条"；
-   非聚焦工作区只是不再接受拖拽（抓取区域，`workspace_under_pointer`，`workspaces.rs:836`），
+   非聚焦工作区只是不再接受拖拽（抓取区域，`workspace_under_pointer`，`workspaces.rs:821`），
    画面照常显示、点选照常。
 3. `arrange_workspaces` 之后：顺序 = `order`、间距一致、x/z 为 0、朝向一致。
 4. 工作区内部：`rects()` 的叶子面积之和 = 条带面积（由 `layout.rs` 的测试保证，当前 24 个测试）。
@@ -103,7 +103,7 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 
 > 2026-11-25 复核：五批均已完成（`WorkspacePanels` = 批 2，四个操作 = 批 3，
 > picker/确认 tile = 批 4，`workspaces_demo` 的 F1–F8/F10 = 批 5）。下表保留当时的分批与
-> 验收标准；“255 个测试”是当时的基线，现在 `rig_niri` 是 317。
+> 验收标准；“255 个测试”是当时的基线，现在 `rig_niri` 是 441（2026-11-25 22:50 实测，`cargo test -p rig_niri --offline` 全绿）。
 
 | 批 | 内容 | 验收 |
 |---|---|---|
@@ -125,7 +125,7 @@ niri 的设计原则（`Development:-Design-Principles.md`）：
 | 东西 | 现在是 | 目标 |
 |---|---|---|
 | 转写 | tile（左列） | ✅ |
-| 输入框 | tile（右列，固定 4 行，贴底） | ✅ |
+| 输入框 | tile（右列，贴底；树里初始 4 行 72px，运行时按内容 3–10 行，`editor::sync_editor_tile` 改高度、顶部 Spacer 吸收差额） | ✅ |
 | 状态行 | tile（右列，固定 2 行） | ✅ |
 | 补全 | tile（右列，打开时 6 行） | ✅ |
 | 右列顶部留白 | `PanelId::Spacer`（只吃空间，不画） | ✅ |
@@ -143,7 +143,7 @@ Vertical
 │       ├── Spacer (Proportion 1)
 │       ├── Confirm (Fixed 0 px)
 │       ├── Complete (Fixed 0 px)
-│       └── Input (Fixed 72 px = 4 行)
+│       └── Input (Fixed 72 px = 4 行，初始值；运行时由 `editor::sync_editor_tile` 改成 3–10 行)
 ├── Hints  (Fixed 18 px = 1 行)
 └── Status (Fixed 36 px = 2 行)
 ```

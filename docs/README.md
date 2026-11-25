@@ -50,6 +50,8 @@
 |---|---|
 | [`VERIFICATION_REPORT.md`](reports/VERIFICATION_REPORT.md) | 路线 B（UI 镜像成 3D 网格）的验证报告与实测数据 |
 | [`occlusion_report.md`](reports/occlusion_report.md) | "面板被清空导致立方体像浮到前面"的排查结论（`unhover_row` 缺判断） |
+| [`official-tui.md`](reports/official-tui.md) | 官方 `rig 0.47.0` 真实界面抓取（2026-11-25，伪终端 + 去 ANSI）：空会话/运行中长什么样、启动命令、原始字节都在 `experiments/rig-official/` |
+| [`PUBLISH_GITHUB.md`](reports/PUBLISH_GITHUB.md) | 上传到 GitHub 的三种凭证方式与已上传地址（2026-11-25） |
 | [`archive/PUBLISH.md`](archive/PUBLISH.md) | 旧的发布准备（workspace 化 + 改名后已过时） |
 
 ## 写新文档的规矩
@@ -66,7 +68,7 @@ research/
 ├── docs/                ← 所有文档
 │   ├── README.md          索引（先读哪个、哪份是历史）
 │   ├── design/            为什么这么做：SPATIAL_UI（§1–§10）、AGENT_3D_PATTERN、移动端方案、技术栈
-│   ├── status/            现在到哪：HANDOFF（交接页）、PARITY（移植审计）、WORKSPACE_MODEL
+│   ├── status/            现在到哪：HANDOFF（交接页）、PARITY（移植审计）、REMAINING（还剩什么）、WORKSPACE_MODEL
 │   ├── reports/           一次性结论：VERIFICATION_REPORT、occlusion_report、official-tui
 │   └── archive/           历史：GEOMETRY_HISTORY（旧几何）、WATCHWALL（S1 监看墙，已暂缓）
 ├── rig_harness_in_3d/   应用层（= plugins/rig-tui 的位置）

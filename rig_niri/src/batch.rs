@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use rig_core::conversation::{self as talk, Note, pairing::answered_by};
+use rig_core::conversation::{self as talk, Note, TurnEnd, pairing::answered_by};
 use rig_core::effect::EffectId;
 use rig_core::message::{
     AssistantMessage, CallId, Message, Text, ToolCall, ToolResult, ToolResultContent, UserContent,
@@ -185,6 +185,15 @@ struct DialogueFrame {
     /// 对话里已有的调用 id。
     calls: HashSet<CallId>,
 }
+
+/// `[stopped]` 在 `TextId::Message` 里的块序号：`usize::MAX` 让它在排序上排到
+/// 该消息所有真实内容块之后（`transcript::rank` 按块序号升序）。
+///
+/// 为什么复用 `TextId::Message` 而不加一个变体：应用层的非聚焦条带
+/// （`rig_harness_in_3d::workspaces_demo`）清理旧文字块时只保留
+/// `TextId::Message { .. }`；它不在本 crate 的改动范围里，新变体会在那条路径上
+/// 被整块丢掉。block 取最大不会和真实内容块（0、1、……）撞车。
+const STOPPED_BLOCK: usize = usize::MAX;
 
 /// 调用之间的关系：谁启动了谁（子 agent 的调用树）。
 ///
@@ -765,6 +774,21 @@ fn conversation_frame(
 ) -> DialogueFrame {
     let mut frame = DialogueFrame::default();
     let entries: Vec<_> = conversation.entries().collect();
+    // 被停掉的 turn：对话的 turn 记录（`TurnEnd::Stopped`）是停止的**持久**
+    // 来源。live 的 `TurnOutcome` 只在 turn 结束前挂在 turn 实体上，Commit 之后
+    // 实体就没了；上游 `transcript::stop_lines` 读的也是 turn 记录。
+    //
+    // `at` 是停止时这一轮最后一条消息；早于该轮开始、或者已被压缩移走的
+    // 记录不画（上游同样 `entries.of_id(at).is_none() -> continue`）。
+    let mut stopped_after: Vec<usize> = conversation
+        .turns()
+        .filter_map(|(_, record)| match record.end {
+            Some(TurnEnd::Stopped { at: Some(at), .. }) => conversation.index_of(at),
+            _ => None,
+        })
+        .collect();
+    stopped_after.sort_unstable();
+    stopped_after.dedup();
     for (at, entry) in entries.iter().enumerate() {
         let next = entries.get(at + 1).map(|entry| entry.message);
         match entry.message {
@@ -949,8 +973,17 @@ fn conversation_frame(
         };
         frame.requests.push((RenderKey::Aside(id), input));
     }
-    // TODO(stops): 被停掉的 turn 下画的 `[stopped]`（上游 `transcript::stop_lines`，
-    // 读 turn 记录的 `TurnEnd::Stopped`）还没接。
+    // 停止标记：dim 的 `[stopped]`，排在那一轮最后一条消息之后（上游
+    // `transcript::stop_lines` 的 assistant 文案；这里统一一行，不猜停止原因）。
+    for at in stopped_after {
+        frame.text.push((
+            TextId::Message {
+                at,
+                block: STOPPED_BLOCK,
+            },
+            vec![Line::styled("[stopped]", Style::new().dim())],
+        ));
+    }
     frame
 }
 
@@ -2036,6 +2069,135 @@ mod tests {
             .text
             .iter()
             .all(|(_, lines)| !lines_text(lines).contains("summary of the last compaction")));
+    }
+
+    /// 一段用户请求 + assistant 回复的对话。
+    fn answered_conversation() -> (talk::Conversation, talk::MessageId) {
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::user("go"));
+        let reply = conversation.push(Message::assistant("half an answer"));
+        (conversation, reply)
+    }
+
+    fn frame_of(conversation: &talk::Conversation) -> DialogueFrame {
+        conversation_frame(
+            conversation,
+            &CallHistory::default(),
+            &CallTree::default(),
+            &RTheme::default(),
+            80,
+        )
+    }
+
+    /// 这个文字块是不是 `[stopped]`（`TextId::Message` 的 STOPPED_BLOCK）。
+    fn is_stopped(id: &TextId) -> bool {
+        matches!(id, TextId::Message { block, .. } if *block == STOPPED_BLOCK)
+    }
+
+    /// 被停掉的 turn：在它最后一条消息之后画一条 dim 的 `[stopped]`。
+    #[test]
+    fn a_stopped_turn_draws_a_dim_stopped_line_after_its_last_message() {
+        let (mut conversation, reply) = answered_conversation();
+        conversation.open_turn();
+        // 用户按 Esc 停掉：`Stopper::stop` 在 turn 记录里写 `at` = 最后一条消息。
+        conversation.end_turn(TurnEnd::Stopped {
+            by: Some(talk::StopCause::User),
+            at: Some(reply),
+            calls: Vec::new(),
+        });
+        let frame = frame_of(&conversation);
+        let (_, lines) = frame
+            .text
+            .iter()
+            .find(|(id, _)| {
+                *id == TextId::Message {
+                    at: 1,
+                    block: STOPPED_BLOCK,
+                }
+            })
+            .expect("assistant 那一轮（第 1 条消息）之后应有停止标记");
+        assert_eq!(lines_text(lines), "[stopped]");
+        assert!(
+            lines[0].style.add_modifier.contains(Modifier::DIM),
+            "停止标记是 dim 行：{:?}",
+            lines[0].style
+        );
+    }
+
+    /// 正常结束（Answered）的 turn 不画停止标记。
+    #[test]
+    fn an_answered_turn_has_no_stopped_line() {
+        let (mut conversation, reply) = answered_conversation();
+        conversation.open_turn();
+        conversation.end_turn(TurnEnd::Answered {
+            answer: Some(reply),
+        });
+        let frame = frame_of(&conversation);
+        assert!(
+            frame.text.iter().all(|(id, _)| !is_stopped(id)),
+            "Answered 记录不该出现 [stopped]"
+        );
+        assert!(!frame
+            .text
+            .iter()
+            .any(|(_, lines)| lines_text(lines).contains("[stopped]")));
+    }
+
+    /// 没有 `at` 的停止记录（例如压缩在它自己的进程里结束的 turn）没有可判定的
+    /// 落点：不画，别凭空在末尾造一条。
+    #[test]
+    fn a_stop_record_without_a_last_message_draws_nothing() {
+        let (mut conversation, _) = answered_conversation();
+        conversation.open_turn();
+        conversation.end_turn(TurnEnd::Stopped {
+            by: Some(talk::StopCause::User),
+            at: None,
+            calls: Vec::new(),
+        });
+        let frame = frame_of(&conversation);
+        assert!(
+            frame.text.iter().all(|(id, _)| !is_stopped(id)),
+            "没有 at 的停止记录不画"
+        );
+    }
+
+    /// 压缩摘要（`Author::plugin("compaction")` 的 user 条目）本身照常画成
+    /// entry；但 live 的 `Conversation` 不保存"它替换了多少条消息"，所以不能
+    /// 凭空画 `N messages above were compacted`（那需要上游的 `Replaced`/会话
+    /// 日志，本前端都还没有，见 REMAINING §8）。
+    #[test]
+    fn a_compaction_summary_gets_no_invented_message_count() {
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::user("old question"));
+        conversation.push(Message::assistant("old answer"));
+        // `rig_memory::apply_summary` 写进对话的形状：一条 user 条目，作者是
+        // `Author::plugin("compaction")`，正文带这层包裹。
+        let summary = talk::Entry::new(Message::user(
+            "The conversation history before this point was compacted into the following summary:\n\n\
+             <summary>\nold exchange\n</summary>",
+        ))
+        .by(Author::plugin("compaction"));
+        conversation.splice(..2, [summary], Author::plugin("compaction"));
+
+        let frame = frame_of(&conversation);
+        // 摘要本身仍然作为 entry 画出来（不是用户敲的那段文字）。
+        assert!(
+            frame.requests.iter().any(|(key, input)| {
+                matches!(key, RenderKey::Entry(0, 0))
+                    && matches!(input, RenderInput::Entry(entry)
+                        if entry.plugin == "compaction" && entry.text.contains("old exchange"))
+            }),
+            "压缩摘要应照常画成 entry"
+        );
+        // 计数不在 conversation 里：任何一行都不能声称压缩了多少条消息。
+        let all_text = frame
+            .text
+            .iter()
+            .map(|(_, lines)| lines_text(lines))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all_text.contains("messages above were compacted"));
+        assert!(!all_text.contains("message above was compacted"));
     }
 
     #[test]

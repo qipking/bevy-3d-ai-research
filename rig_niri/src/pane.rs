@@ -53,7 +53,7 @@ use crate::frame::{PanelAreas, PanelRoots};
 use crate::keys::KeyFocus;
 use crate::panels::{KeyedRow, PanelId, PanelRows, RowLayout};
 use crate::selection::{Point, Selection};
-use crate::transcript::Row;
+use crate::transcript::{Below, BelowSeen, Row};
 use crate::FeathersSystems;
 
 /// 整段转写的行（未窗口化）。[`crate::batch`] 写它。
@@ -209,63 +209,77 @@ impl PaneScroll {
     }
 }
 
-/// 转写窗格这一帧能放多少行。
+/// 转写窗格这一帧能放多少列、多少行（`(cols, rows)`）。
 ///
 /// 优先看 Niri 的 `Tile`（新窗口逻辑），没有再退回帧布局的 `PanelAreas`。
-fn pane_rows(
+/// 列数只用于宽度裁剪"下面还有"标记（上游 `pane::draw_below` 在窗格比标记
+/// 窄时整句不画）。
+fn pane_size(
     areas: &PanelAreas,
     roots: &PanelRoots,
     tiles: &Query<&crate::niri::Tile>,
     tiling: Option<&crate::niri::Tiling>,
-) -> Option<usize> {
+) -> Option<(usize, usize)> {
     let root = roots.entity(PanelId::Transcript)?;
     if let Ok(tile) = tiles.get(root)
         && let Some(tiling) = tiling
     {
-        let (_, rows) = tiling.tile_cells(tile.layer, tile.column, tile.tile);
-        return (rows > 0).then_some(usize::from(rows));
+        let (cols, rows) = tiling.tile_cells(tile.layer, tile.column, tile.tile);
+        return (rows > 0).then_some((usize::from(cols), usize::from(rows)));
     }
     let area = areas.get(root)?;
-    (!area.is_empty()).then_some(usize::from(area.rows))
+    (!area.is_empty()).then_some((usize::from(area.cols), usize::from(area.rows)))
 }
 
-/// 滚上去时占掉最后一行的标记（rig-tui `pane::draw_below` 的同一句话）。
-/// 滚上去、下面还有行时的标记。
+/// 滚上去、下面还是旧行时占掉最后一行的标记（rig-tui `pane::draw_below` 的同一句话）。
 ///
 /// 只留一份定义：转写引擎的 [`crate::transcript::MORE_BELOW`]（`Below::More` 用的也是它）。
-/// 以前这里另写了一份同样的字符串，两处改一处就会漂。
+/// 滚动之后新到的行用 [`crate::transcript::NEW_OUTPUT`]（`Below::New`），不再单独定义常量。
 pub const BELOW_MARKER: &str = crate::transcript::MORE_BELOW;
 
 /// “下面还有”标记行的 key：`u64::MAX`，不属于任何块（[`item_rows`] 跳过它）。
 const BELOW_MARKER_KEY: u64 = u64::MAX;
 
-fn below_marker() -> KeyedRow {
+/// 最后一行右端的标记行；`text` 是 [`Below::marker`] 给的那句话（窗格太窄时
+/// 传空串：上游仍把最后一行留给标记，只是不画字）。
+///
+/// `hash` 用这一行自己的内容算（[`crate::transcript::row_hash`]）：标记从
+/// `↓ more below` 变成 `↓ new output` 时，面板的增量 diff 才会重画这一行。
+fn below_marker(text: &'static str) -> KeyedRow {
+    let row = Row::new(Line::from("")).with_right(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(RColor::LightCyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let hash = crate::transcript::row_hash(&row);
     KeyedRow {
         key: BELOW_MARKER_KEY,
-        hash: 1,
-        row: Row::new(Line::from("")).with_right(Line::from(Span::styled(
-            BELOW_MARKER,
-            Style::default()
-                .fg(RColor::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ))),
+        hash,
+        row,
     }
 }
 
 /// 把整段的可见窗口写进转写面板（`FeathersSystems::Fit`）。
 ///
 /// 滚上去、下面还有行时，最后一行留给 [`BELOW_MARKER`]（rig-tui 是把标记
-/// 画在最后一行的右端，占掉的是同一行）。
+/// 画在最后一行的右端，占掉的是同一行）。标记的文案由 [`BelowSeen`] 判定：
+/// 滚上去那一刻已经存在的行是 `↓ more below`；之后整段又长了，才换成
+/// `↓ new output`（上游 `pane::draw_below` 的 `Below::{More, New}`）。
+///
+/// 宽度裁剪和上游一致：窗格比标记窄时整句不画，但最后一行仍然留空（上游
+/// `draw_below` 里 `area.width < width` 直接 return）。
 pub fn window_transcript(
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     full: Res<TranscriptRows>,
     mut scroll: ResMut<PaneScroll>,
+    mut seen: ResMut<BelowSeen>,
     mut panels: ResMut<PanelRows>,
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
-    let Some(height) = pane_rows(&areas, &roots, &tiles, tiling.as_deref()) else {
+    let Some((width, height)) = pane_size(&areas, &roots, &tiles, tiling.as_deref()) else {
         return;
     };
     let len = full.len();
@@ -277,15 +291,25 @@ pub fn window_transcript(
     if top != scroll.top {
         scroll.top = top;
     }
-    let below = !scroll.follow && top < max_top && height > 1;
+    // 先让 `BelowSeen` 看到这一帧的 follow/total/top/height：跟随末尾就复位，
+    // 刚离开末尾就记下"已经看到哪里"。
+    let below = seen.of(scroll.follow, len, top, height);
+    // 只有一行的窗格把那一行留给正文（上游 `text_rows` 的同一个分支）。
+    let below = if height > 1 { below } else { Below::Nothing };
+    let marker = below.marker();
+    let marker_fits = marker.is_some_and(|text| Span::from(text).width() <= width);
     let rows_shown = match below {
-        true => height - 1,
-        false => height,
+        Below::Nothing => height,
+        Below::More | Below::New => height - 1,
     };
     let end = (top + rows_shown).min(len);
     let mut rows = full.0[top..end].to_vec();
-    if below {
-        rows.push(below_marker());
+    if below != Below::Nothing {
+        rows.push(below_marker(if marker_fits {
+            marker.unwrap_or_default()
+        } else {
+            ""
+        }));
     }
     panels.set(PanelId::Transcript, rows);
 }
@@ -389,7 +413,7 @@ pub fn pane_keys(
         selection.clear();
     }
 
-    let height = pane_rows(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or(0);
+    let (_, height) = pane_size(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or((0, 0));
     if height == 0 {
         return;
     }
@@ -577,7 +601,7 @@ pub fn pane_wheel(
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
     // 行数每帧从当前区域算（不缓存）：resize 之后这一帧读到的就是新行数。
-    let height = pane_rows(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or(0);
+    let (_, height) = pane_size(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or((0, 0));
     for event in scrolls.read() {
         // 横向滚轮（触摸板的左右滑）不是转写的滚动。
         let over_transcript =
@@ -607,6 +631,7 @@ impl Plugin for PanePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TranscriptRows>()
             .init_resource::<PaneScroll>()
+            .init_resource::<BelowSeen>()
             // 生产里 `PickingPlugin` 已经注册了这个消息；这里补上是为了让不建
             // 窗口的测试 App 也能写 `PointerScroll`（`add_message` 幂等）。
             .add_message::<PointerScroll>()
@@ -754,18 +779,23 @@ mod tests {
 
     // ---- 尺寸变化后的窗口化 ----
 
-    /// 高 `rows` 行的转写面板区域（列数随便给够）。
-    fn pane_area(rows: u16) -> PanelArea {
+    /// 高 `rows` 行、宽 `cols` 列的转写面板区域。
+    fn pane_area_cols(cols: u16, rows: u16) -> PanelArea {
         PanelArea {
-            rect: CellRect::new(0, 0, 80, rows),
+            rect: CellRect::new(0, 0, cols, rows),
             size: Vec2::new(
-                80.0 * crate::frame::CELL.x,
+                f32::from(cols) * crate::frame::CELL.x,
                 f32::from(rows) * crate::frame::CELL.y,
             ),
-            cols: 80,
+            cols,
             rows,
             center: None,
         }
+    }
+
+    /// 宽 80 列、高 `rows` 行的转写面板区域。
+    fn pane_area(rows: u16) -> PanelArea {
+        pane_area_cols(80, rows)
     }
 
     fn keyed_rows(count: usize) -> Vec<KeyedRow> {
@@ -778,11 +808,28 @@ mod tests {
             .collect()
     }
 
+    /// 往整段末尾追加 `count` 行（流式/新一轮输出到达）。
+    fn append_rows(app: &mut App, count: usize) {
+        let start = app.world().resource::<TranscriptRows>().len();
+        let rows: Vec<KeyedRow> = (start..start + count)
+            .map(|index| KeyedRow {
+                key: index as u64,
+                hash: index as u64 + 1,
+                row: Row::new(Line::from(format!("row {index}"))),
+            })
+            .collect();
+        app.world_mut()
+            .resource_mut::<TranscriptRows>()
+            .0
+            .extend(rows);
+    }
+
     /// 一块高 `height` 的转写面板 + 整段 `count` 行；换掉 `PanelAreas` 里的区域
     /// 就是一次 resize（[`window_transcript`] 每帧读当前区域，不缓存）。
     fn windowing_app(count: usize, height: u16, top: usize, follow: bool) -> App {
         let mut app = App::new();
         app.init_resource::<PaneScroll>()
+            .init_resource::<BelowSeen>()
             .init_resource::<PanelRows>();
         let root = app.world_mut().spawn_empty().id();
         app.insert_resource(PanelRoots(HashMap::from([(PanelId::Transcript, root)])));
@@ -843,6 +890,116 @@ mod tests {
         assert_eq!(rows.first().map(String::as_str), Some("row 90"));
         assert_eq!(rows.last().map(String::as_str), Some("row 99"));
         assert_eq!(app.world().resource::<PaneScroll>().top, 90);
+    }
+
+    // ---- “下面还有”标记：more below / new output（上游 pane::draw_below） ----
+
+    /// 跟随末尾时没有标记：最后一行就是真正的末行。
+    #[test]
+    fn following_the_tail_draws_no_below_marker() {
+        let mut app = windowing_app(100, 10, 90, true);
+        app.update();
+        let rows = visible_rows(&app);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.last().map(String::as_str), Some("row 99"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("more below") || row.contains("new output")),
+            "{rows:?}"
+        );
+    }
+
+    /// 滚上去：先画 `↓ more below`；此时追加新行 → 变成 `↓ new output`。
+    #[test]
+    fn scrolling_up_shows_more_below_then_new_output_when_rows_arrive() {
+        let mut app = windowing_app(100, 10, 80, false);
+        app.update();
+        let rows = visible_rows(&app);
+        assert_eq!(rows.len(), 10, "9 行正文 + 1 行标记");
+        assert_eq!(rows.first().map(String::as_str), Some("row 80"));
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(" ↓ more below (PgDn) "),
+            "滚上去、下面还是旧行：more below"
+        );
+        assert_eq!(app.world().resource::<BelowSeen>().seen(), 100);
+        assert!(app.world().resource::<BelowSeen>().scrolled());
+
+        append_rows(&mut app, 5);
+        app.update();
+        let rows = visible_rows(&app);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("row 80"),
+            "新行到达不该移动用户正在看的位置"
+        );
+        assert_eq!(
+            rows.last().map(String::as_str),
+            Some(" ↓ new output (PgDn) "),
+            "滚动之后才到的行：new output"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("more below")),
+            "两种标记不能同时出现：{rows:?}"
+        );
+    }
+
+    /// 滚回底部：标记消失，`BelowSeen` 复位（下一次上滚重新从 More 开始）。
+    #[test]
+    fn scrolling_back_to_the_bottom_clears_the_marker_and_resets_below_seen() {
+        let mut app = windowing_app(100, 10, 80, false);
+        app.update();
+        append_rows(&mut app, 5);
+        app.update();
+        assert_eq!(
+            visible_rows(&app).last().map(String::as_str),
+            Some(" ↓ new output (PgDn) ")
+        );
+
+        // PgDn 到底 / `Scroll::follow`：窗顶回到 max_top，重新跟随末尾。
+        let max_top = 105 - 10;
+        app.world_mut()
+            .resource_mut::<PaneScroll>()
+            .to(None, max_top);
+        app.update();
+
+        let rows = visible_rows(&app);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.last().map(String::as_str), Some("row 104"));
+        assert!(
+            !rows.iter().any(|row| row.contains("PgDn")),
+            "回到末尾就不再占一行给标记：{rows:?}"
+        );
+        let seen = app.world().resource::<BelowSeen>();
+        assert!(!seen.scrolled(), "跟随末尾后 BelowSeen 复位");
+        assert_eq!(seen.seen(), 105, "记下的行数跟着整段更新");
+    }
+
+    /// 窗格比标记窄：整句不画（上游 `draw_below` 的宽度裁剪），最后一行留空。
+    #[test]
+    fn a_pane_narrower_than_the_below_marker_leaves_the_last_row_blank() {
+        let mut app = windowing_app(100, 10, 80, false);
+        let root = app
+            .world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Transcript)
+            .expect("转写面板根");
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .insert(root, pane_area_cols(8, 10));
+        app.update();
+
+        let rows = visible_rows(&app);
+        assert_eq!(rows.len(), 10, "标记行仍被保留，只是不画字");
+        assert_eq!(rows.last().map(String::as_str), Some(""));
+        assert!(
+            !rows.iter().any(|row| row.contains("PgDn")),
+            "窗格 8 列放不下整句：{rows:?}"
+        );
+        assert!(app.world().resource::<BelowSeen>().scrolled());
     }
 
     // ---- 滚轮接线：不建窗口，直接写 PointerScroll 消息 ----
@@ -1013,6 +1170,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<TranscriptRows>()
             .init_resource::<PaneScroll>()
+            .init_resource::<BelowSeen>()
             .init_resource::<PanelRows>()
             .init_resource::<PanelAreas>()
             .init_resource::<PanelRoots>()
@@ -1106,7 +1264,7 @@ mod tests {
         let mut rows = block_rows(0, &["a", "b"]);
         rows.extend(block_rows(1, &["c", "d", "e"]));
         let mut with_marker = rows.clone();
-        with_marker.push(below_marker());
+        with_marker.push(below_marker(BELOW_MARKER));
         assert_eq!(
             item_rows(&with_marker),
             vec![

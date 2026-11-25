@@ -6,6 +6,13 @@
 //! 还能把打的字本身当答案；`multiple` 的 picker 用 Tab 打勾、回车交 `Chosen::items`；
 //! 有 `PickItem::parent` 时是一棵树，←/→ 折叠。
 //!
+//! 键位和上游 `pick::choice_key` 对齐的部分：Alt+1..9 直接选并确认第 n 个可见项
+//! （Alt+0 取消，和 Esc 一样），但只在 picker 显示时由 [`picker_keys`] 接管；没有
+//! picker 时这些键仍归输入框（Ask 的 [`crate::keys::InlineKey`]）/ 插件绑定。
+//! 非树 picker 的 → 展开选中项的完整说明（`PickItem::more`，没有就用 `detail`；
+//! 再按一次收起，← 也收起），↑↓/PgUp/PgDn 移动时列表体跟着滚动；过滤/重新填充
+//! 后按条目身份（标签，其次条目下标）把选中项找回来。
+//!
 //! **这里没有浮层**：picker 是条带最右边的一列——在 `FrameTree` 根的
 //! `Split::Horizontal` 末尾追加一个 `Child`，里面是一块 [`PanelId::Picker`]
 //! 容器（底色 + 边框），容器内部再竖着分成 [`PanelId::List`]（标题 / 说明 /
@@ -18,13 +25,15 @@
 //! 这个队列：它是条带里的确认 tile（见 `batch::confirm_rows`），没有弹层。
 
 use bevy::prelude::*;
-use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
+use bevy::input::{ButtonInput, ButtonState};
 use rig_harness::pick::{PickItem, PickPreview, TickBox, Ticked};
 use rig_harness::prelude::{Chosen, Highlighted, Pick, Picker};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
 use crate::frame::{FramePanel, FrameTree, Look, PanelAreas, PanelRoots, spawn_panel};
+use crate::keys::Modifiers;
 use crate::layout::{Child, Node, NO_GAP, Size, Split};
 use crate::panels::{KeyedRow, PanelId, PanelRows, PanelSpawned};
 use crate::theme::Theme;
@@ -65,6 +74,15 @@ pub struct PickerInput {
     pub rows: Vec<Option<usize>>,
     /// 选中的是第几行。
     pub selected: usize,
+    /// 列表体的第一行（rig 的 `scroll`）：选中项永远落在可见窗口里，
+    /// 渲染时按面板能放的行数把窗口滚过去。
+    pub scroll: usize,
+    /// 是否展开选中项的完整说明（rig 的 `more`）：展开的说明行紧跟在选中行
+    /// 下面，再按一次收起。
+    pub more: bool,
+    /// 上一次选中的条目身份 `(条目下标, 标签)`（rig 的 `picked`）：过滤词
+    /// 变化或插件重新填充条目后，按它把选中项找回来。
+    pub picked: Option<(usize, String)>,
 }
 
 impl PickerInput {
@@ -231,10 +249,110 @@ fn tick_box(picker: &Picker, index: usize, ticked: &[usize]) -> TickBox {
     TickBox::of(&parents, index, ticked)
 }
 
-/// 重算可见行，并把选中行夹回范围里。
-fn refresh(state: &mut PickerInput, picker: &Picker) {
+/// 条目 `index` 展开时显示的完整说明：`PickItem::more`，没有就用 `detail`
+/// （和上游 `Listing` 把 `more` 退回 `detail` 同一条规则）。
+fn more_text<'a>(picker: &'a Picker, index: usize) -> Option<&'a str> {
+    let item = picker.items.get(index)?;
+    item.more.as_deref().or(item.detail.as_deref())
+}
+
+/// 条目 `index` 的身份 `(条目下标, 标签)`（rig 的 `picked`）。
+fn identity(picker: &Picker, index: usize) -> Option<(usize, String)> {
+    picker
+        .items
+        .get(index)
+        .map(|item| (index, item.label.clone()))
+}
+
+/// 当前选中行的条目身份；选中 free_text 的作答行时没有身份。
+fn identity_of(state: &PickerInput, picker: &Picker) -> Option<(usize, String)> {
+    identity(picker, state.rows.get(state.selected).copied().flatten()?)
+}
+
+/// 在 `rows` 里找回 `picked`：先找同标签的条目，再找同一条目下标的
+/// （过滤只留下序号对不上但身份相同的情况；两个都没有就是 `None`）。
+fn find_picked(
+    rows: &[Option<usize>],
+    picker: &Picker,
+    picked: Option<&(usize, String)>,
+) -> Option<usize> {
+    let (index, label) = picked?;
+    rows.iter()
+        .position(|row| {
+            row.and_then(|at| picker.items.get(at))
+                .is_some_and(|item| item.label == *label)
+        })
+        .or_else(|| rows.iter().position(|row| *row == Some(*index)))
+}
+
+/// 展开的说明行：`text` 按 `width` 列折行（和 body 用同一个 `wrap_all`），每行
+/// 缩进 4 格、宽度里已经扣掉这 4 格，所以任何一行的显示宽度都不超过列宽。
+fn more_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let lines: Vec<Line<'static>> = text
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect();
+    // 窄面板上缩进也跟着缩，保证"缩进 + 折行宽度"不超过列宽。
+    let indent = width.saturating_sub(1).min(4);
+    rig_tui::wrap::wrap_all(&lines, width.saturating_sub(indent).max(1))
+        .into_iter()
+        .map(|line| {
+            let line = line.patch_style(style);
+            let mut spans = vec![span(" ".repeat(indent), style)];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// 重算可见行，并按身份把选中项找回来（rig 的 `refill`）。
+///
+/// 插件重新填充条目、树展开/折叠、picker 刚打开时都走这里：同标签的条目
+/// 优先，其次是同一条目下标；都没有就留在原来那行（夹回范围）。
+fn refill(state: &mut PickerInput, picker: &Picker) {
+    // `picked` 优先：插件重新填充时 `state.rows` 还是旧条目的行号，按它算身份
+    // 会把新条目的同一行号错认成选中项。
+    let picked = state.picked.clone().or_else(|| identity_of(state, picker));
     state.rows = rows_for(picker, &state.filter, &state.open);
-    state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+    state.selected = find_picked(&state.rows, picker, picked.as_ref())
+        .unwrap_or(state.selected)
+        .min(state.rows.len().saturating_sub(1));
+    state.picked = identity_of(state, picker);
+    state.scroll = state.scroll.min(state.selected);
+}
+
+/// 过滤词变了：重算可见行，选中的条目还在列表里就留在它上面，不在了回到
+/// 第一行（和上游 `found_row` 的“找不到就 0”一致；`picked` 让同一个标签
+/// 在过滤后仍被选中）。
+fn refilter(state: &mut PickerInput, picker: &Picker) {
+    let picked = state.picked.clone().or_else(|| identity_of(state, picker));
+    state.rows = rows_for(picker, &state.filter, &state.open);
+    state.selected = find_picked(&state.rows, picker, picked.as_ref())
+        .unwrap_or(0)
+        .min(state.rows.len().saturating_sub(1));
+    state.picked = identity_of(state, picker);
+    state.scroll = state.scroll.min(state.selected);
+}
+
+/// 让选中行（以及它下面 `tail` 行，比如刚展开的说明）落进 `visible` 行的
+/// 窗口里，返回窗口第一行（rig 的 `scroll`，记的是列表体的第一行）。
+///
+/// 第一行不会越过选中行本身：滚动只跟着选中项走，不会把选中项滚出视野；
+/// 首尾都夹在 `0..=总行数-可见行数` 里，选项不够一屏时窗口就是 0。
+fn scroll_to_selected(state: &mut PickerInput, visible: usize, total: usize, tail: usize) -> usize {
+    let visible = visible.max(1);
+    let end = state.selected.saturating_add(1 + tail);
+    if state.selected < state.scroll {
+        state.scroll = state.selected;
+    }
+    if end > state.scroll.saturating_add(visible) {
+        state.scroll = end.saturating_sub(visible);
+    }
+    state.scroll = state
+        .scroll
+        .min(state.selected)
+        .min(total.saturating_sub(visible));
+    state.scroll
 }
 
 /// 树上 ←/→：打开分支、落到第一个子项，或者关上、回到父项（rig 的 `unfold`）。
@@ -246,7 +364,7 @@ fn unfold(state: &mut PickerInput, picker: &Picker, open: bool) {
     match (open, is_branch(picker, index), is_open) {
         (true, true, false) => {
             state.open.push(index);
-            refresh(state, picker);
+            refill(state, picker);
         }
         (true, true, true) => {
             if let Some(Some(next)) = state.rows.get(state.selected + 1).copied()
@@ -257,7 +375,7 @@ fn unfold(state: &mut PickerInput, picker: &Picker, open: bool) {
         }
         (false, true, true) => {
             state.open.retain(|branch| *branch != index);
-            refresh(state, picker);
+            refill(state, picker);
         }
         (false, _, _) => {
             if let Some(up) = parent(picker, index)
@@ -513,10 +631,16 @@ pub fn sync_picker(
             state.filter.clear();
             state.ticked.clear();
             state.touched = false;
+            state.more = false;
+            state.scroll = 0;
             state.selected = picker.selected;
             // 一开始选中项上面的分支都是打开的（rig 的 `open`）。
             state.open = branches(picker, state.selected).collect();
-            refresh(&mut state, picker);
+            // 初始选中项的身份先记下来，`refill` 按它在可见行里找回同一项
+            // （折叠着的分支会让条目下标和行号不同）。
+            state.picked = identity(picker, picker.selected);
+            state.rows.clear();
+            refill(&mut state, picker);
         }
         (Some((picker_entity, picker)), Some(_)) => {
             if state.picker != Some(picker_entity) {
@@ -524,14 +648,16 @@ pub fn sync_picker(
                 state.filter.clear();
                 state.ticked.clear();
                 state.touched = false;
+                state.more = false;
+                state.scroll = 0;
                 state.selected = picker.selected;
                 state.open = branches(picker, state.selected).collect();
-            }
-            // 条目被插件重新填过时，行也跟着变。
-            let rows_now = rows_for(picker, &state.filter, &state.open);
-            if rows_now != state.rows {
-                state.rows = rows_now;
-                state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+                state.picked = identity(picker, picker.selected);
+                state.rows.clear();
+                refill(&mut state, picker);
+            } else if rows_for(picker, &state.filter, &state.open) != state.rows {
+                // 条目被插件重新填过时，行也跟着变；选中项按身份找回来。
+                refill(&mut state, picker);
             }
             if picker.multiple && state.touched {
                 let ticked = state.ticked.clone();
@@ -638,12 +764,71 @@ pub fn mark_highlighted(
     }
 }
 
-/// 浮层的键位：打字过滤、↑↓ 选、PgUp/PgDn 翻页、←/→ 折叠、Tab 打勾、回车、Esc。
+/// `code` 是哪个修饰键的位（[`Modifiers::is_modifier`] 为真时用）。
+fn modifier_bit(code: KeyCode) -> Modifiers {
+    match code {
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => Modifiers::SHIFT,
+        KeyCode::ControlLeft | KeyCode::ControlRight => Modifiers::CONTROL,
+        KeyCode::AltLeft | KeyCode::AltRight => Modifiers::ALT,
+        KeyCode::SuperLeft | KeyCode::SuperRight => Modifiers::SUPER,
+        _ => Modifiers::NONE,
+    }
+}
+
+/// 一次按键事件里的数字（Alt+1..9/Alt+0）：先看逻辑键（字符键是数字就是），
+/// 逻辑键认不出来时退回物理键码。
+fn digit_of(event: &KeyboardInput) -> Option<u8> {
+    if let Key::Character(chars) = &event.logical_key {
+        let mut characters = chars.chars();
+        if let (Some(digit), None) = (characters.next(), characters.next())
+            && digit.is_ascii_digit()
+        {
+            return Some(digit as u8 - b'0');
+        }
+        // 有些布局里 Alt+1 的逻辑键是别的字符（macOS 的 `¡`）：退回物理键码。
+    }
+    match event.key_code {
+        KeyCode::Digit0 | KeyCode::Numpad0 => Some(0),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(1),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(2),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(3),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some(4),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some(5),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some(6),
+        KeyCode::Digit7 | KeyCode::Numpad7 => Some(7),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some(8),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some(9),
+        _ => None,
+    }
+}
+
+/// Alt+`number` 在当前 picker 上做什么（rig 的 `answer` 的数字版）：`0` 取消
+/// （和 Esc 一样交 `Pick::person(picker, None)`），`n` 直接选并确认第 n 个
+/// 可见项（和点它一样交 `Chosen::item`）。没有第 n 项时什么也不做——free_text
+/// 的作答行不是条目，不能点，也不能用数字“确认”。
+fn choice_key(number: u8, state: &PickerInput) -> Option<Option<Chosen>> {
+    match number {
+        0 => Some(None),
+        number => {
+            let index = state.rows.get(usize::from(number) - 1).copied().flatten()?;
+            Some(Some(Chosen::item(index)))
+        }
+    }
+}
+
+/// picker 显示时的键位：打字过滤、↑↓ 选、PgUp/PgDn 翻页、←/→（树里折叠，
+/// 平表里展开/收起说明）、Tab 打勾、回车、Esc，以及 Alt+1..9 直接选第 n 项、
+/// Alt+0 取消。
+///
+/// 整个系统只在 `state.picker` 有值时跑：没有 picker 时 Alt+1..9/Alt+0 的
+/// 事件一行都不读，仍由 `editor::keys` 交给 Ask 的内联绑定或插件绑定
+/// （和 `keys::arm_inline_keys` 同一条边界）。
 pub fn picker_keys(
     mut input: MessageReader<KeyboardInput>,
     mut state: ResMut<PickerInput>,
     mut pickers: Query<&mut Picker>,
     mut commands: Commands,
+    held: Option<Res<ButtonInput<KeyCode>>>,
 ) {
     let Some(picker_entity) = state.picker else {
         return;
@@ -652,12 +837,41 @@ pub fn picker_keys(
         return;
     };
     let tree = tree(&picker);
+    // 和 `editor::keys` 一样逐事件跟踪修饰键：同一帧里先按 Alt 再按数字
+    // 也能算 Alt+数字，不依赖 `ButtonInput` 的帧尾状态。
+    let mut modifiers = held.as_deref().map(Modifiers::from_held).unwrap_or_default();
     let mut dirty = false;
     for event in input.read() {
-        if event.state != bevy::input::ButtonState::Pressed {
+        if Modifiers::is_modifier(event.key_code) {
+            match event.state {
+                ButtonState::Pressed => modifiers.insert(modifier_bit(event.key_code)),
+                ButtonState::Released => modifiers.remove(modifier_bit(event.key_code)),
+            }
+            continue;
+        }
+        if event.state != ButtonState::Pressed {
+            continue;
+        }
+        // Alt+1..9 / Alt+0：picker 显示时由这里接管。Ctrl/Super 一起按着
+        // 不算（那是别的绑定），按住不放的重复事件也只认一次。
+        if modifiers.contains(Modifiers::ALT)
+            && !modifiers.intersects(Modifiers::CONTROL | Modifiers::SUPER)
+            && !event.repeat
+            && let Some(number) = digit_of(event)
+        {
+            match choice_key(number, &state) {
+                Some(Some(chosen)) => {
+                    commands.trigger(Pick::person(picker_entity, Some(chosen)));
+                }
+                Some(None) => {
+                    commands.trigger(Pick::person(picker_entity, None));
+                }
+                None => {}
+            }
             continue;
         }
         let last = state.rows.len().saturating_sub(1);
+        let typing = !modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER);
         match &event.logical_key {
             Key::ArrowUp => {
                 state.selected = state.selected.saturating_sub(1);
@@ -683,29 +897,39 @@ pub fn picker_keys(
                 unfold(&mut state, &picker, false);
                 dirty = true;
             }
+            // 平表：→ 展开选中项的完整说明，再按一次收起；← 也收起。
+            // （上游把它交给插件的 `ChoiceKeys`；本 crate 还没有那套自定义
+            // 键，所以先给 → 一个自带的切换键。）
+            Key::ArrowRight => {
+                state.more = !state.more;
+                dirty = true;
+            }
+            Key::ArrowLeft => {
+                if state.more {
+                    state.more = false;
+                    dirty = true;
+                }
+            }
             Key::Tab if picker.multiple => {
                 tick(&mut state, &picker);
                 dirty = true;
             }
             Key::Backspace => {
                 state.filter.pop();
-                state.selected = 0;
-                refresh(&mut state, &picker);
+                refilter(&mut state, &picker);
                 dirty = true;
             }
-            Key::Character(chars) if !chars.is_empty() => {
+            Key::Character(chars) if !chars.is_empty() && typing => {
                 match &event.text {
                     Some(text) => state.filter.push_str(text),
                     None => state.filter.push_str(chars),
                 }
-                state.selected = 0;
-                refresh(&mut state, &picker);
+                refilter(&mut state, &picker);
                 dirty = true;
             }
-            Key::Space if state.filter.len() < 200 => {
+            Key::Space if state.filter.len() < 200 && typing => {
                 state.filter.push(' ');
-                state.selected = 0;
-                refresh(&mut state, &picker);
+                refilter(&mut state, &picker);
                 dirty = true;
             }
             Key::Enter => {
@@ -724,13 +948,15 @@ pub fn picker_keys(
         if let Some(Some(index)) = state.rows.get(state.selected).copied() {
             picker.selected = index;
         }
+        // 下次过滤/重新填充按这个身份找回选中项。
+        state.picked = identity_of(&state, &picker);
     }
 }
 
 /// 把当前 picker 画成浮层的行：标题、说明、输入行、列表、键位行。
 pub fn picker_rows(
     mut panels: ResMut<PanelRows>,
-    state: Res<PickerInput>,
+    mut state: ResMut<PickerInput>,
     pickers: Query<&Picker>,
     theme: Res<Theme>,
     areas: Res<PanelAreas>,
@@ -812,13 +1038,23 @@ pub fn picker_rows(
     let used = rows.len();
     let rows_left = usize::from(area.rows).saturating_sub(used + 2);
     let visible = rows_left.max(1);
-    // 选中行滚到可见范围里（rig-tui 的 `rows` 也做同样的事）。
-    let first = state
-        .selected
-        .saturating_sub(visible.saturating_sub(1))
-        .min(state.rows.len().saturating_sub(visible));
     let tree = tree(&picker);
-    for (row_index, item_index) in state.rows.iter().enumerate().skip(first).take(visible) {
+    // `more`：选中项的完整说明（`more`，没有就用 `detail`）按列宽折行，紧跟在
+    // 选中行下面；窗口把第一行也尽量露出来（`tail`），再大就只保住选中行。
+    let more = match (state.more, state.rows.get(state.selected).copied().flatten()) {
+        (true, Some(index)) => more_text(&picker, index)
+            .map(|text| more_lines(text, usize::from(area.cols), dim))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let total = state.rows.len() + more.len();
+    // 列表体的第一行（rig 的 `scroll`）：选中行一定在窗口里，首尾都夹住。
+    let first = scroll_to_selected(&mut state, visible, total, usize::from(!more.is_empty()));
+    let mut drawn = 0usize;
+    for (row_index, item_index) in state.rows.iter().enumerate().skip(first) {
+        if drawn >= visible {
+            break;
+        }
         let selected = row_index == state.selected;
         let marker = if selected { "> " } else { "  " };
         let marker_style = if selected { selected_style } else { dim };
@@ -879,6 +1115,22 @@ pub fn picker_rows(
             row = row.band(theme.band);
         }
         rows.push(keyed(key_of(&["row", &row_index.to_string()]), key_hash, row));
+        drawn += 1;
+        if row_index != state.selected {
+            continue;
+        }
+        // 展开的说明：不点选、不套选中底色，只是选中行下面的几行文字。
+        for (line_index, line) in more.iter().enumerate() {
+            if drawn >= visible {
+                break;
+            }
+            rows.push(keyed(
+                key_of(&["more", &row_index.to_string(), &line_index.to_string()]),
+                key_of(&[&line.to_string(), "more"]),
+                Row::new(line.clone()),
+            ));
+            drawn += 1;
+        }
     }
     if state.rows.is_empty() {
         rows.push(keyed(
@@ -894,12 +1146,26 @@ pub fn picker_rows(
     let mut keys: Vec<(&'static str, u8)> = vec![("↑↓ 选择", 9), ("Enter 确认", 10), ("Esc 关闭", 8)];
     if !picker.items.is_empty() {
         keys.push(("打字过滤", 7));
+        keys.push(("Alt+1..9 选", 5));
     }
     if picker.multiple {
         keys.push(("Tab 打勾", 6));
     }
     if tree {
         keys.push(("←/→ 折叠", 5));
+    }
+    // 平表里 → 展开/收起选中项的说明（树里 → 是折叠，没有这个提示）。
+    let has_more = state
+        .rows
+        .get(state.selected)
+        .copied()
+        .flatten()
+        .is_some_and(|index| more_text(&picker, index).is_some());
+    if !tree && has_more {
+        keys.push(match state.more {
+            true => ("→ 收起", 6),
+            false => ("→ 说明", 6),
+        });
     }
     if picker.free_text {
         keys.push(("打字作答", 7));
@@ -1164,14 +1430,19 @@ mod tests {
         Picker::new(title).item(label, "")
     }
 
-    /// 给列里的列表 tile 一块区域，让 `picker_rows` 真的产出行。
-    fn give_list_an_area(app: &mut App) -> Entity {
+    /// 给列里的列表 tile 一块 `rect` 大小的区域，让 `picker_rows` 真的产出行。
+    fn give_list_area(app: &mut App, rect: CellRect) -> Entity {
         let list = column_entities(app).1.expect("列表面板");
-        app.world_mut().resource_mut::<PanelAreas>().0.insert(
-            list,
-            PanelArea::new(CellRect::new(64, 0, 32, 28), PanelInset::DEFAULT),
-        );
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .insert(list, PanelArea::new(rect, PanelInset::DEFAULT));
         list
+    }
+
+    /// 默认区域（32 列 × 28 行）的便捷入口。
+    fn give_list_an_area(app: &mut App) -> Entity {
+        give_list_area(app, CellRect::new(64, 0, 32, 28))
     }
 
     /// 列表 tile 这一帧画出来的全部文字（标题、说明、条目、键位行）。
@@ -1264,6 +1535,52 @@ mod tests {
             window: Entity::PLACEHOLDER,
         });
         app.update();
+    }
+
+    /// Alt+数字：先发修饰键、再发数字键（窗口事件不带修饰键字段，靠事件顺序
+    /// 跟踪，和 `editor::keys` 的测试同一手法），最后松开 Alt。
+    fn press_alt_digit(app: &mut App, digit: char) {
+        let code = match digit {
+            '0' => KeyCode::Digit0,
+            '1' => KeyCode::Digit1,
+            '2' => KeyCode::Digit2,
+            '3' => KeyCode::Digit3,
+            '4' => KeyCode::Digit4,
+            '5' => KeyCode::Digit5,
+            '6' => KeyCode::Digit6,
+            '7' => KeyCode::Digit7,
+            '8' => KeyCode::Digit8,
+            '9' => KeyCode::Digit9,
+            other => panic!("测试只用 Alt+0..9，实际 {other}"),
+        };
+        for (key_code, logical_key) in [
+            (KeyCode::AltLeft, Key::Alt),
+            (code, Key::Character(digit.to_string().into())),
+        ] {
+            app.world_mut().write_message(KeyboardInput {
+                key_code,
+                logical_key,
+                state: ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        }
+        app.update();
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::AltLeft,
+            logical_key: Key::Alt,
+            state: ButtonState::Released,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    /// 列表 tile 这一帧的行数（标题、说明、过滤、条目、键位行）。
+    fn list_row_count(app: &App) -> usize {
+        app.world().resource::<PanelRows>().get(PanelId::List).len()
     }
 
     fn column_entities(app: &App) -> (Option<Entity>, Option<Entity>, Option<Entity>) {
@@ -1625,6 +1942,370 @@ mod tests {
             app.world().resource::<SeenPicks>().0.last(),
             Some(&(picker, None))
         );
+    }
+
+    /// Alt+1 直接选第 1 项并确认：和点击一样交 `Chosen::item(0)`，不往过滤
+    /// 词里打字。
+    #[test]
+    fn alt_one_picks_the_first_item_like_a_click() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("a", None), ("b", None), ("c", None)], false),
+        );
+        press_alt_digit(&mut app, '1');
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(0)))),
+            "Alt+1 = 点第一行：同一个 Pick/Chosen"
+        );
+        assert_eq!(
+            app.world().resource::<PickerInput>().filter,
+            "",
+            "Alt+1 不往过滤词里打字符"
+        );
+    }
+
+    /// Alt+3 选第 3 项并确认。
+    #[test]
+    fn alt_three_picks_the_third_item() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("a", None), ("b", None), ("c", None)], false),
+        );
+        press_alt_digit(&mut app, '3');
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(2))))
+        );
+    }
+
+    /// Alt+0 取消：和 Esc 一样交 `Pick::person(picker, None)`。
+    #[test]
+    fn alt_zero_cancels_the_picker() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        press_alt_digit(&mut app, '0');
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, None))
+        );
+    }
+
+    /// 越界的 Alt+数字什么都不做（不 panic、不产生 Pick）。
+    #[test]
+    fn alt_past_the_last_item_answers_nothing() {
+        let mut app = tiled_app();
+        let _picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        press_alt_digit(&mut app, '3');
+        assert!(app.world().resource::<SeenPicks>().0.is_empty());
+    }
+
+    /// 没有 picker 时 Alt+1..9/Alt+0 仍归输入框：插件的 Alt+1 绑定照常
+    /// 收到 `KeyPressed`；picker 一出现才由 picker 接管（和 Ask 的
+    /// `arm_inline_keys` 同一条边界）。
+    #[test]
+    fn alt_digits_stay_with_the_input_when_no_picker_shows() {
+        #[derive(Resource, Default)]
+        struct Pressed(bool);
+
+        use crate::keys::AppKeyBindingsExt;
+
+        let mut app = tiled_app();
+        // 输入键分派（`editor::keys`）只在没有 picker 时跑，和 `EditorPlugin`
+        // 的 `run_if(crate::picker::no_picker)` 一样。
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<crate::editor::Editor>()
+            .init_resource::<crate::editor::SubmittedPrompts>()
+            .init_resource::<crate::keys::KeyFocus>()
+            .init_resource::<crate::keys::PendingInput>()
+            .add_message::<crate::editor::PromptSubmitted>();
+        crate::keys::add_built_in(&mut app);
+        app.init_resource::<Pressed>();
+        app.add_key_binding(
+            crate::keys::KeyBinding::new(crate::keys::KeyPress::alt('1'), "Plugin")
+                .in_scope(crate::keys::KeyScope::Global),
+            |_pressed: On<crate::keys::KeyPressed>, mut seen: ResMut<Pressed>| seen.0 = true,
+        );
+        app.add_systems(Update, crate::editor::keys.run_if(crate::picker::no_picker));
+        app.update();
+
+        press_alt_digit(&mut app, '1');
+        assert!(
+            app.world().resource::<Pressed>().0,
+            "没有 picker：Alt+1 不能被 picker 吞掉，插件绑定要收到 KeyPressed"
+        );
+        assert!(
+            app.world().resource::<SeenPicks>().0.is_empty(),
+            "没有 picker：Alt+1 不产生 Pick"
+        );
+
+        // picker 出现后，同样的键归 picker：直接确认第 1 项，插件绑定不再响。
+        app.world_mut().resource_mut::<Pressed>().0 = false;
+        let picker = spawn_picker(&mut app, picker(&[("a", None), ("b", None)], false));
+        press_alt_digit(&mut app, '1');
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(0)))),
+            "picker 显示时 Alt+1 由 picker 接管"
+        );
+        assert!(
+            !app.world().resource::<Pressed>().0,
+            "picker 显示时 Alt+1 不再落到插件绑定"
+        );
+    }
+
+    /// 带 `more` 的 picker：第二项有完整说明。
+    fn picker_with_more() -> Picker {
+        let mut picker = Picker::new("说明");
+        picker
+            .items
+            .push(PickItem::new("short", "").detail("short detail"));
+        let mut long = PickItem::new("long", "");
+        long.detail = Some("one line".into());
+        long.more = Some("the long description of the second item ".repeat(6));
+        picker.items.push(long);
+        picker
+    }
+
+    /// → 展开选中项的完整说明：列表体多出按列宽折行的说明行，再按一次收起。
+    #[test]
+    fn more_expands_and_collapses_the_selected_items_description() {
+        let mut app = tiled_app();
+        let _picker = spawn_picker(&mut app, picker_with_more());
+        let list = give_list_an_area(&mut app);
+        app.update();
+        let before = list_row_count(&app);
+
+        // 选中第二项（有 more 的那条）。
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        press(&mut app, KeyCode::ArrowRight, Key::ArrowRight);
+        let expanded = list_row_count(&app);
+        assert!(
+            expanded > before,
+            "展开后列表体要多出说明行：{before} → {expanded}"
+        );
+
+        let text = list_text(&app);
+        assert!(
+            text.contains("the long description of"),
+            "展开的完整说明要画出来（按列宽折行）：{text}"
+        );
+        // 说明紧跟在选中行下面。
+        let rows = app.world().resource::<PanelRows>().get(PanelId::List);
+        let selected_at = rows
+            .iter()
+            .position(|keyed| keyed.row.line.to_string().contains("> long"))
+            .expect("选中行");
+        assert!(
+            rows[selected_at + 1]
+                .row
+                .line
+                .to_string()
+                .contains("the long description of"),
+            "说明行在选中行下面"
+        );
+        // 按列宽折行、不越界。
+        let cols = usize::from(
+            app.world()
+                .resource::<PanelAreas>()
+                .get(list)
+                .expect("列表区域")
+                .cols,
+        );
+        for keyed in rows {
+            assert!(
+                keyed.row.line.width() <= cols,
+                "行宽 {} 越界（{cols} 列）：{}",
+                keyed.row.line.width(),
+                keyed.row.line
+            );
+        }
+        // 说明行都有 4 格缩进（条目行的标记只有 2 格）。
+        let wrapped = rows
+            .iter()
+            .filter(|keyed| keyed.row.line.to_string().starts_with("    "))
+            .count();
+        assert!(wrapped > 1, "长说明要折成多行（实际 {wrapped} 行）");
+
+        // 再按一次 → 收起，行数恢复到展开前。
+        press(&mut app, KeyCode::ArrowRight, Key::ArrowRight);
+        assert_eq!(list_row_count(&app), before, "收起后行数恢复");
+        assert!(!list_text(&app).contains("the long description of"));
+    }
+
+    /// 选项比可见行多时，列表体跟着选中项滚动；首尾都不越界。
+    #[test]
+    fn scrolling_follows_the_selection_and_stops_at_the_ends() {
+        let mut app = tiled_app();
+        let labels: Vec<String> = (0..20).map(|index| format!("item{index:02}")).collect();
+        let items: Vec<(&str, Option<&str>)> =
+            labels.iter().map(|label| (label.as_str(), None)).collect();
+        let _picker = spawn_picker(&mut app, picker(&items, false));
+        give_list_area(&mut app, CellRect::new(64, 0, 32, 12));
+        app.update();
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.rows.len(), 20);
+            assert_eq!(state.scroll, 0, "一打开从第一行开始");
+        }
+
+        // ↓ 到第 13 行：窗口滚到 6，选中行在最下面。
+        for _ in 0..12 {
+            press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        }
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 12);
+            assert_eq!(state.scroll, 6, "窗口跟着选中项走");
+        }
+        let text = list_text(&app);
+        assert!(text.contains("item12"), "选中项可见：{text}");
+        assert!(!text.contains("item00"), "顶部已经滚出去了：{text}");
+
+        // 到尾巴：选中最后一项，窗口停在最大位置，不越界。
+        for _ in 0..10 {
+            press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        }
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 19);
+            assert_eq!(state.scroll, 13, "看得见 7 行：20 - 7");
+        }
+        let text = list_text(&app);
+        assert!(text.contains("item19"), "最后一项可见：{text}");
+        assert!(!text.contains("item00"));
+
+        // 再按 ↓ 也不越界。
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 19);
+            assert_eq!(state.scroll, 13);
+        }
+
+        // 回顶部：窗口回到 0，第一项可见。
+        for _ in 0..30 {
+            press(&mut app, KeyCode::ArrowUp, Key::ArrowUp);
+        }
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 0);
+            assert_eq!(state.scroll, 0);
+        }
+        let text = list_text(&app);
+        assert!(text.contains("item00"));
+        assert!(!text.contains("item19"));
+
+        // PgDn/PgUp 也是同一套滚动。
+        press(&mut app, KeyCode::PageDown, Key::PageDown);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 10);
+            assert_eq!(state.scroll, 4, "选中行在窗口里");
+        }
+        press(&mut app, KeyCode::PageUp, Key::PageUp);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.selected, 0);
+            assert_eq!(state.scroll, 0);
+        }
+    }
+
+    /// 过滤后选中项还在列表里就保持同一个 label；不在了回到第 0 行，不 panic。
+    #[test]
+    fn filtering_keeps_the_selected_label_when_it_still_matches() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("alpha", None), ("beta", None), ("gamma", None)], false),
+        );
+        give_list_an_area(&mut app);
+        app.update();
+
+        // 选中 beta。
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.rows[state.selected], Some(1));
+            assert_eq!(state.picked, Some((1, "beta".to_owned())));
+        }
+
+        // "g" 只剩 gamma：beta 不在列表里了 → 回到第 0 行。
+        type_text(&mut app, "g", KeyCode::KeyG);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.filter, "g");
+            assert_eq!(state.rows, vec![Some(2)]);
+            assert_eq!(state.selected, 0, "beta 不在过滤结果里：回到第一行");
+            assert_eq!(
+                app.world().get::<Picker>(picker).expect("picker").selected,
+                2,
+                "选中的现在是 gamma"
+            );
+        }
+
+        // 退格回到全部：选中的 gamma 还在 → 保持同一 label（它现在在第 2 行）。
+        press(&mut app, KeyCode::Backspace, Key::Backspace);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.filter, "");
+            assert_eq!(state.rows.len(), 3);
+            assert_eq!(state.rows[state.selected], Some(2), "gamma 仍是选中项");
+            assert_eq!(state.picked, Some((2, "gamma".to_owned())));
+        }
+
+        // 再过滤一次：同一 label 继续保持在选中行。
+        type_text(&mut app, "g", KeyCode::KeyG);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.rows[state.selected], Some(2));
+        }
+
+        // 过滤到一个都不剩：选中行夹回 0，不 panic。
+        type_text(&mut app, "x", KeyCode::KeyX);
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.filter, "gx");
+            assert!(state.rows.is_empty());
+            assert_eq!(state.selected, 0);
+            assert_eq!(state.picked, None);
+        }
+    }
+
+    /// 插件重新填充条目后，选中项按身份（label，其次条目下标）找回同一项。
+    #[test]
+    fn refilling_the_items_keeps_the_selected_label() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("alpha", None), ("beta", None), ("gamma", None)], false),
+        );
+        give_list_an_area(&mut app);
+        app.update();
+
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        // 插件在列表前面插一项（下标全部后移一位）。
+        app.world_mut()
+            .get_mut::<Picker>(picker)
+            .expect("picker")
+            .items
+            .insert(0, PickItem::new("new", ""));
+        app.update();
+
+        let state = app.world().resource::<PickerInput>();
+        assert_eq!(state.rows.len(), 4);
+        assert_eq!(state.rows[state.selected], Some(2), "beta 现在是条目 2");
+        assert_eq!(
+            app.world()
+                .get::<Picker>(picker)
+                .expect("picker")
+                .items[2]
+                .label,
+            "beta"
+        );
+        assert_eq!(state.picked, Some((2, "beta".to_owned())));
     }
 
     /// 聚焦工作区的 `Workspace.tree` 也跟着加/摘列（不只改全局代理）。

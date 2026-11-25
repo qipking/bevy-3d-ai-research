@@ -805,13 +805,10 @@ impl Below {
 /// 记"离开末尾那一刻整段的行数"，用来分辨 [`Below::More`] 和 [`Below::New`]。
 ///
 /// 上游把这件事记在 `Scroll::held.grew` 里；我们的滚动状态在 `pane.rs`
-/// （`PaneScroll`），所以本文件只提供判断与标记文本。
-///
-/// TODO(pane): `pane::window_transcript` 现在只会画 `↓ more below`（常量
-/// `BELOW_MARKER`）。要画出 `↓ new output`，窗格得持有 [`BelowSeen`]、每帧
-/// 用 `BelowSeen::of(follow, rows, top, height)` 取 [`Below`]，再拿
-/// [`Below::marker`] 当右端标记 —— 改的是 `pane.rs`（不在本文件的改动范围内）。
-#[derive(Clone, Copy, Debug, Default)]
+/// （`PaneScroll`）。这个状态本身是 bevy 资源：`pane::window_transcript` 每帧
+/// 用 [`BelowSeen::of`] 取 [`Below`]，再拿 [`Below::marker`] 当右端标记；
+/// 滚回末尾（`follow`）时自动复位。
+#[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct BelowSeen {
     /// 离开末尾时整段的行数。
     seen: usize,
@@ -837,6 +834,18 @@ impl BelowSeen {
             self.scrolled = false;
         }
         below
+    }
+
+    /// 离开末尾时记下的整段行数；跟着末尾时是这一帧的总行数。
+    ///
+    /// 只给测试/调试读：滚回底部后它应等于当前整段，`scrolled` 应为 false。
+    pub fn seen(&self) -> usize {
+        self.seen
+    }
+
+    /// 这一帧是否仍在"离开末尾"的滚动状态（滚回底部后复位为 false）。
+    pub fn scrolled(&self) -> bool {
+        self.scrolled
     }
 }
 
@@ -974,6 +983,40 @@ mod tests {
                 "later".to_owned(),
             ],
             "顺序：消息 0、消息 1、本进程提示词、流式调用"
+        );
+    }
+
+    #[test]
+    fn a_stopped_row_follows_the_last_block_of_its_message() {
+        let mut transcript = Transcript::default();
+        transcript.set_width(40);
+        transcript.set_text(TextId::Message { at: 0, block: 0 }, text_lines(&["go"]));
+        transcript.set_text(TextId::Message { at: 1, block: 0 }, text_lines(&["half"]));
+        // 停止标记用 `TextId::Message` 的最大块序号（见 `batch::STOPPED_BLOCK`）。
+        transcript.set_text(
+            TextId::Message {
+                at: 1,
+                block: usize::MAX,
+            },
+            vec![Line::styled("[stopped]", Style::new().dim())],
+        );
+        transcript.set_text(
+            TextId::Message { at: 2, block: 0 },
+            text_lines(&["next turn"]),
+        );
+        assert_eq!(
+            transcript.texts(),
+            vec!["go".to_owned(), "half".to_owned(), "[stopped]".to_owned(), "next turn".to_owned()],
+            "停止标记在第 1 条消息之后、下一条消息之前"
+        );
+        assert!(
+            transcript.keyed_rows()[2]
+                .row
+                .line
+                .style
+                .add_modifier
+                .contains(Modifier::DIM),
+            "停止标记折行后仍是 dim"
         );
     }
 
