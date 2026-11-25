@@ -70,8 +70,11 @@ pub enum FeathersSystems {
     Render,
 }
 
-/// 条带滚动（L2 导出，L3 的键位/滚轮直接调用）。
-pub use workspaces::{WorkspaceScroll, clamp_scroll, scroll_to_visible};
+/// 条带滚动（L2 几何 + L3 交互）：滚动量、夹紧、把列滚进视口。
+pub use workspaces::{
+    ColumnBounds, WorkspaceScroll, WorkspaceScrollFocus, clamp_scroll, column_bounds, scroll_by,
+    scroll_to_visible,
+};
 
 /// 业务代码只需要从这里拿东西。
 pub mod prelude {
@@ -113,9 +116,10 @@ pub mod prelude {
     };
     pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots};
     pub use crate::workspaces::{
-        WORKSPACE_GAP, Workspace, WorkspaceDrag, WorkspacePanel, WorkspacePanels, WorkspaceScroll,
-        WorkspaceSet, WorkspacesPlugin, arrange_workspaces, clamp_scroll, drag_workspace,
-        drag_world_delta, focus_workspace, place_workspace, scroll_to_visible, spawn_workspace,
+        ColumnBounds, WORKSPACE_GAP, Workspace, WorkspaceDrag, WorkspacePanel, WorkspacePanels,
+        WorkspaceScroll, WorkspaceScrollFocus, WorkspaceSet, WorkspacesPlugin, active_panel,
+        arrange_workspaces, clamp_scroll, column_bounds, drag_workspace, drag_world_delta,
+        focus_workspace, place_workspace, scroll_by, scroll_to_visible, spawn_workspace,
         spawn_workspace_with_tree, workspace_step, workspace_strip_height,
     };
     pub use crate::transcript::{Below, BelowSeen, BlockId, Slot, TextId, Transcript};

@@ -698,6 +698,39 @@ pub fn add_built_in(app: &mut App) {
     }
 }
 
+/// 横向滚动工作区的绑定：`Ctrl+Alt+H/L` 一屏、`Ctrl+Alt+Home/End` 到两端。
+///
+/// 键位理由（先查过 [`built_in`]）：
+/// * `Alt+←/→` 是内置的 WordLeft/WordRight，同作用域冲突；
+/// * `Ctrl+Alt+←/→` 没被内置表占用，但 picker 的 `picker_keys` 对方向键
+///   **不看修饰键**（picker 打开时按 → 会展开选中项说明），会和滚动打架；
+/// * `Ctrl+Alt+H/L` 是 niri 自己的 focus-column 约定；带 Ctrl/Alt 的字符键
+///   picker 不处理（`typing == false`），编辑器也不会把它当输入；
+/// * `Ctrl+Alt+Home/End` 单独绑成 Global 是为了遮住 Input 作用域的无修饰
+///   回退：否则 `Ctrl+Alt+Home` 会退化成 `Home`，把光标移到行首。
+///
+/// 这些绑定**没有观察者**：滚动由 `crate::workspaces` 的 `scroll_workspace_keys`
+/// 读同一批 [`KeyboardInput`] 处理（picker 打开时 `editor::keys` 不跑，绑定表
+/// 也不分发）；绑定只负责占住键，避免回退到光标动作。
+pub fn workspace_scroll_bindings() -> Vec<KeyBinding> {
+    let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
+    let with = |key: Key, label: &str| KeyBinding::new(KeyPress::new(key, ctrl_alt), label);
+    vec![
+        with(character_key('h'), "Scroll the workspace left"),
+        with(character_key('l'), "Scroll the workspace right"),
+        with(Key::Home, "Scroll to the workspace's left end"),
+        with(Key::End, "Scroll to the workspace's right end"),
+    ]
+}
+
+/// 装上 [`workspace_scroll_bindings`]（幂等；同键已被别的全局绑定占用时
+/// 只记 [`RefusedKeys`]，不 panic）。
+pub fn add_workspace_scroll_keys(app: &mut App) {
+    for binding in workspace_scroll_bindings() {
+        let _ = bind(app.world_mut(), binding);
+    }
+}
+
 /// 这个 `Ask` 是否显示在**当前工作区**的确认面板里：没有 `ShownAgent`
 /// （无视图的测试/导出路径）时全部可见；有 `ForAgent` 的只认当前 agent，
 /// 无主的（app 级问题）也可见。
@@ -1182,6 +1215,63 @@ mod tests {
             assert_eq!(*label, want_label, "第 {index} 条的说明");
             assert_eq!(*action, want_action, "第 {index} 条的动作");
         }
+    }
+
+    #[test]
+    fn workspace_scroll_keys_are_free_and_shadow_the_bare_home_and_end() {
+        let scroll = workspace_scroll_bindings();
+        assert_eq!(scroll.len(), 4, "H/L + Home/End");
+        let built: Vec<KeyBinding> = built_in()
+            .into_iter()
+            .map(|(keys, label, _)| KeyBinding::new(keys, label).in_scope(KeyScope::Input))
+            .collect();
+        for binding in &scroll {
+            for other in &built {
+                assert!(
+                    !binding.conflicts(other),
+                    "`{}` 不能和内置 `{}`（{}）冲突",
+                    binding.keys,
+                    other.keys,
+                    other.label
+                );
+            }
+        }
+        for binding in &scroll {
+            assert_eq!(binding.scope, KeyScope::Global);
+        }
+
+        // Global 的 Ctrl+Alt+Home 要遮住 Input 作用域里的 Home（否则编辑器
+        // 会把 Ctrl+Alt+Home 当成 Home，把光标移到行首）。
+        let mut app = App::new();
+        add_built_in(&mut app);
+        add_workspace_scroll_keys(&mut app);
+        let mut query = app
+            .world_mut()
+            .query::<(Entity, &KeyBinding, Option<&InputAction>)>();
+        let collected: Vec<(Entity, &KeyBinding, Option<InputAction>)> = query
+            .iter(app.world())
+            .map(|(entity, binding, action)| (entity, binding, action.copied()))
+            .collect();
+        let rows: Vec<BindingRef> = collected
+            .iter()
+            .map(|(entity, binding, action)| BindingRef {
+                entity: *entity,
+                binding,
+                action: *action,
+            })
+            .collect();
+        let press = KeyPress::new(Key::Home, Modifiers::CONTROL | Modifiers::ALT);
+        let found = find(&rows, std::slice::from_ref(&press), KeyScope::Input);
+        let entity = match found {
+            Found::Binding(entity) => entity,
+            other => panic!("Ctrl+Alt+Home 应该命中我们的绑定，实际 {other:?}"),
+        };
+        let row = rows
+            .iter()
+            .find(|row| row.entity == entity)
+            .expect("命中的绑定");
+        assert_eq!(row.binding.keys.to_string(), "ctrl+alt+home");
+        assert!(row.action.is_none(), "键由 workspaces 读原始事件，不挂动作");
     }
 
     #[test]

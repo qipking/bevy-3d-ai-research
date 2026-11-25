@@ -57,7 +57,7 @@ use crate::theme::{
     SCROLLBAR_RADIUS, SCROLLBAR_WIDTH, Theme,
 };
 use crate::transcript::Row;
-use crate::workspaces::{Workspace, WorkspaceSet};
+use crate::workspaces::{Workspace, WorkspaceScrollFocus, WorkspaceSet};
 use crate::FeathersSystems;
 
 /// rig-tui 的 `PAGE`：PgUp/PgDn 一次跳几个。
@@ -679,6 +679,24 @@ fn remove_previews_everywhere(
     }
 }
 
+/// 打开/关闭 picker 列之后请求把活动列滚进视口（`NIRI_SCROLL.md` L3）。
+///
+/// 只在列的**开/关**两个地方调：内容变化（过滤、滚动列表）不请求，免得
+/// picker 每帧把自己拉回视口；具体滚多少由
+/// [`crate::workspaces::column_bounds`] / `scroll_to_visible` 决定（列已
+/// 完整可见时不动）。没有 `WorkspacesPlugin` 的最小 App 没有这个请求资源，
+/// 直接跳过。
+fn request_active_column_scroll(
+    focus: &mut Option<ResMut<WorkspaceScrollFocus>>,
+    set: Option<&WorkspaceSet>,
+) {
+    if let (Some(focus), Some(set)) = (focus.as_deref_mut(), set)
+        && let Some(focused) = set.focused
+    {
+        focus.request(focused);
+    }
+}
+
 /// 把 preview 加进 / 移出 picker 列（[`Node::split_leaf_sized`] /
 /// [`Node::remove_leaf`]；列宽和容器都不动）。
 fn set_preview_in_tree(
@@ -823,6 +841,7 @@ pub fn sync_picker(
     set: Option<Res<WorkspaceSet>>,
     mut workspaces: Query<&mut Workspace>,
     pickers: Query<(Entity, &Picker)>,
+    mut scroll_focus: Option<ResMut<WorkspaceScrollFocus>>,
 ) {
     // 队列兜底：picker 在插件存在之前就 spawn 时观察者收不到；每帧把查询里
     // 漏掉的补到队尾（`push` 去重），再清掉已经 despawn / 关掉的。
@@ -894,6 +913,8 @@ pub fn sync_picker(
             state.picked = identity(picker, picker.selected);
             state.rows.clear();
             refill(&mut state, picker);
+            // 新列在视口外时把它滚进来（L3）。
+            request_active_column_scroll(&mut scroll_focus, set.as_deref());
         }
         (Some((picker_entity, picker)), Some(_)) => {
             if state.picker != Some(picker_entity) {
@@ -938,6 +959,8 @@ pub fn sync_picker(
             *metrics = PickerScrollMetrics::default();
             *drag = PickerScrollbarDrag::default();
             *state = PickerInput::default();
+            // 列没了：必要时滚回去让活动转写可见（L3）。
+            request_active_column_scroll(&mut scroll_focus, set.as_deref());
         }
         (None, None) => {}
     }

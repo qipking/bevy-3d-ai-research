@@ -1161,6 +1161,7 @@ fn wheel_panel(
 #[allow(clippy::too_many_arguments)]
 pub fn pane_wheel(
     mut scrolls: MessageReader<PointerScroll>,
+    held: Option<Res<ButtonInput<KeyCode>>>,
     roots: Res<PanelRoots>,
     layouts: Query<&RowLayout>,
     bars: Query<&TranscriptScrollbar>,
@@ -1172,8 +1173,16 @@ pub fn pane_wheel(
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
+    // Shift+滚轮 / 横向滚轮轴 = 工作区横向滚动（`workspaces::scroll_workspace_wheel`）：
+    // 转写这一层让开，免得一次滚轮既横向滚条带又纵向滚行。
+    let shift = held
+        .as_deref()
+        .is_some_and(|keys| keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight));
     for event in scrolls.read() {
         // 横向滚轮（触摸板的左右滑）不是转写的滚动。
+        if shift || event.x != 0.0 {
+            continue;
+        }
         let Some(panel) = wheel_panel(event.entity, &roots, &layouts, &bars, &thumbs) else {
             continue;
         };
@@ -1765,6 +1774,40 @@ mod tests {
         let scroll = scroll(&fixture.app);
         assert_eq!(scroll.top, 40);
         assert!(!scroll.follow);
+    }
+
+    #[test]
+    fn shift_wheel_is_left_to_the_workspace_scroll() {
+        let mut fixture = wheel_fixture(PanelId::Transcript, 10, 100);
+        set_view(&mut fixture, view(90, true));
+        fixture.app.init_resource::<ButtonInput<KeyCode>>();
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ShiftLeft);
+        wheel(&mut fixture, 1.0);
+        fixture.app.update();
+        let scroll = scroll(&fixture.app);
+        assert_eq!(scroll.top, 90, "Shift+滚轮归工作区横向滚动");
+        assert!(scroll.follow);
+    }
+
+    #[test]
+    fn a_horizontal_wheel_axis_is_left_to_the_workspace_scroll() {
+        let mut fixture = wheel_fixture(PanelId::Transcript, 10, 100);
+        set_view(&mut fixture, view(40, false));
+        fixture.app.world_mut().write_message(PointerScroll {
+            entity: fixture.row,
+            pointer: mouse_pointer(),
+            unit: MouseScrollUnit::Line,
+            x: 2.0,
+            y: 1.0,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            phase: TouchPhase::Moved,
+        });
+        fixture.app.update();
+        assert_eq!(scroll(&fixture.app).top, 40, "横向轴归工作区横向滚动");
     }
 
     #[test]

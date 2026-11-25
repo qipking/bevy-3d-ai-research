@@ -64,14 +64,21 @@
 
 use std::collections::HashMap;
 
+use bevy::input::ButtonState;
+use bevy::input::keyboard::{KeyCode, KeyboardInput};
+use bevy::input::mouse::MouseScrollUnit;
+use bevy::picking::events::PointerScroll;
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window};
 
 use crate::frame::{
-    DefaultScreen, FramePanel, FrameSize, FrameTree, PanelArea, PanelAreas, UNITS_TO_WORLD,
+    CELL, DefaultScreen, FramePanel, FrameSize, FrameTree, PanelArea, PanelAreas, UNITS_TO_WORLD,
 };
 use crate::layout;
+use crate::niri::TileRect;
 use crate::panels::{PanelId, PanelRoots, PanelRows, PanelSpawned};
+use crate::pane::ActiveTranscript;
+use crate::picker::PickerInput;
 use crate::FeathersSystems;
 
 /// 一个工作区 = 一个会话的完整界面 + 它在世界里的绝对位姿。
@@ -166,6 +173,409 @@ pub fn scroll_to_visible(scroll: f32, x: f32, width: f32, viewport_width: f32) -
     }
     scroll
 }
+
+/// 条带里**一列**的位置（UI 像素，`x` 相对视口左边界）。
+///
+/// "列"= 包含聚焦面板的、条带最外层横向 split 的直接子节点：默认树里就是
+/// 转写列（0.62 视口宽）或右列；picker 打开时是它追加的那一列（0.5 视口宽）。
+/// 列里的竖直分裂（右列、picker 的列表/preview）整体算同一列。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnBounds {
+    /// 列左边界相对视口左边界的位置（`>= 0`）。
+    pub x: f32,
+    /// 列宽。
+    pub width: f32,
+    /// 条带内容总宽：滚动的合法上界是 `content_width - viewport_width`。
+    pub content_width: f32,
+    /// 条带视口宽（默认树里 = 帧宽）。
+    pub viewport_width: f32,
+}
+
+impl ColumnBounds {
+    /// 把这一列完整滚进视口后的 `scroll`（已按 `[0, content - viewport]` 夹紧）。
+    ///
+    /// 列已经完整可见时返回传入的 `scroll`（niri 的 "focused window 不该自己
+    /// 移动"）；列比视口宽时左贴边。
+    pub fn scroll_to(self, scroll: f32) -> f32 {
+        let target = scroll_to_visible(scroll, self.x, self.width, self.viewport_width);
+        target
+            .min(clamp_scroll(self.content_width, self.viewport_width))
+            .max(0.0)
+    }
+}
+
+/// 把 `[scroll, scroll + viewport)` 平移 `delta` 像素，并夹进 `[0, max]`。
+///
+/// 键位（一屏）和滚轮都走这一条：正 `delta` 往右（内容左移），负 `delta` 往左。
+pub fn scroll_by(scroll: f32, delta: f32, total_width: f32, viewport_width: f32) -> f32 {
+    (finite_px(scroll) + finite_px(delta))
+        .min(clamp_scroll(total_width, viewport_width))
+        .max(0.0)
+}
+
+/// 条带里包含 `panel` 的最外层横向 split（`niri` 的 strip）。
+///
+/// 与 [`layout::Node::strip_area`] 同一口径：从根往下第一次遇到"横向 split
+/// 且子树里有 `panel`"就是它，更内层的横 split（拆窗后转写列里的）不覆盖。
+fn strip_node<'a>(node: &'a layout::Node, panel: PanelId) -> Option<&'a layout::Node> {
+    match node {
+        layout::Node::Leaf { .. } => None,
+        layout::Node::Container { node, .. } => strip_node(node, panel),
+        layout::Node::Split {
+            direction,
+            children,
+            ..
+        } => {
+            let holds = children
+                .iter()
+                .any(|child| child.node.leaves().contains(&panel));
+            if !holds {
+                return None;
+            }
+            match direction {
+                layout::Split::Horizontal => Some(node),
+                layout::Split::Vertical => children
+                    .iter()
+                    .find_map(|child| strip_node(&child.node, panel)),
+            }
+        }
+    }
+}
+
+/// 条带内容总宽（UI 像素）：最外层横向条带里所有东西的最右边界 − 视口左边。
+///
+/// 默认树 = 1.0 个视口宽；picker 打开后 = 1.5 个视口宽（右边界向外伸出）。
+/// 没有横向条带（树只是一列/一块面板）时等于视口宽——没有可横向滚的内容。
+fn strip_content_width(tree: &layout::Node, panel: PanelId, area: TileRect) -> f32 {
+    let Some(node) = strip_node(tree, panel) else {
+        return area.size.x / layout::PX_TO_METERS;
+    };
+    let strip = tree.strip_area(area, panel).unwrap_or(area);
+    let left = strip.center.x - strip.size.x * 0.5;
+    let mut right = left;
+    for (_, rect, _) in node.placements(strip) {
+        right = right.max(rect.center.x + rect.size.x * 0.5);
+    }
+    ((right - left) / layout::PX_TO_METERS).max(0.0)
+}
+
+/// 面板 `panel` 所在**列**在条带视口里的位置（见 [`ColumnBounds`]）。
+///
+/// `viewport_width` 是帧宽（UI 像素）。`None` 表示面板不在树上（或视口为 0）、
+/// 没有可滚的列；调用方据此跳过，不 panic。
+pub fn column_bounds(
+    tree: &layout::Node,
+    panel: PanelId,
+    viewport_width: f32,
+) -> Option<ColumnBounds> {
+    let viewport = finite_px(viewport_width).max(0.0);
+    if viewport <= 0.0 {
+        return None;
+    }
+    // 高度只用来看"这是不是横向条带"，取 1 米足够；真正的视口宽由入参决定。
+    let area = TileRect {
+        center: Vec2::ZERO,
+        size: Vec2::new(viewport * layout::PX_TO_METERS, 1.0),
+    };
+    let leaves = tree.leaves();
+    let Some(node) = strip_node(tree, panel) else {
+        // 没有横向条带：整块区域就是视口，没有可滚的列。
+        return leaves.contains(&panel).then_some(ColumnBounds {
+            x: 0.0,
+            width: viewport,
+            content_width: viewport,
+            viewport_width: viewport,
+        });
+    };
+    let layout::Node::Split { children, .. } = node else {
+        return None;
+    };
+    let child = children
+        .iter()
+        .find(|child| child.node.leaves().contains(&panel))?;
+    let column_panels = child.node.leaves();
+    let strip = tree.strip_area(area, panel).unwrap_or(area);
+    let strip_left = strip.center.x - strip.size.x * 0.5;
+    let strip_width = (strip.size.x / layout::PX_TO_METERS).max(0.0);
+    if strip_width <= 0.0 {
+        return None;
+    }
+    // 列的 x/宽 = 这一列里所有叶子（含容器内叶子）的并集；列内竖直分裂
+    // 不改变 x 范围，所以并集就是列矩形（容器本身不含叶子，不用算）。
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    for (id, rect, _) in tree.placements(area) {
+        if !column_panels.contains(&id) {
+            continue;
+        }
+        min_x = min_x.min(rect.center.x - rect.size.x * 0.5);
+        max_x = max_x.max(rect.center.x + rect.size.x * 0.5);
+    }
+    if !min_x.is_finite() || !max_x.is_finite() {
+        return None;
+    }
+    Some(ColumnBounds {
+        x: ((min_x - strip_left) / layout::PX_TO_METERS).max(0.0),
+        width: ((max_x - min_x) / layout::PX_TO_METERS).max(0.0),
+        content_width: strip_content_width(tree, panel, area),
+        viewport_width: strip_width,
+    })
+}
+
+/// 活动列是**哪块面板**所在的列：picker 打开时是列表那一列，否则是活动
+/// 转写根（[`ActiveTranscript`]）所在的列；解析不出来时退回主转写。
+pub fn active_panel(roots: &PanelRoots, active_root: Option<Entity>, picker_open: bool) -> PanelId {
+    if picker_open {
+        return PanelId::List;
+    }
+    active_root
+        .and_then(|root| {
+            roots
+                .0
+                .iter()
+                .find_map(|(id, candidate)| (*candidate == root).then_some(*id))
+        })
+        .unwrap_or(PanelId::Transcript)
+}
+
+/// 一次"把活动列滚进视口"的请求 + 上次活动列的快照。
+///
+/// 触发口径（`NIRI_SCROLL.md` L3）：
+/// * picker 打开/关闭时由 [`crate::picker`] 调 [`WorkspaceScrollFocus::request`]；
+/// * 活动列本身变化（`ActiveTranscript` 切换、picker 开关）由这里比对快照；
+/// * 帧尺寸变化（窗口 resize）时重新计算并夹紧。
+///
+/// 用户用键位/滚轮主动滚开之后快照不变，所以**不会被拉回去**——niri 的
+/// "focused window 不该自己移动"。
+#[derive(Resource, Default, Debug)]
+pub struct WorkspaceScrollFocus {
+    /// 上一次算活动列时的快照。
+    last: Option<ActiveColumnKey>,
+    /// 上一次见到的帧尺寸（resize 检测）。
+    last_frame: Option<(u16, u16)>,
+    /// 待处理的请求（picker 打开/关闭时写）。
+    pending: Vec<Entity>,
+}
+
+impl WorkspaceScrollFocus {
+    /// 请求在下一次布局时把 `workspace` 的活动列滚进视口。
+    pub fn request(&mut self, workspace: Entity) {
+        if !self.pending.contains(&workspace) {
+            self.pending.push(workspace);
+        }
+    }
+
+    /// `workspace` 有没有还没处理的请求。
+    pub fn is_pending(&self, workspace: Entity) -> bool {
+        self.pending.contains(&workspace)
+    }
+}
+
+/// 活动列变化的判定依据（值相等 = 不需要重算 scroll）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveColumnKey {
+    workspace: Entity,
+    panel: PanelId,
+    cols: u16,
+    rows: u16,
+    picker_open: bool,
+}
+
+/// 把聚焦工作区的活动列滚进视口；resize 时夹紧所有工作区的 scroll。
+///
+/// 只写 [`WorkspaceScroll`]：树、列宽、列 x 一律不碰（niri 不变量 3）。
+/// 没有工作区 / 没有 `WorkspaceScroll` 的旧路径直接跳过，不 panic。
+fn scroll_active_column(
+    set: Option<Res<WorkspaceSet>>,
+    frame: Option<Res<FrameSize>>,
+    active: Option<Res<ActiveTranscript>>,
+    picker: Option<Res<PickerInput>>,
+    mut focus: ResMut<WorkspaceScrollFocus>,
+    mut workspaces: Query<(
+        &Workspace,
+        Option<&WorkspacePanels>,
+        Option<&mut WorkspaceScroll>,
+    )>,
+) {
+    let (Some(set), Some(frame)) = (set, frame) else {
+        return;
+    };
+    let viewport = f32::from(frame.cols) * CELL.x;
+    let picker_open = picker
+        .as_deref()
+        .is_some_and(|picker| picker.column.is_some());
+    let active_root = active.as_deref().and_then(|active| active.0);
+    let frame_key = (frame.cols, frame.rows);
+    let frame_changed = focus.last_frame != Some(frame_key);
+    focus.last_frame = Some(frame_key);
+
+    let focused_key = set.focused.and_then(|entity| {
+        let (_, panels, _) = workspaces.get(entity).ok()?;
+        let roots = panels.map(|panels| &panels.roots);
+        let panel = roots
+            .map(|roots| active_panel(roots, active_root, picker_open))
+            .unwrap_or(PanelId::Transcript);
+        Some(ActiveColumnKey {
+            workspace: entity,
+            panel,
+            cols: frame.cols,
+            rows: frame.rows,
+            picker_open,
+        })
+    });
+    let active_changed = focused_key != focus.last;
+    focus.last = focused_key;
+    let focused_panel = focused_key.map(|key| key.panel);
+    let pending = std::mem::take(&mut focus.pending);
+
+    for entity in &set.items {
+        let Ok((workspace, _, scroll)) = workspaces.get_mut(*entity) else {
+            continue;
+        };
+        let Some(mut scroll) = scroll else {
+            continue;
+        };
+        let focused = set.focused == Some(*entity);
+        let panel = match (focused, focused_panel) {
+            (true, Some(panel)) => panel,
+            _ => PanelId::Transcript,
+        };
+        let Some(bounds) = column_bounds(&workspace.tree, panel, viewport) else {
+            continue;
+        };
+        let requested = pending.contains(entity);
+        let mut next = scroll.scroll;
+        if requested || (focused && active_changed) {
+            // 只在必要时滚：列已完整可见时 `scroll_to` 原样返回。
+            next = bounds.scroll_to(next);
+        } else if frame_changed {
+            next = next
+                .min(clamp_scroll(bounds.content_width, bounds.viewport_width))
+                .max(0.0);
+        }
+        if next != scroll.scroll {
+            scroll.scroll = next;
+        }
+    }
+}
+
+/// 键位横向滚动：`Ctrl+Alt+H/L` 一屏，`Ctrl+Alt+Home/End` 到最左/最右。
+///
+/// 键位选择见 [`crate::keys::workspace_scroll_bindings`]：`Alt+←/→` 被内置的
+/// WordLeft/WordRight 占用；`Ctrl+Alt+←/→` 又会被 picker 的方向键（不看修饰
+/// 键）顺带展开/收起说明，所以用 niri 自己的 H/L 约定。键由这里读原始
+/// `KeyboardInput`（picker 打开时 `editor::keys` 不跑，绑定表也不分发），
+/// 只在改完 `WorkspaceScroll` 后夹进 `[0, max]`。
+fn scroll_workspace_keys(
+    mut input: MessageReader<KeyboardInput>,
+    held: Option<Res<ButtonInput<KeyCode>>>,
+    set: Option<Res<WorkspaceSet>>,
+    frame: Option<Res<FrameSize>>,
+    mut workspaces: Query<(&Workspace, &mut WorkspaceScroll)>,
+) {
+    let presses: Vec<KeyCode> = input
+        .read()
+        .filter(|event| event.state == ButtonState::Pressed)
+        .map(|event| event.key_code)
+        .collect();
+    if presses.is_empty() {
+        return;
+    }
+    let (Some(held), Some(set), Some(frame)) = (held, set, frame) else {
+        return;
+    };
+    let modifiers = crate::keys::Modifiers::from_held(&held);
+    let control_alt = modifiers.contains(crate::keys::Modifiers::CONTROL)
+        && modifiers.contains(crate::keys::Modifiers::ALT);
+    let extra = modifiers.intersects(crate::keys::Modifiers::SHIFT | crate::keys::Modifiers::SUPER);
+    if !control_alt || extra {
+        return;
+    }
+    let Some(focused) = set.focused else {
+        return;
+    };
+    let Ok((workspace, mut scroll)) = workspaces.get_mut(focused) else {
+        return;
+    };
+    let viewport = f32::from(frame.cols) * CELL.x;
+    let Some(bounds) = column_bounds(&workspace.tree, PanelId::Transcript, viewport) else {
+        return;
+    };
+    let total = bounds.content_width;
+    let viewport = bounds.viewport_width;
+    for code in presses {
+        let next = match code {
+            KeyCode::KeyH => scroll_by(scroll.scroll, -viewport, total, viewport),
+            KeyCode::KeyL => scroll_by(scroll.scroll, viewport, total, viewport),
+            KeyCode::Home => 0.0,
+            KeyCode::End => clamp_scroll(total, viewport),
+            _ => continue,
+        };
+        if next != scroll.scroll {
+            scroll.scroll = next;
+        }
+    }
+}
+
+/// 滚轮横向滚动：`Shift+滚轮` 或横向滚轮轴（`PointerScroll.x`）滚当前工作区。
+///
+/// 普通滚轮（无 Shift、`y` 方向）不读，仍归转写行滚动（`pane::pane_wheel`）。
+/// 一格 = [`WHEEL_CELLS_PER_LINE`] 个字宽；像素单位（触摸板）按像素算。
+/// 每滚一次都夹进 `[0, content - viewport]`；只改 `WorkspaceScroll`。
+fn scroll_workspace_wheel(
+    mut scrolls: MessageReader<PointerScroll>,
+    held: Option<Res<ButtonInput<KeyCode>>>,
+    set: Option<Res<WorkspaceSet>>,
+    frame: Option<Res<FrameSize>>,
+    mut workspaces: Query<(&Workspace, &mut WorkspaceScroll)>,
+) {
+    let shift = held.as_deref().is_some_and(|keys| {
+        keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight)
+    });
+    // 先读完消息：没有工作区时也不能把事件留在队列里。
+    let events: Vec<(MouseScrollUnit, f32, f32)> = scrolls
+        .read()
+        .map(|event| (event.unit, event.x, event.y))
+        .collect();
+    let (Some(set), Some(frame)) = (set, frame) else {
+        return;
+    };
+    let Some(focused) = set.focused else {
+        return;
+    };
+    let Ok((workspace, mut scroll)) = workspaces.get_mut(focused) else {
+        return;
+    };
+    let viewport = f32::from(frame.cols) * CELL.x;
+    let Some(bounds) = column_bounds(&workspace.tree, PanelId::Transcript, viewport) else {
+        return;
+    };
+    let total = bounds.content_width;
+    let viewport = bounds.viewport_width;
+    let mut current = scroll.scroll;
+    for (unit, x, y) in events {
+        // 正方向 = 内容往左（scroll 增大）。横向轴正 x 往右；Shift+滚轮往下
+        // （y < 0）也往右，和列表滚动的手感一致。
+        let raw = if x != 0.0 {
+            x
+        } else if shift && y != 0.0 {
+            -y
+        } else {
+            continue;
+        };
+        let delta = match unit {
+            MouseScrollUnit::Line => raw * WHEEL_CELLS_PER_LINE * CELL.x,
+            MouseScrollUnit::Pixel => raw,
+        };
+        current = scroll_by(current, delta, total, viewport);
+    }
+    if current != scroll.scroll {
+        scroll.scroll = current;
+    }
+}
+
+/// 滚轮一格（一行）横向滚几个字宽。
+const WHEEL_CELLS_PER_LINE: f32 = 8.0;
 
 /// 所有工作区。
 ///
@@ -1021,7 +1431,13 @@ fn drag_workspaces(
 }
 
 
-/// 工作区插件：启动收编 + 聚焦装载 + 新面板打标签。
+/// 工作区插件：启动收编 + 聚焦装载 + 新面板打标签 + L3 横向滚动交互。
+///
+/// L3 的三条系统（均只改 [`WorkspaceScroll`]）：
+/// * `scroll_active_column`：活动列变化 / picker 开关请求 / 窗口 resize 时
+///   把聚焦工作区的活动列滚进视口并夹紧；
+/// * `scroll_workspace_keys`：`Ctrl+Alt+H/L` 一屏、`Ctrl+Alt+Home/End` 到两端；
+/// * `scroll_workspace_wheel`：`Shift+滚轮` / 横向滚轮轴滚当前工作区。
 ///
 /// 放置（`frame::lay_out_frame` / `frame::place_panels`）和行同步
 /// （`panels::sync_panels`）在自己的插件里按 [`WorkspaceSet`] 分派，不在这里。
@@ -1029,6 +1445,9 @@ pub struct WorkspacesPlugin;
 
 impl Plugin for WorkspacesPlugin {
     fn build(&self, app: &mut App) {
+        // L3 的横向滚动键：Global 绑定，只用来遮住 Input 作用域的同键回退
+        //（键本身由 `scroll_workspace_keys` 读，picker 打开时也能用）。
+        crate::keys::add_workspace_scroll_keys(app);
         // 单独装本插件时也要有确定的阶段顺序；`FeathersViewPlugin` 重复配置
         // 同一组边是幂等的。
         app.configure_sets(
@@ -1046,6 +1465,11 @@ impl Plugin for WorkspacesPlugin {
         .init_resource::<LoadedFocus>()
         // 第 3 批：拖拽状态（中键 / Alt+左键，见 `drag_workspaces`）。
         .init_resource::<WorkspaceDrag>()
+        // L3：活动列快照 + picker 打开/关闭的滚动请求。
+        .init_resource::<WorkspaceScrollFocus>()
+        // L3：键位/滚轮读同一批原始输入事件（headless 测试也能写）。
+        .add_message::<KeyboardInput>()
+        .add_message::<PointerScroll>()
         // niri 模式的屏幕在 `PostStartup` 生成：先让它写全局资源，再收编。
         .add_systems(
             PostStartup,
@@ -1068,6 +1492,20 @@ impl Plugin for WorkspacesPlugin {
             tag_new_panels
                 .in_set(FeathersSystems::Layout)
                 .before(crate::frame::lay_out_frame),
+        )
+        // L3：活动列滚进视口 + 键位/滚轮横向滚动。都排在 `lay_out_frame`
+        // 之前，同一帧就能看到新 scroll；键位/滚轮排在活动列之后，用户
+        // 这一帧的操作压过"自动滚到活动列"。
+        .add_systems(
+            Update,
+            (
+                scroll_active_column,
+                scroll_workspace_keys,
+                scroll_workspace_wheel,
+            )
+                .chain()
+                .in_set(FeathersSystems::Layout)
+                .before(crate::frame::lay_out_frame),
         );
     }
 }
@@ -1076,12 +1514,22 @@ impl Plugin for WorkspacesPlugin {
 mod tests {
     //! 每个工作区一套面板状态的 headless 测试：不建窗口、不跑渲染。
     use super::*;
+    use bevy::camera::NormalizedRenderTarget;
     use bevy::ecs::system::RunSystemOnce;
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
+    use bevy::input::mouse::MouseScrollUnit;
+    use bevy::input::touch::TouchPhase;
+    use bevy::picking::backend::HitData;
+    use bevy::picking::events::{Pointer, PointerScroll};
+    use bevy::picking::pointer::{Location, PointerId};
     use bevy::text::FontSource;
+    use rig_harness::prelude::Picker;
     use rig_tui::ratatui::text::Line;
 
     use crate::frame::{FrameGeometry, FramePlugin, FrameSize, CELL, UNITS_TO_WORLD};
     use crate::layout::{Child, Node as LayoutNode, Split, NO_GAP};
+    use crate::niri::TileRect;
     use crate::panels::{KeyedRow, PanelsPlugin, RowLayout};
     use crate::selection::Selection;
     use crate::transcript::{Row, RowText, TranscriptFont};
@@ -1112,6 +1560,8 @@ mod tests {
             .init_resource::<FrameGeometry>()
             .init_resource::<Selection>()
             .init_resource::<DefaultScreen>()
+            // L3：手动摆 picker 状态（不装 PickerPlugin 的测试也能覆盖滚动）。
+            .init_resource::<PickerInput>()
             .insert_resource(FrameSize { cols: 96, rows: 28 })
             .insert_resource(TranscriptFont(FontSource::default()))
             .add_plugins((PanelsPlugin, WorkspacesPlugin))
@@ -2628,6 +3078,482 @@ mod tests {
         );
         // 空交集也算得出材质 uniform（宽/高 0），没有 panic。
         assert!(effective.width() == 0.0 || effective.height() == 0.0);
+    }
+
+    // ---- L3：滚动接上交互（活动列必须可见 + 键位/滚轮 + resize 夹紧） ----
+
+    /// 视口宽（UI 像素）：测试统一用 96×28 帧。
+    fn viewport_px(app: &App) -> f32 {
+        f32::from(app.world().resource::<FrameSize>().cols) * CELL.x
+    }
+
+    /// 帧矩形（米），给 `tree.rects` 断言列几何用。
+    fn frame_tile(app: &App) -> TileRect {
+        let frame = *app.world().resource::<FrameSize>();
+        TileRect {
+            center: Vec2::ZERO,
+            size: Vec2::new(
+                f32::from(frame.cols) * CELL.x,
+                f32::from(frame.rows) * CELL.y,
+            ) * UNITS_TO_WORLD,
+        }
+    }
+
+    fn workspace_tree(app: &App, workspace: Entity) -> LayoutNode {
+        app.world()
+            .get::<Workspace>(workspace)
+            .expect("Workspace")
+            .tree
+            .clone()
+    }
+
+    /// 换掉 `workspace` 的树，并同步聚焦工作区的全局 `FrameTree`
+    ///（`lay_out_frame` 对聚焦工作区读全局树）。
+    fn set_workspace_tree(app: &mut App, workspace: Entity, tree: LayoutNode) {
+        if let Some(mut component) = app.world_mut().get_mut::<Workspace>(workspace) {
+            component.tree = tree.clone();
+        }
+        if app.world().resource::<WorkspaceSet>().focused == Some(workspace) {
+            app.world_mut().resource_mut::<FrameTree>().0 = tree;
+        }
+    }
+
+    /// 打开路径真实追加的那一列：`Picker` 容器 + `List` 叶子。
+    fn picker_column() -> LayoutNode {
+        LayoutNode::container(PanelId::Picker, LayoutNode::leaf(PanelId::List))
+    }
+
+    fn append_picker_column(app: &mut App, workspace: Entity) -> LayoutNode {
+        let mut tree = workspace_tree(app, workspace);
+        assert!(tree.append_column_at(PanelId::Transcript, picker_column()));
+        set_workspace_tree(app, workspace, tree.clone());
+        tree
+    }
+
+    fn scroll_of(app: &App, workspace: Entity) -> f32 {
+        app.world()
+            .get::<WorkspaceScroll>(workspace)
+            .expect("WorkspaceScroll")
+            .scroll
+    }
+
+    /// 手动摆 picker 状态（不跑 `sync_picker`；树上那一列由调用方追加）。
+    fn set_picker_open(app: &mut App, open: bool) {
+        if !open {
+            *app.world_mut().resource_mut::<PickerInput>() = PickerInput::default();
+            return;
+        }
+        let column = app.world_mut().spawn_empty().id();
+        let mut state = app.world_mut().resource_mut::<PickerInput>();
+        state.picker = Some(column);
+        state.column = Some(column);
+    }
+
+    fn mouse_pointer() -> Pointer {
+        Pointer::new(
+            PointerId::Mouse,
+            Location {
+                target: NormalizedRenderTarget::None {
+                    width: 1280,
+                    height: 800,
+                },
+                position: Vec2::ZERO,
+            },
+        )
+    }
+
+    /// 写一次 `PointerScroll`（`x` 横向轴，`y` 纵向轴）并跑一帧。
+    fn wheel(app: &mut App, unit: MouseScrollUnit, x: f32, y: f32) {
+        app.world_mut().write_message(PointerScroll {
+            entity: Entity::PLACEHOLDER,
+            pointer: mouse_pointer(),
+            unit,
+            x,
+            y,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            phase: TouchPhase::Moved,
+        });
+        app.update();
+    }
+
+    /// 写一次键盘按下并跑一帧（修饰键状态由调用方提前按在 `ButtonInput` 里）。
+    fn press_code(app: &mut App, code: KeyCode) {
+        let logical = match code {
+            KeyCode::KeyH => Key::Character("h".into()),
+            KeyCode::KeyL => Key::Character("l".into()),
+            KeyCode::Home => Key::Home,
+            KeyCode::End => Key::End,
+            _ => Key::Character("x".into()),
+        };
+        app.world_mut().write_message(KeyboardInput {
+            key_code: code,
+            logical_key: logical,
+            state: ButtonState::Pressed,
+            repeat: false,
+            text: None,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    fn set_key(app: &mut App, code: KeyCode, pressed: bool) {
+        let mut held = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        if pressed {
+            held.press(code);
+        } else {
+            held.release(code);
+        }
+    }
+
+    // 32. 列几何：转写列在视口左端；picker 列从视口右边界开始、伸出视口；
+    //     `scroll_to` 只在必要时动，列比视口宽时左贴边。
+    #[test]
+    fn column_bounds_finds_the_transcript_and_the_picker_column() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let viewport = 96.0 * CELL.x;
+        let mut tree = layout::default_tree();
+        let transcript = column_bounds(&tree, PanelId::Transcript, viewport).expect("转写列");
+        assert!(near(transcript.x, 0.0));
+        assert!(near(
+            transcript.width,
+            viewport * layout::TRANSCRIPT_COLUMN_FRACTION
+        ));
+        assert!(near(transcript.content_width, viewport), "默认树正好一个视口宽");
+        assert_eq!(transcript.scroll_to(0.0), 0.0, "已完整可见：不动");
+        assert_eq!(transcript.scroll_to(120.0), 0.0, "列在视口左边：滚回 0");
+
+        assert!(tree.append_column_at(PanelId::Transcript, picker_column()));
+        let picker = column_bounds(&tree, PanelId::List, viewport).expect("picker 列");
+        assert!(near(picker.x, viewport), "picker 列从视口右边界开始");
+        assert!(near(
+            picker.width,
+            viewport * layout::DEFAULT_COLUMN_FRACTION
+        ));
+        assert!(near(picker.content_width, viewport * 1.5), "内容比视口宽半个屏");
+        assert!(
+            near(picker.scroll_to(0.0), viewport * 0.5),
+            "滚到能完整看见这一列"
+        );
+        assert!(
+            near(picker.scroll_to(viewport * 0.5), viewport * 0.5),
+            "已完整可见：一个像素都不动"
+        );
+
+        // 列比视口宽：左贴边（x 是列自己左边界，不是 0）。
+        let wide = LayoutNode::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(0.5, LayoutNode::leaf(PanelId::Spacer)),
+                Child::fraction(1.5, LayoutNode::leaf(PanelId::Transcript)),
+            ],
+        );
+        let bounds = column_bounds(&wide, PanelId::Transcript, viewport).expect("宽列");
+        assert!(near(bounds.x, viewport * 0.5));
+        assert!(near(bounds.width, viewport * 1.5));
+        assert!(
+            near(bounds.scroll_to(0.0), viewport * 0.5),
+            "列比视口宽：左贴边"
+        );
+    }
+
+    // 33. picker 打开（列伸出视口）→ scroll 把该列完整展示；关闭 → 滚回让
+    //     转写可见。全程只改 `WorkspaceScroll`，树的列 x/宽度一个字节不变。
+    #[test]
+    fn opening_an_off_screen_picker_scrolls_it_in_and_closing_scrolls_back() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let tree_before = append_picker_column(&mut app, a);
+        let rects_before = tree_before.rects(frame_tile(&app));
+        assert_eq!(scroll_of(&app, a), 0.0);
+
+        set_picker_open(&mut app, true);
+        app.update();
+
+        let scroll = scroll_of(&app, a);
+        assert!(
+            (scroll - viewport * layout::DEFAULT_COLUMN_FRACTION).abs() < 1e-3,
+            "picker 列应完整可见：scroll = 半个视口，实际 {scroll}"
+        );
+        assert_eq!(workspace_tree(&app, a), tree_before, "滚动不改树");
+        assert_eq!(
+            workspace_tree(&app, a).rects(frame_tile(&app)),
+            rects_before,
+            "列 x/宽度一个字节不变（niri 不变量 3）"
+        );
+        assert_eq!(scroll_of(&app, b), 0.0, "别的工作区不动");
+
+        set_picker_open(&mut app, false);
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0, "关闭后滚回去让转写可见");
+        assert_eq!(workspace_tree(&app, a), tree_before, "关闭也不改树");
+    }
+
+    // 34. 活动列已完整可见时，打开/关闭 picker 都不改变 scroll
+    //     （niri：focused window 不该自己移动）。
+    #[test]
+    fn opening_and_closing_a_visible_picker_does_not_move_the_strip() {
+        // 窄树：转写 0.3 视口 + picker 0.3 视口，两列都在视口里。
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        let tree = LayoutNode::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(0.3, LayoutNode::leaf(PanelId::Transcript)),
+                Child::fraction(0.3, picker_column()),
+            ],
+        );
+        set_workspace_tree(&mut app, a, tree);
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0);
+
+        set_picker_open(&mut app, true);
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0, "picker 列已完整可见：不动");
+
+        set_picker_open(&mut app, false);
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0, "转写也完整可见：不动");
+    }
+
+    // 35. picker 打开前已经滚到能看见它：打开不再移动 scroll；关闭时转写
+    //     不可见才滚回去（只在必要时）。
+    #[test]
+    fn a_picker_that_is_already_visible_is_not_moved_on_open() {
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        append_picker_column(&mut app, a);
+        app.world_mut()
+            .get_mut::<WorkspaceScroll>(a)
+            .expect("WorkspaceScroll")
+            .scroll = viewport * 0.5;
+        app.update();
+        assert!((scroll_of(&app, a) - viewport * 0.5).abs() < 1e-3);
+
+        set_picker_open(&mut app, true);
+        app.update();
+        assert!(
+            (scroll_of(&app, a) - viewport * 0.5).abs() < 1e-3,
+            "picker 列已经完整可见，不该再动"
+        );
+
+        set_picker_open(&mut app, false);
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0, "转写看不见了，才滚回去");
+    }
+
+    // 36. 键位：Ctrl+Alt+H/L 一屏、Ctrl+Alt+Home/End 到两端；夹在 [0, max]，
+    //     列宽/列 x/面板尺寸都不变。
+    #[test]
+    fn keyboard_scrolling_stays_inside_the_strip_and_leaves_columns_alone() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let max = viewport * layout::DEFAULT_COLUMN_FRACTION;
+        let tree_before = append_picker_column(&mut app, a);
+        let rects_before = tree_before.rects(frame_tile(&app));
+        let sizes_before = panel_sizes(&app, a);
+        app.init_resource::<ButtonInput<KeyCode>>();
+        set_key(&mut app, KeyCode::ControlLeft, true);
+        set_key(&mut app, KeyCode::AltLeft, true);
+
+        // 一次一屏，但右端只有半屏：夹到 max。
+        press_code(&mut app, KeyCode::KeyL);
+        assert!((scroll_of(&app, a) - max).abs() < 1e-3, "右端夹住");
+        press_code(&mut app, KeyCode::Home);
+        assert_eq!(scroll_of(&app, a), 0.0);
+        press_code(&mut app, KeyCode::KeyH);
+        assert_eq!(scroll_of(&app, a), 0.0, "左端夹住");
+        press_code(&mut app, KeyCode::End);
+        assert!((scroll_of(&app, a) - max).abs() < 1e-3);
+        press_code(&mut app, KeyCode::KeyL);
+        assert!((scroll_of(&app, a) - max).abs() < 1e-3, "到右端不越界");
+
+        // 没有修饰键时不是滚动键。
+        set_key(&mut app, KeyCode::AltLeft, false);
+        set_key(&mut app, KeyCode::ControlLeft, false);
+        press_code(&mut app, KeyCode::KeyH);
+        assert!((scroll_of(&app, a) - max).abs() < 1e-3, "普通 H 不滚");
+
+        assert_eq!(workspace_tree(&app, a), tree_before, "不改树");
+        assert_eq!(
+            workspace_tree(&app, a).rects(frame_tile(&app)),
+            rects_before,
+            "列 x/宽度不变"
+        );
+        assert_eq!(panel_sizes(&app, a), sizes_before, "面板尺寸不变");
+        assert_eq!(scroll_of(&app, b), 0.0, "非聚焦工作区不动");
+    }
+
+    // 37. 滚轮：Shift+滚轮 / 横向轴滚当前工作区，普通滚轮不横向滚；夹紧。
+    #[test]
+    fn shift_wheel_and_horizontal_wheel_scroll_only_the_workspace() {
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let max = viewport * layout::DEFAULT_COLUMN_FRACTION;
+        append_picker_column(&mut app, a);
+        app.init_resource::<ButtonInput<KeyCode>>();
+        set_key(&mut app, KeyCode::ShiftLeft, true);
+
+        wheel(&mut app, MouseScrollUnit::Line, 0.0, -3.0);
+        let step = 3.0 * WHEEL_CELLS_PER_LINE * CELL.x;
+        assert!(
+            (scroll_of(&app, a) - step.min(max)).abs() < 1e-3,
+            "Shift+滚轮下 = 往右一屏的 1/4 左右"
+        );
+        wheel(&mut app, MouseScrollUnit::Line, 0.0, -100.0);
+        assert!((scroll_of(&app, a) - max).abs() < 1e-3, "夹到右端");
+        wheel(&mut app, MouseScrollUnit::Line, 0.0, 100.0);
+        assert_eq!(scroll_of(&app, a), 0.0, "夹到左端");
+
+        // 普通滚轮（没有 Shift、没有横向轴）不横向滚。
+        set_key(&mut app, KeyCode::ShiftLeft, false);
+        wheel(&mut app, MouseScrollUnit::Line, 0.0, -3.0);
+        assert_eq!(scroll_of(&app, a), 0.0);
+
+        // 横向滚轮轴（没有 Shift 也算）。
+        wheel(&mut app, MouseScrollUnit::Line, 2.0, 0.0);
+        let horizontal = (2.0 * WHEEL_CELLS_PER_LINE * CELL.x).min(max);
+        assert!((scroll_of(&app, a) - horizontal).abs() < 1e-3);
+    }
+
+    // 38. resize 后 scroll 被夹进新的 [0, max]，仍然完整展示活动列。
+    #[test]
+    fn resizing_the_window_clamps_the_strip_scroll() {
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        append_picker_column(&mut app, a);
+        set_picker_open(&mut app, true);
+        app.update();
+        assert!(
+            (scroll_of(&app, a) - viewport * layout::DEFAULT_COLUMN_FRACTION).abs() < 1e-3
+        );
+
+        *app.world_mut().resource_mut::<FrameSize>() = FrameSize { cols: 64, rows: 28 };
+        app.update();
+
+        let viewport = 64.0 * CELL.x;
+        let max = clamp_scroll(viewport * 1.5, viewport);
+        let scroll = scroll_of(&app, a);
+        assert!(scroll >= 0.0 && scroll <= max + 1e-3, "夹在 [0, {max}]，实际 {scroll}");
+        assert!((scroll - max).abs() < 1e-3, "活动列（picker）仍完整可见");
+    }
+
+    // 39. 没有工作区 / 没有 WorkspaceScroll 的旧路径不 panic。
+    #[test]
+    fn scrolling_without_workspaces_or_scroll_does_not_panic() {
+        let mut app = App::new();
+        app.init_resource::<WorkspaceSet>()
+            .init_resource::<WorkspaceScrollFocus>()
+            .insert_resource(FrameSize { cols: 96, rows: 28 })
+            .add_systems(Update, scroll_active_column);
+        app.update();
+
+        let workspace = app
+            .world_mut()
+            .spawn(Workspace {
+                session: 0,
+                tree: layout::default_tree(),
+                pose: Transform::IDENTITY,
+                order: 0,
+            })
+            .id();
+        {
+            let mut set = app.world_mut().resource_mut::<WorkspaceSet>();
+            set.items.push(workspace);
+            set.focused = Some(workspace);
+        }
+        app.update();
+        assert!(
+            app.world().get::<WorkspaceScroll>(workspace).is_none(),
+            "没有 WorkspaceScroll 也不 panic、不凭空加组件"
+        );
+    }
+
+    // 40. 真 PickerPlugin：打开时 `sync_picker` 追加列并请求滚动；despawn 关闭
+    //     后滚回让转写可见（不依赖测试里手摆的 PickerInput）。
+    #[test]
+    fn a_real_picker_open_and_close_scrolls_the_workspace() {
+        let mut app = workspace_app();
+        app.init_resource::<crate::theme::Theme>()
+            .add_plugins(crate::picker::PickerPlugin);
+        app.update(); // `PostStartup` 收编出默认工作区
+        let focused = app
+            .world()
+            .resource::<WorkspaceSet>()
+            .focused
+            .expect("默认工作区");
+        let viewport = viewport_px(&app);
+        assert_eq!(scroll_of(&app, focused), 0.0);
+
+        let picker = app
+            .world_mut()
+            .spawn(Picker::new("test").item("a", ""))
+            .id();
+        app.update();
+        assert!(
+            workspace_tree(&app, focused)
+                .leaves()
+                .contains(&PanelId::List),
+            "picker 列加进树"
+        );
+        let scroll = scroll_of(&app, focused);
+        assert!(
+            (scroll - viewport * layout::DEFAULT_COLUMN_FRACTION).abs() < 1e-3,
+            "打开后滚到 picker 列：{scroll}"
+        );
+        assert!(
+            !app.world()
+                .resource::<WorkspaceScrollFocus>()
+                .is_pending(focused),
+            "打开时的滚动请求已在布局里消费掉"
+        );
+
+        app.world_mut().entity_mut(picker).despawn();
+        app.update();
+        assert_eq!(scroll_of(&app, focused), 0.0, "关闭后滚回去看转写");
+    }
+
+    // 41. `ActiveTranscript` 切换：活动列从第二块转写切到伸出视口的那一列时
+    //     滚过去；切回已可见的列时不动（只在必要时滚）。
+    #[test]
+    fn switching_the_active_transcript_column_scrolls_it_into_view() {
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let tree = LayoutNode::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(0.5, LayoutNode::leaf(PanelId::Transcript)),
+                Child::fraction(0.5, LayoutNode::leaf(PanelId::Spacer)),
+                Child::fraction(0.5, LayoutNode::leaf(PanelId::Pane2)),
+            ],
+        );
+        set_workspace_tree(&mut app, a, tree);
+        let pane2 = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .get_mut::<WorkspacePanels>(a)
+            .expect("WorkspacePanels")
+            .roots
+            .0
+            .insert(PanelId::Pane2, pane2);
+        app.insert_resource(ActiveTranscript(Some(pane2)));
+        app.update();
+
+        assert!(
+            (scroll_of(&app, a) - viewport * 0.5).abs() < 1e-3,
+            "Pane2 列在 x = 视口宽处，要滚到能完整看见它"
+        );
+
+        app.insert_resource(ActiveTranscript(None));
+        app.update();
+        assert_eq!(scroll_of(&app, a), 0.0, "切回主转写：它已可见，滚回 0");
     }
 
     // 26. 整理会把拖过的位置重置回 order 对应的竖直序列。

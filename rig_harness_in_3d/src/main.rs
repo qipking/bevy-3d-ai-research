@@ -214,13 +214,20 @@ fn demo_preview(
 /// 滚轮 -> 转写窗格的滚动（按行，和 rig-tui 的 pane 一样是行滚动不是像素滚动）。
 fn scroll_panel(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
+    held: Res<ButtonInput<KeyCode>>,
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     rows: Res<TranscriptRows>,
     mut panes: Query<&mut TranscriptPane>,
 ) {
+    // Shift+滚轮 / 横向滚轮轴归工作区横向滚动（`rig_niri::workspaces`），
+    // 普通滚轮仍滚转写行。
+    let shift = held.pressed(KeyCode::ShiftLeft) || held.pressed(KeyCode::ShiftRight);
     let mut delta = 0.0;
     for event in wheel.read() {
+        if shift || event.x != 0.0 {
+            continue;
+        }
         delta += match event.unit {
             bevy::input::mouse::MouseScrollUnit::Line => event.y,
             bevy::input::mouse::MouseScrollUnit::Pixel => event.y / 18.0,
