@@ -3,7 +3,7 @@
 resolver = "3"
 members = ["feathers_in_3d", "rig_niri", "rig_harness_in_3d"]
 
-# `bevy_luma` 自带 [workspace]（独立 workspace，vendored 上游），不能当 member。
+# `vendor/bevy_luma` 自带 [workspace]（独立 workspace，vendored 上游），不能当 member。
 # `experiments/` 下的探针没有自己的 [workspace]，不 exclude 的话 cargo 会向上找到这里、
 # 发现包不在 members 里而报错；排除后它们各自独立构建。
-exclude = ["bevy_luma", "experiments"]
+exclude = ["vendor/bevy_luma", "experiments", "reference"]

@@ -13,7 +13,7 @@
 | 文档 | 一句话 | 状态 |
 |---|---|---|
 | [`status/HANDOFF.md`](status/HANDOFF.md) | 交接页：分层、目录、怎么跑、踩过的坑 | **当前**，先读 |
-| [`status/PLAN.md`](status/PLAN.md) | 把 rig-harness 的 UI 换成 3D 的实施计划与进度 | 当前（进度表） |
+| [`status/WORKSPACE_MODEL.md`](status/WORKSPACE_MODEL.md) | 工作区模型：niri 条带 × 绝对空间坐标、四个操作、不变量 | 当前（布局的唯一目标） |
 | [`design/SPATIAL_UI.md`](design/SPATIAL_UI.md) | 空间 UI 纲领：3D 相对终端哪些赢面是真的、该丢什么 | 当前（规矩） |
 
 ## status/ —— 现在到哪
@@ -21,7 +21,7 @@
 | 文档 | 一句话 | 状态 |
 |---|---|---|
 | [`HANDOFF.md`](status/HANDOFF.md) | 交接页（含 jj 事故记录与规则） | 当前 |
-| [`PLAN.md`](status/PLAN.md) | 实施顺序、每步做到哪、下一步（环/总览已归档，仅留布局参考） | 当前 |
+| [`archive/PLAN.md`](archive/PLAN.md) | 旧的实施顺序与进度表 | **已归档**（进度看 `PARITY.md`，布局看 `WORKSPACE_MODEL.md`） |
 | [`PARITY.md`](status/PARITY.md) | 逐模块移植审计：谁已移植、谁部分、谁没开始、缺哪个公开 API | **当前，查进度看它** |
 | [`WORKSPACE_MODEL.md`](status/WORKSPACE_MODEL.md) | **工作区模型**：niri 条带 × 绝对空间坐标、四个操作、六条不变量 | **当前，布局的唯一目标** |
 
@@ -49,7 +49,7 @@
 |---|---|
 | [`VERIFICATION_REPORT.md`](reports/VERIFICATION_REPORT.md) | 路线 B（UI 镜像成 3D 网格）的验证报告与实测数据 |
 | [`occlusion_report.md`](reports/occlusion_report.md) | "面板被清空导致立方体像浮到前面"的排查结论（`unhover_row` 缺判断） |
-| [`PUBLISH.md`](reports/PUBLISH.md) | 三个 crate 的发布准备（仓库布局、版本策略） |
+| [`archive/PUBLISH.md`](archive/PUBLISH.md) | 旧的发布准备（workspace 化 + 改名后已过时） |
 
 ## 写新文档的规矩
 
@@ -65,8 +65,8 @@ research/
 ├── docs/                ← 所有文档
 │   ├── README.md          索引（先读哪个、哪份是历史）
 │   ├── design/            为什么这么做：SPATIAL_UI（§1–§10）、AGENT_3D_PATTERN、移动端方案、技术栈
-│   ├── status/            现在到哪：HANDOFF（交接页）、PLAN（进度表）
-│   ├── reports/           一次性结论：VERIFICATION_REPORT、occlusion_report、PUBLISH
+│   ├── status/            现在到哪：HANDOFF（交接页）、PARITY（移植审计）、WORKSPACE_MODEL
+│   ├── reports/           一次性结论：VERIFICATION_REPORT、occlusion_report、official-tui
 │   └── archive/           历史：GEOMETRY_HISTORY（旧几何）、WATCHWALL（S1 监看墙，已暂缓）
 ├── rig_harness_in_3d/   应用层（= plugins/rig-tui 的位置）
 ├── rig_niri/        视图层（= rig-tui 这个 crate 的位置）

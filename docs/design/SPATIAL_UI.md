@@ -12,7 +12,7 @@
 > 哪些终端设计要丢、哪些必须留、为什么用 Bevy ECS、以及拿 visionOS HIG 当标尺怎么落地。
 > 以后每个 UI 改动都要过 §8 的检查表；违反时要写"例外说明"。
 
-相关：[`PLAN.md`](../status/PLAN.md)（实施顺序）、[`AGENT_3D_PATTERN.md`](AGENT_3D_PATTERN.md)（分层）、
+相关：[`PLAN.md`](../archive/PLAN.md)（实施顺序）、[`AGENT_3D_PATTERN.md`](AGENT_3D_PATTERN.md)（分层）、
 [`HANDOFF.md`](../status/HANDOFF.md)（怎么跑）、[`GEOMETRY_HISTORY.md`](../archive/GEOMETRY_HISTORY.md)（已归档几何）。
 
 ---

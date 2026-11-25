@@ -55,7 +55,7 @@ bevy = { version = "=0.20.0", default-features = false, features = [
     "bevy_input_focus",
 ] }
 bevy_feathers = "=0.20.0"
-bevy_luma = { path = "../../bevy_luma" }
+bevy_luma = { path = "../../vendor/bevy_luma" }
 
 # Force `custom_cursor` on bevy_window / bevy_winit so the CursorIcon::Custom
 # variant is consistently feature-gated across the whole tree.

@@ -18,7 +18,7 @@ export CARGO_HOME="$ROOT/.cargo-home"          # 离线依赖目录（本机没�
 export RIG_HOME="${RIG_HOME:-$ROOT/.rig-home}" # 官方 agent 的项目/会话目录，已经建过一次
 mkdir -p "$RIG_HOME"
 
-SRC="$ROOT/experiments/rig-official"
+SRC="$ROOT/reference/rig-official"
 BIN="$SRC/target/debug/rig"
 
 if [[ ! -x "$BIN" ]]; then

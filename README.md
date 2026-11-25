@@ -10,13 +10,15 @@ Cargo.toml          workspace 根（members: feathers_in_3d / rig_niri / rig_har
 rig_harness_in_3d/  应用层（harness 装配 + 业务工具 + 演示/巡游）——fork 模板就是它
 rig_niri/           视图层：照 rig-tui 的模型重写的前端（面板/状态/输入/picker/窗口逻辑）
 feathers_in_3d/     渲染层：把 bevy_ui 子树镜像成 3D 网格 + 字形 + 排序 + 裁剪 + 拾取
-bevy_luma/          上游的 SDF 3D UI 材料（vendored，改动要克制）
+vendor/bevy_luma/   上游的 SDF 3D UI 材料（vendored 依赖，自带 workspace）
 
-docs/               文档：design(为什么) / status(现在到哪) / reports(一次性结论) → 先看 docs/README.md
-experiments/        一次性探针：spike、occlusion_probe、rig-tui-inspect（不保证能编译）
-reference/          上游源码，只读参考：rig-harness-src、niri（GPL-3.0，已 gitignore）
-render/             截图证据（每个子目录对应一次验证）
-tools/              脚本
+docs/               文档：design(为什么) / status(现在到哪) / reports(一次性结论) / archive(历史)
+                    → 先看 docs/README.md
+reference/          只读参考项目：niri（GPL-3.0，已 gitignore）、rig-harness-src、
+                    rig-official（官方 rig 的 crate 副本 + 抓屏脚本）、rig-tui-inspect
+experiments/        一次性探针：spike、occlusion_probe（各自独立构建，不保证能编译）
+render/             截图证据（只剩最近一次：rf_niri_app）
+tools/              脚本（CJK 字体子集化）
 ```
 
 ## 分层

@@ -29,13 +29,16 @@ shots/
 .claude/
 *.raw
 
-# 官方 rig 的 crate 源码副本（可一键重新生成，见 experiments/rig-official/README.md）
-experiments/rig-official/*
-!experiments/rig-official/README.md
-!experiments/rig-official/capture.py
+# 官方 rig 的 crate 源码副本（可一键重新生成，见 reference/rig-official/README.md）
+reference/rig-official/*
+!reference/rig-official/README.md
+!reference/rig-official/capture.py
 
 # 一次性调试截图（不当作证据存档）
 render/ws*/
 render/layout_check/
 render/dbg*/
 render/final_check/
+
+# 解包的上游 crate 源码（可重新解包，不进仓库）
+reference/rig-tui-inspect/
