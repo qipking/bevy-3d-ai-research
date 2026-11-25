@@ -99,10 +99,11 @@ workspace 并持续跟上游漂移，收益不抵成本。
 | `kernel.rs` | 两个演示工具 + **闸门**（`Ask` 按住调用）+ `answer_ask` 观察者 |
 | `workspaces_demo.rs` | 多工作区演示：绑定 agent、聚焦键、非聚焦行同步、`restack_on_resize` |
 | `settings.rs` / `notice.rs` / `status.rs` | 设置路径、通知历史、`AppStatus` |
+| `show.rs` / `theme_cmd.rs` | `/show`（切转写来源：agent / 存档会话）与 `/theme`（dark/light）命令 |
 
 ---
 
-## 3. 视图层内部（`rig_niri`，25 个模块）
+## 3. 视图层内部（`rig_niri`，26 个模块）
 
 ### 3.1 输入与键位
 
@@ -122,6 +123,7 @@ workspace 并持续跟上游漂移，收益不抵成本。
 | `layout.rs` | 分裂树：`Node`/`Split`/`Size::{Fraction,Proportion,Fixed}`；`rects`/`placements`；列宽预设、移动列、`append_column` |
 | `frame.rs` | `FrameSize`（跟随窗口/`RF_FRAME` 固定）、`FramePlugin`、面板区域 `PanelArea`、3D 锚点 `WorldPanel`、面板 chrome token、确认 tile 高度 |
 | `workspaces.rs` | `Workspace{session,tree,pose,order}`、`WorkspaceSet{items,focused}`、`WorkspacePanels{rows,roots,spawned,areas}`、`WorkspaceScroll`、排列/拖拽/聚焦、`clamp_scroll`/`scroll_to_visible`/`workspace_step` |
+| `panel.rs` | 插件面板画布（F6）：`PanelId::Plugin(PluginPanel)`、注册/放进条带/自动装进工作区、`drawn_row(s)` 读回 |
 | `niri.rs` / `spatial.rs` | 早期实验（RF_NIRI_LAYOUT / 卡片空间），仍在插件里但不在主链路 |
 
 ### 3.3 内容管线
@@ -238,7 +240,7 @@ Render   ：panels::sync_panels（行→节点，按 key 前缀 diff）→ 编�
 
 ## 8. 测试与验证
 
-- 全部无窗口 ECS 测试：`rig_niri` 557、app 22、bin 5、`feathers_in_3d` 8（`cargo test --workspace --offline`）。
+- 全部无窗口 ECS 测试：`rig_niri` 606、app 36、bin 5、`feathers_in_3d` 15（`cargo test --workspace --offline`）。
 - 真实渲染验证：`RF_SHOT_DIR=render/rf_niri_app cargo run -p rig_harness_in_3d`（巡游 17 张截图，自动退出）。
 - 关键不变量都有测试：列宽不随兄弟变、开列不动旧列、裁剪 = 面板∩视口、行宽 ≤ 面板列数、焦点不会被转写抢走、滚动不改列几何。
 
