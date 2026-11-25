@@ -211,11 +211,19 @@ batch.rs
 
 ## 6. 版本管理与提交
 
-jj 仓库（`research/`）。本会话 `~/.config` 只读，用包装脚本：
+jj 仓库（仓库根 = jj 仓库根），正常就用官方命令：
 
 ```sh
-./jjx st / describe -m "..." / new / log
+jj st / jj describe / jj new / jj log           # 平时这样
 ```
+
+**不要去碰 `jj restore`（无路径 = 丢弃整个 change）**；回退单个文件写路径，出事就
+`jj op log` + `jj op restore <op-id>`（详见 §0）。
+
+只有在 `~/.config` 只读的环境里（例如受限沙箱的自动化会话）才需要 `tools/jjx`：
+它只是把 `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/`XDG_DATA_HOME` 指到仓库内的 `.jjenv/`，
+`.jjenv/` 里只有两个几十字节的 per-repo 元数据文件，**不是仓库数据**（仓库数据在 `.jj/`），
+也不需要提交（已 gitignore）。
 
 `bevy_luma` 的本地改动（alpha_mode 固定 Premultiplied）是有意的，别回滚。
 

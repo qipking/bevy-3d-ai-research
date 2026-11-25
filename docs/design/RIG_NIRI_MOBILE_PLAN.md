@@ -536,13 +536,13 @@ rig_niri/      适配层 + 应用
 
 ## 版本管理（jj）
 
-本会话 `~/.config` 只读，jj 的 XDG 目录重定向到工作区，封装成 `research/jjx`：
+（历史记录）本会话 `~/.config` 只读，当时用一个包装脚本把 jj 的 XDG 目录重定向到工作区：
 
 ```sh
-./jjx st          # 改动
-./jjx describe -m "..."   # 给当前改动写说明
-./jjx new         # 下一个改动
-./jjx log         # 历史
+jj st          # 改动
+jj describe -m "..."   # 给当前改动写说明
+jj new         # 下一个改动
+jj log         # 历史
 ```
 
 ## luma 怎么解决"斜看时的文字/色带错位"（源码）

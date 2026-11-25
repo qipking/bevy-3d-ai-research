@@ -1,0 +1,12 @@
+#!/bin/sh
+# 只有在 `~/.config` 不可写时才需要这个包装（例如受限沙箱里的自动化会话）。
+#
+# 官方用法就是直接 `jj`：仓库数据在 `.jj/`，用户配置在 `$XDG_CONFIG_HOME/jj/`，
+# 没有 jjx / .jjenv 这种东西。这里只是把三个 XDG 目录指到仓库内的 `.jjenv/`，
+# 让 `~/.config` 只读的环境也能跑 jj。正常机器上不要用它。
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 1
+XDG_CONFIG_HOME=$ROOT/.jjenv/config \
+XDG_CACHE_HOME=$ROOT/.jjenv/cache \
+XDG_DATA_HOME=$ROOT/.jjenv/data \
+exec jj "$@"
