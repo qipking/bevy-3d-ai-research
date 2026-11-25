@@ -198,7 +198,7 @@ pub fn app(title: &str) -> App {
             ..default()
         }));
     app.add_plugins(bevy_feathers::FeathersPlugins);
-    app.add_plugins(workspaces_demo::WorkspacesDemoPlugin);
+    app.add_plugins(workspaces_demo::WorkspacesDemoPlugin::default());
     // 渲染层
     app.add_plugins(FeathersIn3dPlugin);
     // harness 本体：session / commands / launcher / clock / watch / ask / pick / run / progress
@@ -368,7 +368,7 @@ pub mod prelude {
         batch::{BatchPlugin, CompletedCalls},
         editor::{Editor, PromptSubmitted, SubmittedPrompts},
         frame::{
-            CellRect, Extent, FrameGeometry, FramePanel, FrameSize, Placement, PanelArea,
+            CellRect, FrameGeometry, FramePanel, FrameSize, Placement, PanelArea,
         },
         pane::{PaneScroll, TranscriptRows},
         panels::{KeyedRow, PanelId, PanelRows, PanelRoots},

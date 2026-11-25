@@ -34,17 +34,24 @@ pub enum PanelId {
     Transcript,
     Status,
     Input,
-    /// 浮层（picker / 补全）的容器：底色 + 边框，行在 [`PanelId::List`] 里。
-    Overlay,
-    /// 浮层里的列表列（有 preview 时只占容器的一半）。
+    /// picker 那一列的容器面板：只给这一列画底色 + 边框，本身不产行。
+    ///
+    /// picker 不再是浮层：它是条带最右边的一列（`FrameTree` 根横向 split 的
+    /// 最后一个子），容器里再竖着分成 [`PanelId::List`] / [`PanelId::Preview`]。
+    Picker,
+    /// picker 列里的列表面板：标题、说明、过滤行、列表、键位行都写在这里。
     List,
-    /// 浮层里的一列（picker 的 preview）。
+    /// picker 列里的 preview 面板（插件挂 `PickPreview::Text` 时才有）。
     Preview,
     /// 第二个转写窗格：拆窗（`Alt+S`，见 [`crate::frame::split_transcript`]）后
     /// 出现，每帧显示与 [`PanelId::Transcript`] 完全相同的可见行。
     Pane2,
     /// 占位：分裂树里只吃空间、不画任何东西（右列顶部留白，让输入框贴底）。
     Spacer,
+    /// 键位提示行：从输入面板里拆出来，单独一个 1 行高的 tile（niri 里就是一块窗口）。
+    Hints,
+    /// 确认行（Ask / 上一条待确认的操作）：单独一个 tile，不再挤进转写。
+    Confirm,
     /// 输入框上方的补全 tile：关着时在分裂树里是 0 高度，打开时占 6 行。
     ///
     /// 行由 [`crate::complete`] 产（候选 + 官方提示行），这里只当普通面板走

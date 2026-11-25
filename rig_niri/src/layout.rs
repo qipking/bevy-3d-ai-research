@@ -5,6 +5,10 @@
 //! [`Split::Vertical`] 切成若干份，每一份可以是叶子（一块面板），也可以再是
 //! 一个 split。于是"列里再拆列""列里拆上下"都只是嵌套，不需要新的枚举。
 //!
+//! 还有一种 [`Node::Container`]：一块容器面板包着一段区域（picker 那一列的
+//! 底色/边框）。容器**不是叶子**，[`Node::rects`] 只返回真正的面板叶子；
+//! [`Node::containers`] 单独给容器区域，绘制时它垫在内部面板下面。
+//!
 //! 语义照 `reference/niri` 的列/窗口分裂模型（只学语义，独立实现）：
 //!
 //! * 同层相邻两个子之间恰好留 [`Node::Split::gap`] 的缝；
@@ -19,6 +23,9 @@
 //! 只有固定子的列也能铺满：第一个子吃掉剩余，后面的固定子保持精确。
 //! `default_tree` 的右列则把输入写成比例子（补全 tile 的 0/6 行是固定子，
 //! 输入拿剩下的），所以补全打开/关闭时右列总高都精确不变。
+//!
+//! 条带最右边加一列（picker）用 [`Node::append_column`]：新列占 1/3，已有列
+//! 按同一因子等比缩小；[`Node::remove_column`] 摘掉它，树逐字节复原。
 //!
 //! 3D 坐标：区域用 [`TileRect`]（米，原点在帧中心，y 朝上）。第一块子区域在
 //! 上/左，第二块在下/右。
@@ -105,6 +112,17 @@ pub enum Node {
     },
     /// 一块面板。
     Leaf { panel: PanelId },
+    /// 一块**容器面板**包着一段区域：容器自己画底色/边框，内部再排子节点。
+    ///
+    /// 容器**不是叶子**：[`Node::rects`] 只返回真正的面板叶子（容器和它们
+    /// 几何重叠，靠绘制层压在后面），[`Node::containers`] 单独返回容器的
+    /// 区域。picker 那一列就是"`Picker` 容器 + 列内的 `List` / `Preview`"。
+    Container {
+        /// 容器面板。
+        panel: PanelId,
+        /// 容器内部的分裂树。
+        node: Box<Node>,
+    },
 }
 
 impl Node {
@@ -121,20 +139,30 @@ impl Node {
         }
     }
 
+    /// 一块容器面板包着 `node`（见 [`Node::Container`]）。
+    pub fn container(panel: PanelId, node: Node) -> Self {
+        Self::Container {
+            panel,
+            node: Box::new(node),
+        }
+    }
+
     /// 空 split（或只装着空 split 的 split）。
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Leaf { .. } => false,
+            Self::Container { node, .. } => node.is_empty(),
             Self::Split { children, .. } => {
                 children.is_empty() || children.iter().all(|child| child.node.is_empty())
             }
         }
     }
 
-    /// 叶子面板列表（先左/上，后右/下）。
+    /// 叶子面板列表（先左/上，后右/下）；容器不算叶子。
     pub fn leaves(&self) -> Vec<PanelId> {
         match self {
             Self::Leaf { panel } => vec![*panel],
+            Self::Container { node, .. } => node.leaves(),
             Self::Split { children, .. } => children
                 .iter()
                 .flat_map(|child| child.node.leaves())
@@ -142,20 +170,49 @@ impl Node {
         }
     }
 
-    /// 把 `area` 递归切成每个叶子的矩形。
+    /// 把 `area` 递归切成每个**叶子**的矩形（容器不算，见 [`Node::containers`]）。
     ///
     /// 保证：同一个 split 的相邻叶子之间恰好是 `gap`；所有叶子既不重叠，
     /// 也不在区域里留缝（最后一个子的远端贴住区域边，吃掉舍入误差）。
     pub fn rects(&self, area: TileRect) -> Vec<(PanelId, TileRect)> {
+        self.placements(area)
+            .into_iter()
+            .filter_map(|(panel, rect, container)| (!container).then_some((panel, rect)))
+            .collect()
+    }
+
+    /// 容器面板的区域（和它内部的叶子重叠，只是绘制层更低）。
+    pub fn containers(&self, area: TileRect) -> Vec<(PanelId, TileRect)> {
+        self.placements(area)
+            .into_iter()
+            .filter_map(|(panel, rect, container)| container.then_some((panel, rect)))
+            .collect()
+    }
+
+    /// 递归切分，把容器和叶子都按先后顺序收进来。
+    ///
+    /// 返回值第三项是"这是不是容器"：容器永远在它内部的面板之前出现。
+    pub fn placements(&self, area: TileRect) -> Vec<(PanelId, TileRect, bool)> {
+        let mut out = Vec::new();
+        self.walk(area, &mut out);
+        out
+    }
+
+    /// [`Node::placements`] 的递归体。
+    fn walk(&self, area: TileRect, out: &mut Vec<(PanelId, TileRect, bool)>) {
         match self {
-            Self::Leaf { panel } => vec![(*panel, area)],
+            Self::Leaf { panel } => out.push((*panel, area, false)),
+            Self::Container { panel, node } => {
+                out.push((*panel, area, true));
+                node.walk(area, out);
+            }
             Self::Split {
                 direction,
                 gap,
                 children,
             } => {
                 if children.is_empty() {
-                    return Vec::new();
+                    return;
                 }
                 let horizontal = matches!(direction, Split::Horizontal);
                 let total = if horizontal {
@@ -234,7 +291,6 @@ impl Node {
                     area.center.y - area.size.y * 0.5
                 };
                 let mut cursor = near;
-                let mut out = Vec::new();
                 for (index, child) in children.iter().enumerate() {
                     // 最后一个子贴住远端：浮点误差不会在区域边上留一条缝。
                     let end = if index + 1 == count {
@@ -255,14 +311,13 @@ impl Node {
                             size: Vec2::new(area.size.x, (cursor - end).max(0.0)),
                         }
                     };
-                    out.extend(child.node.rects(child_area));
+                    child.node.walk(child_area, out);
                     cursor = if horizontal {
                         end + gap
                     } else {
                         end - gap
                     };
                 }
-                out
             }
         }
     }
@@ -274,6 +329,10 @@ impl Node {
     /// 3. 只剩一个子的 split 摊平成那个子；
     /// 4. 同层比例权重归一化（和为 1）；全为 0/NaN 时改成等分。
     pub fn normalize(&mut self) {
+        if let Self::Container { node, .. } = self {
+            node.normalize();
+            return;
+        }
         let Self::Split { children, .. } = self else {
             return;
         };
@@ -317,32 +376,60 @@ impl Node {
 
     /// 把一个叶子换成"原叶子 + 新叶子"的 split。这是"窗口能拆分"的最小操作。
     ///
-    /// 方向由调用方定；新 split 用 [`DEFAULT_GAP`] 留缝。找到 `panel` 且
-    /// `new_panel` 还不在树上时返回 `true`；找不到、或者新面板已经存在时返回
-    /// `false`（同一块面板出现两次的话 [`crate::frame::PanelRoots`] 没法把两个
-    /// 叶子映到各自的实体，所以不允许重复）。
+    /// 方向由调用方定；新 split 用 [`DEFAULT_GAP`] 留缝、两个子等宽。找到
+    /// `panel` 且 `new_panel` 还不在树上时返回 `true`；找不到、或者新面板已经
+    /// 存在时返回 `false`（同一块面板出现两次的话 [`crate::frame::PanelRoots`]
+    /// 没法把两个叶子映到各自的实体，所以不允许重复）。
     pub fn split_leaf(&mut self, panel: PanelId, direction: Split, new_panel: PanelId) -> bool {
+        self.split_leaf_sized(
+            panel,
+            direction,
+            new_panel,
+            DEFAULT_GAP,
+            Size::Proportion(1.0),
+            Size::Proportion(1.0),
+        )
+    }
+
+    /// 同 [`Node::split_leaf`]，但缝和两个子的尺寸由调用方定。
+    ///
+    /// picker 的 preview 用 [`NO_GAP`] + `2:1` 把一列竖着切成"列表 / preview"：
+    /// 同一列内部不需要缝（两个面板自己带边框），2:1 是和 niri 的列内预设对齐。
+    pub fn split_leaf_sized(
+        &mut self,
+        panel: PanelId,
+        direction: Split,
+        new_panel: PanelId,
+        gap: f32,
+        original: Size,
+        added: Size,
+    ) -> bool {
         // 重复触发（已经拆过）要安全地什么也不做：树保持原样。
         if new_panel == panel || self.leaves().contains(&new_panel) {
             return false;
         }
         match self {
             Self::Leaf { panel: found } if *found == panel => {
-                let original = *found;
+                let original_panel = *found;
                 *self = Self::split(
                     direction,
-                    DEFAULT_GAP,
+                    gap,
                     vec![
-                        Child::proportion(1.0, Node::leaf(original)),
-                        Child::proportion(1.0, Node::leaf(new_panel)),
+                        Child::new(original, Node::leaf(original_panel)),
+                        Child::new(added, Node::leaf(new_panel)),
                     ],
                 );
                 true
             }
             Self::Leaf { .. } => false,
-            Self::Split { children, .. } => children
-                .iter_mut()
-                .any(|child| child.node.split_leaf(panel, direction, new_panel)),
+            Self::Container { node, .. } => {
+                node.split_leaf_sized(panel, direction, new_panel, gap, original, added)
+            }
+            Self::Split { children, .. } => children.iter_mut().any(|child| {
+                child
+                    .node
+                    .split_leaf_sized(panel, direction, new_panel, gap, original, added)
+            }),
         }
     }
 
@@ -351,20 +438,23 @@ impl Node {
     /// 尺寸挂在父 [`Child`] 上（叶子自身没有尺寸），所以从根开始找"装着这个
     /// 叶子的那个子"。根正好是叶子时返回 `None`（根没有父，也就没有尺寸）。
     pub fn leaf_size(&self, panel: PanelId) -> Option<Size> {
-        let Self::Split { children, .. } = self else {
-            return None;
-        };
-        for child in children {
-            if let Self::Leaf { panel: found } = &child.node {
-                if *found == panel {
-                    return Some(child.size);
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Container { node, .. } => node.leaf_size(panel),
+            Self::Split { children, .. } => {
+                for child in children {
+                    if let Self::Leaf { panel: found } = &child.node {
+                        if *found == panel {
+                            return Some(child.size);
+                        }
+                    }
+                    if let Some(size) = child.node.leaf_size(panel) {
+                        return Some(size);
+                    }
                 }
-            }
-            if let Some(size) = child.node.leaf_size(panel) {
-                return Some(size);
+                None
             }
         }
-        None
     }
 
     /// 改 `panel` 这个叶子的尺寸约束；找到并真的改了返回 `true`。
@@ -373,24 +463,197 @@ impl Node {
     /// `Fixed(6 行)`。尺寸没变时不写，免得每帧都把 [`crate::frame::FrameTree`]
     /// 标脏。
     pub fn set_leaf_size(&mut self, panel: PanelId, size: Size) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Container { node, .. } => node.set_leaf_size(panel, size),
+            Self::Split { children, .. } => {
+                for child in children.iter_mut() {
+                    if matches!(&child.node, Self::Leaf { panel: found } if *found == panel) {
+                        if child.size == size {
+                            return false;
+                        }
+                        child.size = size;
+                        return true;
+                    }
+                    if child.node.set_leaf_size(panel, size) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// 在根横向条带的**最右边**追加一列（`column` 可以是叶子，也可以是容器）。
+    ///
+    /// 列宽策略：新列拿现有比例权重之和的一半 —— 即条带空间的 **1/3**，对齐
+    /// niri 新窗口的默认列宽（1/3、1/2、2/3 三档里的 1/3）。已有列都乘同一个
+    /// 因子（2/3）等比缩小，彼此的**相对**宽度一个像素都不变；帧宽本身不变，
+    /// 所以叶子仍然精确铺满整屏。
+    ///
+    /// niri 的第一原则是"开新窗口不改变已有窗口大小"——那是在**无限长**的条带
+    /// 上（视口跟着焦点滚动）。这里的条带就是固定大小的帧，没有滚动的视口，
+    /// 只能在帧内按比例重新分配；等比缩小是"已有列宽只按比例重新分配"的那一
+    /// 种，见 `frame.rs` 的文档。
+    ///
+    /// 根不是横向 split 时把整棵树包成横向：原树 2 份、新列 1 份（新列同样是
+    /// 1/3）。`column` 里的面板已经出现在树上时返回 `false`，不重复加列。
+    pub fn append_column(&mut self, column: Node) -> bool {
+        let present = self.leaves();
+        if column
+            .leaves()
+            .iter()
+            .any(|panel| present.contains(panel))
+        {
+            return false;
+        }
+        match self {
+            Self::Split {
+                direction: Split::Horizontal,
+                children,
+                ..
+            } => {
+                let total: f32 = children
+                    .iter()
+                    .filter_map(|child| match child.size {
+                        Size::Proportion(weight) => Some(weight.sanitized()),
+                        Size::Fixed(_) => None,
+                    })
+                    .sum();
+                let weight = if total > 0.0 { total / 2.0 } else { 1.0 };
+                children.push(Child::new(Size::Proportion(weight), column));
+                true
+            }
+            Self::Split { .. } | Self::Leaf { .. } | Self::Container { .. } => {
+                let old = std::mem::replace(
+                    self,
+                    Self::Split {
+                        direction: Split::Horizontal,
+                        gap: NO_GAP,
+                        children: Vec::new(),
+                    },
+                );
+                if let Self::Split { children, .. } = self {
+                    children.push(Child::proportion(2.0, old));
+                    children.push(Child::proportion(1.0, column));
+                }
+                true
+            }
+        }
+    }
+
+    /// 把 `column` 追加到**包含 `near` 的那条横向 split** 的末尾（niri：新窗口往右加一列）。
+    ///
+    /// 找不到 `near` 时退回 [`Self::append_column`]。
+    pub fn append_column_at(&mut self, near: PanelId, column: Node) -> bool {
+        let present = self.leaves();
+        if column.leaves().iter().any(|panel| present.contains(panel)) {
+            return false;
+        }
+        if self.append_column_in(near, &column) {
+            return true;
+        }
+        self.append_column(column)
+    }
+
+    /// 递归找包含 `near` 的横向 split，把 `column` 追加进去。
+    fn append_column_in(&mut self, near: PanelId, column: &Node) -> bool {
+        let here_has_near = self.leaves().contains(&near);
+        let Self::Split {
+            direction,
+            children,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if *direction == Split::Horizontal && here_has_near {
+            let total: f32 = children
+                .iter()
+                .filter_map(|child| match child.size {
+                    Size::Proportion(weight) => Some(weight.sanitized()),
+                    Size::Fixed(_) => None,
+                })
+                .sum();
+            let weight = if total > 0.0 { total / 2.0 } else { 1.0 };
+            children.push(Child::new(Size::Proportion(weight), column.clone()));
+            return true;
+        }
+        let mut found = false;
+        for child in children.iter_mut() {
+            if child.node.leaves().contains(&near) {
+                found = child.node.append_column_in(near, column);
+                if found {
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// 摘掉根条带里**包含 `panel` 的那一整列**（picker 关闭时用）。
+    ///
+    /// 只动根的直接子节点；其余子的尺寸权重原样保留，所以"加列 → 摘列"之后
+    /// 树和加列前逐字节相同。根不是 split、或者没有这一列时返回 `false`。
+    pub fn remove_column(&mut self, panel: PanelId) -> bool {
         let Self::Split { children, .. } = self else {
             return false;
         };
-        for child in children.iter_mut() {
-            if matches!(&child.node, Self::Leaf { panel: found } if *found == panel) {
-                if child.size == size {
-                    return false;
-                }
-                child.size = size;
-                return true;
-            }
-            if child.node.set_leaf_size(panel, size) {
-                return true;
-            }
+        let Some(index) = children
+            .iter()
+            .position(|child| child.node.leaves().contains(&panel))
+        else {
+            return false;
+        };
+        children.remove(index);
+        if let Some(only) = self.take_only_child() {
+            *self = only;
         }
-        false
+        true
+    }
+
+    /// 递归摘掉一个叶子：装着它的那个子节点被删除，只剩一个子的 split 摊平。
+    ///
+    /// preview 关闭时用（列表那一列留下，preview 那一半消失、列表重新占满整列）。
+    pub fn remove_leaf(&mut self, panel: PanelId) -> bool {
+        let removed = match self {
+            Self::Leaf { .. } => false,
+            Self::Container { node, .. } => node.remove_leaf(panel),
+            Self::Split { children, .. } => {
+                let mut removed = false;
+                for index in 0..children.len() {
+                    if matches!(&children[index].node, Self::Leaf { panel: found } if *found == panel)
+                    {
+                        children.remove(index);
+                        removed = true;
+                        break;
+                    }
+                    if children[index].node.remove_leaf(panel) {
+                        removed = true;
+                        break;
+                    }
+                }
+                removed
+            }
+        };
+        if removed && let Some(only) = self.take_only_child() {
+            *self = only;
+        }
+        removed
+    }
+
+    /// 把只剩一个子的 split 摊平成那个子（不归一化比例权重，几何不变）。
+    fn take_only_child(&mut self) -> Option<Node> {
+        let Self::Split { children, .. } = self else {
+            return None;
+        };
+        if children.len() != 1 {
+            return None;
+        }
+        children.pop().map(|child| child.node)
     }
 }
+
 
 /// `f32` 的 `max` 不会滤掉 NaN；这里统一把 NaN/∞ 变成 0。
 trait Sanitized {
@@ -434,6 +697,8 @@ impl Sanitized for f32 {
 pub fn default_tree() -> Node {
     use crate::transcript::ROW_HEIGHT;
 
+    // 条带 = 横向：左转写，右列（留白 / 确认 / 补全 / 输入 / 提示 / 状态）。
+    // 全部是树里的叶子（niri 里就是窗口），没有浮层。
     Node::split(
         Split::Horizontal,
         NO_GAP,
@@ -445,13 +710,15 @@ pub fn default_tree() -> Node {
                     Split::Vertical,
                     NO_GAP,
                     vec![
-                        // 右列顶部留白（Spacer 只吃空间不画面）：这样输入框和状态行
-                        // 贴底，像官方那样"底部是输入区"，其余高度给留白。
+                        // 顶部留白：让输入区贴底。
                         Child::proportion(1.0, Node::leaf(PanelId::Spacer)),
-                        // 补全 tile 在输入框上方：关着时 0 高度（不占位）。
+                        // 确认行（Ask）：没有待确认时 0 高度。
+                        Child::fixed(0.0, Node::leaf(PanelId::Confirm)),
+                        // 补全：关着时 0 高度。
                         Child::fixed(0.0, Node::leaf(PanelId::Complete)),
-                        // 输入框固定 4 行：补全打开时它不会跟着缩，而是被挤上去。
                         Child::fixed(4.0 * ROW_HEIGHT, Node::leaf(PanelId::Input)),
+                        // 提示行 1 行（面板用无内边距的观感，否则 1 行放不下 1 行字）。
+                        Child::fixed(1.0 * ROW_HEIGHT, Node::leaf(PanelId::Hints)),
                         Child::fixed(2.0 * ROW_HEIGHT, Node::leaf(PanelId::Status)),
                     ],
                 ),
@@ -787,13 +1054,15 @@ mod tests {
     fn the_default_tree_covers_the_screen() {
         let node = default_tree();
         let found = node.rects(area());
-        assert_eq!(found.len(), 5, "转写 / 留白 / 补全 / 输入 / 状态");
+        assert_eq!(found.len(), 7, "转写 / 留白 / 确认 / 补全 / 输入 / 提示 / 状态");
         let mut ids: Vec<PanelId> = found.iter().map(|(id, _)| *id).collect();
         ids.sort_by_key(|id| format!("{id:?}"));
         assert_eq!(
             ids,
             vec![
                 PanelId::Complete,
+                PanelId::Confirm,
+                PanelId::Hints,
                 PanelId::Input,
                 PanelId::Spacer,
                 PanelId::Status,
@@ -817,7 +1086,9 @@ mod tests {
         assert!(close(transcript.size.x, area().size.x * 2.0 / 3.0));
         assert!(close(status.size.y, 2.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS));
         assert!(close(bottom(&status), bottom(&area())));
-        assert!(close(bottom(&input), top(&status)));
+        let hints = found.iter().find(|(id, _)| *id == PanelId::Hints).unwrap().1;
+        assert!(close(bottom(&input), top(&hints)), "输入下方是提示行");
+        assert!(close(bottom(&hints), top(&status)), "提示行下方是状态行");
         // 补全 tile 关着：高度 0，贴输入上方（右列底部是输入+状态，顶部是留白）。
         assert_eq!(complete.size.y, 0.0);
         assert!(close(top(&complete), top(&input)), "0 高度贴输入上沿");
@@ -889,7 +1160,9 @@ mod tests {
         assert!(close(bottom(&input), bottom(&input_closed)), "输入底边不动");
         assert!(close(top(&input), top(&input_closed)), "输入整块不动");
         assert!(close(bottom(&complete), top(&input)), "补全紧贴输入上方");
-        assert!(close(bottom(&input), top(&status)));
+        let hints = open.iter().find(|(id, _)| *id == PanelId::Hints).unwrap().1;
+        assert!(close(bottom(&input), top(&hints)), "输入下方是提示行");
+        assert!(close(bottom(&hints), top(&status)), "提示行下方是状态行");
         // 留白让出 6 行。
         assert!(
             close(spacer.size.y, spacer_closed.size.y - 6.0 * row * PX_TO_METERS),
@@ -1018,5 +1291,128 @@ mod tests {
         );
         assert!(close(bottom(&input), top(&status)));
         assert!(close(bottom(&status), bottom(&area())));
+    }
+
+    // 21. 条带最右边加一列：新列 1/3，已有列等比缩到 2/3（相对宽度不变）。
+    #[test]
+    fn appending_a_column_takes_a_third_and_scales_the_old_columns() {
+        let mut node = default_tree();
+        let before = rects(&node);
+        assert!(node.append_column(Node::container(
+            PanelId::Picker,
+            Node::leaf(PanelId::List)
+        )));
+        let after = rects(&node);
+
+        assert_eq!(after.len(), before.len() + 1, "只多一个叶子");
+        assert_eq!(after.last().map(|(id, _)| *id), Some(PanelId::List));
+        let column = after.last().expect("新列").1;
+        assert!(close(column.size.x, area().size.x / 3.0), "新列 = 条带的 1/3");
+        assert!(close(right(&column), right(&area())), "新列贴住最右");
+        assert_eq!(node.leaves().last(), Some(&PanelId::List));
+
+        for (id, old) in &before {
+            let fresh = after
+                .iter()
+                .find(|(found, _)| found == id)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{id:?} 还在树上"));
+            assert!(
+                close(fresh.size.x, old.size.x * 2.0 / 3.0),
+                "{id:?} 按比例缩到 2/3"
+            );
+            assert!(close(fresh.size.y, old.size.y));
+            assert!(close(top(&fresh), top(old)));
+            if *id == PanelId::Transcript {
+                assert!(close(left(&fresh), left(old)), "最左列左边界不动");
+            }
+        }
+        // 叶子面积仍然铺满整屏。
+        let leaves: f32 = after.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
+        assert!(close(leaves, area().size.x * area().size.y));
+    }
+
+    // 22. 加列 → 摘列：树逐字节复原；重复摘是空操作。
+    #[test]
+    fn removing_the_appended_column_restores_the_tree() {
+        let before = default_tree();
+        let mut node = before.clone();
+        assert!(node.append_column(Node::container(
+            PanelId::Picker,
+            Node::leaf(PanelId::List)
+        )));
+        assert!(node.remove_column(PanelId::List));
+        assert_eq!(node, before, "加列再摘列不改树的其它部分");
+        assert!(!node.remove_column(PanelId::List), "没有这一列时返回 false");
+        assert_eq!(node, before);
+    }
+
+    // 23. 容器不是叶子：rects 只给叶子，containers 单独给容器区域。
+    #[test]
+    fn containers_are_not_leaves_but_have_their_own_area() {
+        let node = Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::proportion(2.0, leaf(PanelId::Transcript)),
+                Child::new(
+                    Size::Proportion(1.0),
+                    Node::container(PanelId::Picker, Node::leaf(PanelId::List)),
+                ),
+            ],
+        );
+        assert_eq!(node.leaves(), vec![PanelId::Transcript, PanelId::List]);
+        let all = node.placements(area());
+        assert_eq!(all.len(), 3, "转写 + 容器 + 列表");
+        assert_eq!(all[1].0, PanelId::Picker);
+        assert!(all[1].2, "第二项是容器");
+        assert_eq!(all[2].0, PanelId::List);
+        assert!(!all[2].2);
+
+        let leaf_rects = node.rects(area());
+        assert_eq!(leaf_rects.len(), 2);
+        let containers = node.containers(area());
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].0, PanelId::Picker);
+        assert_eq!(containers[0].1, all[2].1, "容器和内部列表区域相同");
+    }
+
+    // 24. 自定义尺寸的拆叶子：2:1 竖直拆分；摘掉 preview 后树精确复原。
+    #[test]
+    fn splitting_a_leaf_with_custom_sizes_can_be_undone() {
+        let before = three_leaf_tree();
+        let mut node = before.clone();
+        let input_before = rects(&node)
+            .into_iter()
+            .find(|(id, _)| *id == PanelId::Input)
+            .expect("输入")
+            .1;
+        assert!(node.split_leaf_sized(
+            PanelId::Input,
+            Split::Vertical,
+            PanelId::Preview,
+            NO_GAP,
+            Size::Proportion(2.0),
+            Size::Proportion(1.0),
+        ));
+        let found = rects(&node);
+        let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
+        let preview = found.iter().find(|(id, _)| *id == PanelId::Preview).unwrap().1;
+        assert!(close(input.size.x, preview.size.x), "同一列同宽");
+        assert!(close(input.size.y, preview.size.y * 2.0), "2:1");
+        assert!(close(input.size.y + preview.size.y, input_before.size.y));
+        assert!(close(bottom(&input), top(&preview)), "没有缝");
+        // 右列从下到上是 状态 / preview / 输入：preview 的底边 = 状态行顶边。
+        let status = found
+            .iter()
+            .find(|(id, _)| *id == PanelId::Status)
+            .expect("状态行")
+            .1;
+        assert!(close(top(&input), top(&area())), "输入贴右列顶部");
+        assert!(close(bottom(&preview), top(&status)), "preview 贴着状态行");
+
+        assert!(node.remove_leaf(PanelId::Preview));
+        assert_eq!(node, before, "摘掉 preview 后精确复原");
+        assert!(!node.remove_leaf(PanelId::Preview));
     }
 }

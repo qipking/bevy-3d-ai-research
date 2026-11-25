@@ -49,6 +49,28 @@ BEVY_ASSET_ROOT=$PWD RIG_HOME=/path/to/rig-home RF_SHOT_DIR=../render/my_app ./t
 | `HarnessExtPlugin` | `/hello`、`/setting`、输入框 `/命令` 桥、`Notice` → 转写引擎、真实状态行、`[view]` 设置 |
 | `prelude` | 业务只用这里的类型（含 rig-tui 的 look 契约，不用直接依赖 rig-tui） |
 
+## 多工作区 = 多真 agent（`RF_WORKSPACES=N`）
+
+`RF_WORKSPACES=N` 不再摆假会话号：每个工作区绑定一个真的 rig-ecs
+`Agent` + `Conversation`，由 `spawn_root` 创建。
+
+- **磁盘会话仍是一个**：`SessionPaths` 是 app 级 `Resource`（`app()` 启动时
+  `Home::new_session()` 建），`SessionLog` 也是一个 app 一个；所有工作区的
+  agent 都写进这一个会话日志（按 `AgentId` 区分）。
+- 第 0 个工作区（默认屏幕）收编已有的主 agent（`kernel.rs` 的 `main`），
+  其它工作区各建 `workspace-<n>`；映射在
+  `WorkspaceAgents`（工作区实体 -> agent 实体）里，因为
+  `rig_niri::Workspace::session` 还是 `u64` 占位，本模板不能改它。
+- 聚焦工作区：`ShownAgent` 跟着焦点走， `rig_niri::batch` 真管线读它的
+  `Conversation`；非聚焦工作区：应用侧用 `rig_niri::transcript::Transcript`
+  从自己的 `Conversation` 产行，写进 `WorkspacePanels.rows[Transcript]`。
+- 验收日志：`[workspaces] ... agents=N ... session=<RIG_HOME 里的会话目录>`。
+
+已知接缝：`rig_niri::batch::conversation_frame` 是私有的，非聚焦工作区的
+`RenderBatch` 是应用侧按同一套行格式做的最小拼装（用户/assistant 正文、
+推理、工具调用与结果）；entry / 内容块 / aside 和运行中的工具效应暂不画。
+等上游公开 `build_batch_for(agent)` 后这段应删掉。
+
 ## 设置（`RIG_HOME/settings.toml`）
 
 路径规则用上游的 `Home::settings()`：只读 `RIG_HOME`，项目目录没有 rig 设置。

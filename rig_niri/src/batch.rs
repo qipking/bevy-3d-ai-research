@@ -9,7 +9,11 @@
 //! 2. [`run_looks`]：跑一遍 rig-tui 的 `TranscriptRender`，业务 look 改写
 //!    `RenderOutput::lines`；`RenderSystems::Decorate` 里补子 agent 的调用树。
 //! 3. [`collect_rows`]：把 look 的产出交给 [`crate::transcript::Transcript`] 这个
-//!    对话引擎（排序、折行、流式增补、finalize），再拼上还没回答的 `Ask`。
+//!    对话引擎（排序、折行、流式增补、finalize）。
+//!
+//! 还没回答的 `Ask` **不在转写里**：它们由 [`confirm_rows`] 产成确认行，写进
+//! 独立的 [`PanelId::Confirm`] tile（见 [`confirm_panel_rows`]），和转写互不
+//! 挤占。这样待确认的操作既不会跟着转写滚走，也不会因为转写滚动被裁掉。
 //!
 //! 以前这里写死过一句中文"回复"，由每两帧吐一个字的假流式驱动 —— 已经删掉：
 //! 正文现在只来自真实的 `Partial`（运行中的流）或对话里的 assistant 消息。
@@ -26,7 +30,7 @@ use rig_core::message::{
     AssistantMessage, CallId, Message, Text, ToolCall, ToolResult, ToolResultContent, UserContent,
 };
 use rig_ecs::prelude::*;
-use rig_harness::prelude::{CallOutput, ShownAgent, ToolProgress};
+use rig_harness::prelude::{Ask, CallOutput, ShownAgent, ToolProgress};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style, Stylize};
 use rig_tui::ratatui::text::{Line, Span};
 use rig_tui::{
@@ -38,9 +42,9 @@ use rig_tui::{
 use crate::editor::SubmittedPrompts;
 use crate::frame::{PanelAreas, PanelRoots};
 use crate::pane::TranscriptRows;
-use crate::panels::{KeyedRow, PanelId};
+use crate::panels::{KeyedRow, PanelId, PanelRows};
 use crate::transcript::{
-    BlockId, Slot, TextId, Transcript as TranscriptEngine, row_hash, wrap_lines,
+    BlockId, Row, Slot, TextId, Transcript as TranscriptEngine, row_hash, wrap_lines,
 };
 
 /// 已结算的调用（效应实体结算后会被回收，转写需要自己记历史）。
@@ -1031,14 +1035,15 @@ pub fn run_looks(world: &mut World) {
 // RenderBatch -> 行
 // ---------------------------------------------------------------------------
 
-/// 把 look 的产出交给对话引擎（排序、折行、流式增补、finalize），再拼上 `Ask`。
+/// 把 look 的产出交给对话引擎（排序、折行、流式增补、finalize）。
+///
+/// 待确认的 `Ask` 不在这里拼：它们走确认面板（[`confirm_panel_rows`]）。
 pub fn collect_rows(
     batch: Res<RenderBatch>,
     mut transcript: ResMut<TranscriptEngine>,
     dialogue: Res<Dialogue>,
     stream: Res<ReplyStream>,
     prompts: Res<SubmittedPrompts>,
-    asks: Query<(Entity, &rig_harness::prelude::Ask), Without<Outcome>>,
     mut rows: ResMut<TranscriptRows>,
 ) {
     let width = batch.width;
@@ -1092,53 +1097,164 @@ pub fn collect_rows(
         transcript.place(BlockId::Request(RenderKey::Aside(*id)), *slot);
     }
 
-    let mut keyed: Vec<KeyedRow> = transcript.keyed_rows().to_vec();
+    rows.0 = transcript.keyed_rows().to_vec();
+}
 
-    // 还没回答的 Ask：真实组件，追加在最后（正文与选项也按同一宽度折行）。
-    for (ask_entity, ask) in asks.iter() {
-        let title = Line::from(vec![
-            Span::styled("? ", Style::new().fg(RColor::Magenta)),
-            Span::styled(
-                ask.title.clone(),
-                Style::new()
-                    .fg(RColor::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        push_ask_rows(&mut keyed, ask_entity, "title", vec![title], width, None);
-        for (index, body_line) in ask.body.lines().enumerate() {
-            let line = Line::from(Span::styled(
-                format!("    {body_line}"),
-                Style::new().fg(RColor::Rgb(200, 206, 220)),
-            ));
-            push_ask_rows(
-                &mut keyed,
-                ask_entity,
-                &format!("body{index}"),
-                vec![line],
-                width,
-                None,
-            );
-        }
-        for (index, choice) in ask.choices.iter().enumerate() {
-            let line = Line::from(Span::styled(
-                format!("    [{}] {}", index + 1, choice.label),
-                Style::new()
-                    .fg(RColor::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            push_ask_rows(
-                &mut keyed,
-                ask_entity,
-                &format!("choice{index}"),
-                vec![line],
-                width,
-                Some(&choice.id),
-            );
-        }
+// ---------------------------------------------------------------------------
+// 确认面板（还没回答的 Ask）
+// ---------------------------------------------------------------------------
+
+/// 一条待确认的 `Ask`：实体 + 内核效应 id（FIFO 顺序的来源）。
+///
+/// 内核给每个效应发的 id 严格递增，所以按它升序就是"先来先显示"；上游
+/// `rig-harness` 的 `answer_with_text` 也用同一个键挑"最老的问题"来回答，
+/// 这里沿用同一条规则，不另造时序。
+#[derive(Clone, Copy, Debug)]
+pub struct PendingAsk<'a> {
+    /// Ask 实体：`Row.choice` 里带的就是它，点击回答时用。
+    pub entity: Entity,
+    /// 内核效应 id：越小越先来。
+    pub effect: EffectId,
+    /// 问题本身。
+    pub ask: &'a Ask,
+}
+
+/// 确认行：把所有待确认的 `Ask` 按 FIFO 排成可显示的行。
+///
+/// * 没有待确认的 Ask → 空 vec（确认 tile 就是 0 行）。
+/// * 每个 Ask 一块：标题（`? 标题`）、正文（缩进、按 `width` 折行）、选项
+///   （`    [n] 标签`，带 [`Row::choice`]，点该选项折出来的任一行都回答它）。
+/// * 多个 Ask 时每块**标题行**前加 `(第几个/共几个) `；只有一个时不加，免得
+///   给唯一的问题添噪音。序号只标在标题上而不标每一行：块以标题开头，每行
+///   重复会和选项自己的 `[n]` 编号、正文缩进混在一起。
+/// * `width` 是文字列数（和 `wrap_lines` 一致）；0 按 1 列折，不 panic。
+pub fn confirm_rows(asks: &[PendingAsk<'_>], width: u16) -> Vec<Row> {
+    confirm_keyed_rows(asks, width)
+        .into_iter()
+        .map(|keyed| keyed.row)
+        .collect()
+}
+
+/// [`confirm_rows`] 的带 key/hash 版本：直接写进 `PanelRows` 的形状。
+///
+/// key 每帧稳定（Ask 实体 + 块内位置）；选项行的 `Row.choice` 原样保留，
+/// 面板生成行实体时会据此挂上 `transcript::AskChoice`，点击语义和拆出来
+/// 之前完全一样。
+pub fn confirm_keyed_rows(asks: &[PendingAsk<'_>], width: u16) -> Vec<KeyedRow> {
+    let mut ordered: Vec<PendingAsk<'_>> = asks.to_vec();
+    ordered.sort_by_key(|pending| pending.effect);
+    let total = ordered.len();
+    let mut rows = Vec::new();
+    for (index, pending) in ordered.iter().enumerate() {
+        push_ask_block(
+            &mut rows,
+            pending.entity,
+            pending.ask,
+            (total > 1).then_some((index + 1, total)),
+            width,
+        );
     }
+    rows
+}
 
-    rows.0 = keyed;
+/// 确认 tile 的高度（UI 像素）：行数 × 行高，没有行时 0。
+///
+/// 树里的建议（树不归本模块改）：右列输入框**正上方**（补全 tile 和输入
+/// 之间），高度随 [`PanelRows`] 里 `Confirm` 的行数改 —— 0 个 Ask 时 0 行，
+/// 和补全 tile 的空闲态一样不占位置；多个 Ask 时按 [`confirm_tile_height`]
+/// 取 `n * ROW_HEIGHT`。放在输入上方是因为它是"回答完才能继续"的确认，
+/// 眼睛从转写落到底部时先看到它，再是输入框。
+pub fn confirm_tile_height(rows: usize) -> f32 {
+    rows as f32 * crate::transcript::ROW_HEIGHT
+}
+
+/// 把一个 Ask 按"标题 + 正文 + 选项"折成确认行（FIFO 已在调用方排好）。
+fn push_ask_block(
+    rows: &mut Vec<KeyedRow>,
+    ask: Entity,
+    question: &Ask,
+    ordinal: Option<(usize, usize)>,
+    width: u16,
+) {
+    let mut title = Vec::new();
+    if let Some((index, total)) = ordinal {
+        // 次要信息用主题的 dim 色（和 `Theme::default().dim` 同一色值）。
+        title.push(Span::styled(
+            format!("({index}/{total}) "),
+            Style::new().fg(RColor::Rgb(120, 128, 145)),
+        ));
+    }
+    title.push(Span::styled("? ", Style::new().fg(RColor::Magenta)));
+    title.push(Span::styled(
+        question.title.clone(),
+        Style::new()
+            .fg(RColor::LightMagenta)
+            .add_modifier(Modifier::BOLD),
+    ));
+    push_ask_rows(rows, ask, "title", vec![Line::from(title)], width, None);
+    for (index, body_line) in question.body.lines().enumerate() {
+        let line = Line::from(Span::styled(
+            format!("    {body_line}"),
+            Style::new().fg(RColor::Rgb(200, 206, 220)),
+        ));
+        push_ask_rows(
+            rows,
+            ask,
+            &format!("body{index}"),
+            vec![line],
+            width,
+            None,
+        );
+    }
+    for (index, choice) in question.choices.iter().enumerate() {
+        let line = Line::from(Span::styled(
+            format!("    [{}] {}", index + 1, choice.label),
+            Style::new()
+                .fg(RColor::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        push_ask_rows(
+            rows,
+            ask,
+            &format!("choice{index}"),
+            vec![line],
+            width,
+            Some(&choice.id),
+        );
+    }
+}
+
+/// 把当前还没回答的 `Ask` 写进确认面板（[`PanelId::Confirm`]）。
+///
+/// 数据来源和原来的 `collect_rows` 相同（世界里没有 `Outcome` 的 Ask），
+/// 多取一个 `Effect` 作为 FIFO 序号；宽度取树给 Confirm 叶子的文字列数，
+/// 根还不存在时用 97 兜底（和 `editor::editor_rows` 一致）。只装
+/// `BatchPlugin` 的测试 App 没有 `PanelRows`，这时什么也不做。
+pub fn confirm_panel_rows(
+    asks: Query<(Entity, &Ask, Option<&Effect>), Without<Outcome>>,
+    roots: Option<Res<PanelRoots>>,
+    areas: Option<Res<PanelAreas>>,
+    mut panels: Option<ResMut<PanelRows>>,
+) {
+    let Some(panels) = panels.as_deref_mut() else {
+        return;
+    };
+    let width = roots
+        .as_deref()
+        .and_then(|roots| roots.entity(PanelId::Confirm))
+        .and_then(|root| areas.as_deref().and_then(|areas| areas.get(root)))
+        .map_or(97, |area| area.cols.max(1));
+    let pending: Vec<PendingAsk<'_>> = asks
+        .iter()
+        .map(|(entity, ask, effect)| PendingAsk {
+            entity,
+            // 还没登记成效应的 Ask（正常一帧内就有）排最后，但不丢掉：
+            // 确认面板显示的是"世界里所有没回答的 Ask"，不只是有效应 id 的。
+            effect: effect.map(Effect::id).unwrap_or(EffectId::from_raw(u64::MAX)),
+            ask,
+        })
+        .collect();
+    panels.set(PanelId::Confirm, confirm_keyed_rows(&pending, width));
 }
 
 /// Ask 行的 key：高位段（引擎按位置发的 key 最高位是 0，不会撞）。
@@ -1313,7 +1429,13 @@ impl Plugin for BatchPlugin {
             .add_systems(AgentPass, record_calls.in_set(Stage::Review))
             .add_systems(
                 Update,
-                (track_reply_stream, rebuild_batch, run_looks, collect_rows)
+                (
+                    track_reply_stream,
+                    rebuild_batch,
+                    run_looks,
+                    collect_rows,
+                    confirm_panel_rows,
+                )
                     .chain()
                     .in_set(crate::FeathersSystems::Draw),
             );
@@ -1796,5 +1918,273 @@ mod tests {
         assert_eq!(ordinals.of(second), 1);
         assert_eq!(ordinals.of(first), 0, "同一个效应每次都要同一个位置");
         assert_eq!(ordinals.of(EffectId::from_raw(8)), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // 确认面板（Ask 从转写里拆出来）
+    // -----------------------------------------------------------------------
+
+    /// 一个构造好的 Ask：标题 + 正文 + 若干 `(id, label)` 选项。
+    fn question(title: &str, body: &str, choices: &[(&str, &str)]) -> Ask {
+        let mut ask = Ask::new(title).body(body);
+        for (id, label) in choices {
+            ask = ask.choice(*id, *label);
+        }
+        ask
+    }
+
+    /// 一条待确认的 Ask（测试用假实体 + 手写的 FIFO 序号）。
+    fn pending<'a>(ask: &'a Ask, entity: Entity, effect: u64) -> PendingAsk<'a> {
+        PendingAsk {
+            entity,
+            effect: EffectId::from_raw(effect),
+            ask,
+        }
+    }
+
+    fn confirm_texts(rows: &[Row]) -> Vec<String> {
+        rows.iter().map(|row| text(&row.line)).collect()
+    }
+
+    /// 一个只有确认面板的世界：行写进 `PanelRows`，根和区域都就位。
+    fn confirm_world(width: u16) -> (World, Entity) {
+        let mut world = World::new();
+        world.insert_resource(rig_ecs::effects::Effects::default());
+        world.init_resource::<PanelRows>();
+        world.init_resource::<PanelRoots>();
+        world.init_resource::<PanelAreas>();
+        let root = world.spawn_empty().id();
+        world
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Confirm, root);
+        world.resource_mut::<PanelAreas>().0.insert(
+            root,
+            crate::frame::PanelArea {
+                rect: crate::frame::CellRect::new(0, 0, width, 8),
+                size: Vec2::ZERO,
+                cols: width,
+                rows: 8,
+                center: None,
+            },
+        );
+        (world, root)
+    }
+
+    #[test]
+    fn no_pending_ask_means_the_confirm_tile_is_empty() {
+        assert!(confirm_rows(&[], 80).is_empty());
+        assert!(confirm_keyed_rows(&[], 80).is_empty());
+        assert_eq!(confirm_tile_height(0), 0.0);
+    }
+
+    #[test]
+    fn one_ask_lays_out_its_title_body_and_choices_as_clickable_rows() {
+        let entity = Entity::from_raw_u32(42).expect("合法实体");
+        let ask = question(
+            "Keep the changes?",
+            "3 files changed",
+            &[("yes", "Yes"), ("no", "No")],
+        );
+        let rows = confirm_rows(&[pending(&ask, entity, 1)], 80);
+
+        // 标题 + 1 行正文 + 2 个选项。
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            confirm_texts(&rows),
+            vec![
+                "? Keep the changes?".to_owned(),
+                "    3 files changed".to_owned(),
+                "    [1] Yes".to_owned(),
+                "    [2] No".to_owned(),
+            ]
+        );
+
+        // 只有选项行可点，且带的是这个 Ask 和它自己的选项 id。
+        let choices: Vec<(Entity, String)> = rows
+            .iter()
+            .filter_map(|row| row.choice.clone())
+            .collect();
+        assert_eq!(choices.len(), ask.choices.len(), "几个选项就几行可点");
+        assert_eq!(
+            choices,
+            vec![
+                (entity, "yes".to_owned()),
+                (entity, "no".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_asks_show_first_come_first_served_with_their_ordinal() {
+        let first = question("first", "", &[("ok", "OK")]);
+        let second = question("second", "", &[("ok", "OK")]);
+        let first_entity = Entity::from_raw_u32(11).expect("合法实体");
+        let second_entity = Entity::from_raw_u32(22).expect("合法实体");
+
+        // 故意把后来的 Ask 排在查询前面：FIFO 应由 EffectId 决定，不看查询顺序。
+        let rows = confirm_rows(
+            &[
+                pending(&second, second_entity, 20),
+                pending(&first, first_entity, 10),
+            ],
+            80,
+        );
+        let texts = confirm_texts(&rows);
+        // 每个 Ask 一块：标题 + 一个选项。
+        assert_eq!(texts[0], "(1/2) ? first");
+        assert_eq!(texts[1], "    [1] OK");
+        assert_eq!(texts[2], "(2/2) ? second");
+        assert_eq!(texts[3], "    [1] OK");
+        // 选项仍然各归各的 Ask。
+        let ask_of: Vec<Entity> = rows
+            .iter()
+            .filter_map(|row| row.choice.as_ref().map(|(ask, _)| *ask))
+            .collect();
+        assert_eq!(ask_of, vec![first_entity, second_entity]);
+
+        // 只有一个 Ask 时不加序号（不给唯一的问题添噪音）。
+        let single = confirm_texts(&confirm_rows(&[pending(&first, first_entity, 10)], 80));
+        assert_eq!(single[0], "? first");
+    }
+
+    #[test]
+    fn a_long_choice_wraps_and_every_wrapped_row_still_answers_it() {
+        let entity = Entity::from_raw_u32(7).expect("合法实体");
+        let ask = question(
+            "A question title long enough to need wrapping",
+            "",
+            &[("yes", "an extremely long label that also needs wrapping")],
+        );
+        let rows = confirm_rows(&[pending(&ask, entity, 1)], 20);
+        let choice_rows: Vec<&Row> = rows.iter().filter(|row| row.choice.is_some()).collect();
+        assert!(choice_rows.len() > 1, "长选项应折成多行：{:?}", confirm_texts(&rows));
+        for row in choice_rows {
+            assert_eq!(
+                row.choice,
+                Some((entity, "yes".to_owned())),
+                "折出来的每一段都要回答同一个选项"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_width_confirm_layout_does_not_panic() {
+        let entity = Entity::from_raw_u32(1).expect("合法实体");
+        let ask = question("Q", "B", &[("ok", "OK")]);
+        let rows = confirm_rows(&[pending(&ask, entity, 1)], 0);
+        assert!(!rows.is_empty(), "0 列也至少产出一行");
+        assert_eq!(confirm_tile_height(rows.len()), rows.len() as f32 * 18.0);
+    }
+
+    #[test]
+    fn pending_asks_in_the_world_fill_the_confirm_panel_in_fifo_order() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let (mut world, _root) = confirm_world(80);
+        // 没有待确认的 Ask：写空 vec（tile 0 行）。
+        world.run_system_once(confirm_panel_rows).unwrap();
+        assert!(world
+            .resource::<PanelRows>()
+            .get(PanelId::Confirm)
+            .is_empty());
+
+        let first = world.spawn(question("first", "", &[("ok", "OK")])).id();
+        let second = world.spawn(question("second", "", &[("ok", "OK")])).id();
+        world.flush();
+        assert!(
+            world.get::<Effect>(first).is_some(),
+            "Ask 的效应应由内核登记（FIFO 序号从它来）"
+        );
+
+        world.run_system_once(confirm_panel_rows).unwrap();
+        let rows = world.resource::<PanelRows>().get(PanelId::Confirm);
+        let texts: Vec<String> = rows.iter().map(|keyed| text(&keyed.row.line)).collect();
+        assert_eq!(texts[0], "(1/2) ? first");
+        assert_eq!(texts[2], "(2/2) ? second");
+        let asks: Vec<Entity> = rows
+            .iter()
+            .filter_map(|keyed| keyed.row.choice.as_ref().map(|(ask, _)| *ask))
+            .collect();
+        assert_eq!(asks, vec![first, second]);
+    }
+
+    /// 点击语义不变：确认行经面板的同一套生成路径后，行实体上挂的就是
+    /// `transcript::AskChoice`（前端 `answer_ask` 观察者查的就是它），
+    /// 而且从行内文字子节点往上爬也能找到——和点击处理的做法一致。
+    #[test]
+    fn confirm_choice_rows_carry_the_ask_choice_the_click_observer_reads() {
+        use bevy::ecs::system::RunSystemOnce;
+        use bevy::text::FontSource;
+
+        use crate::panels::PanelsPlugin;
+        use crate::transcript::{AskChoice, TranscriptFont};
+
+        let mut app = App::new();
+        app.insert_resource(rig_ecs::effects::Effects::default())
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelAreas>()
+            .add_plugins(PanelsPlugin)
+            .insert_resource(TranscriptFont(FontSource::default()));
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Confirm, root);
+        app.world_mut().resource_mut::<PanelAreas>().0.insert(
+            root,
+            crate::frame::PanelArea {
+                rect: crate::frame::CellRect::new(0, 0, 80, 4),
+                size: Vec2::ZERO,
+                cols: 80,
+                rows: 4,
+                center: None,
+            },
+        );
+        let ask = app
+            .world_mut()
+            .spawn(question("Keep?", "", &[("yes", "Yes")]))
+            .id();
+        app.world_mut().flush();
+        app.world_mut().run_system_once(confirm_panel_rows).unwrap();
+        app.update();
+
+        let rows: Vec<Entity> = app
+            .world()
+            .get::<Children>(root)
+            .map(|children| children.iter().collect())
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 2, "一行标题 + 一行选项");
+        assert!(
+            app.world().get::<AskChoice>(rows[0]).is_none(),
+            "标题不可点"
+        );
+        let choice = app
+            .world()
+            .get::<AskChoice>(rows[1])
+            .expect("选项行必须挂 AskChoice");
+        assert_eq!(choice.ask, ask);
+        assert_eq!(choice.choice, "yes");
+
+        // 点击落在行内文字上时，观察者从命中的实体沿 ChildOf 往上爬。
+        let text_child = app
+            .world()
+            .get::<Children>(rows[1])
+            .and_then(|children| children.iter().next())
+            .expect("选项行有文字子节点");
+        let mut hit = text_child;
+        let mut found = None;
+        loop {
+            if let Some(choice) = app.world().get::<AskChoice>(hit) {
+                found = Some((choice.ask, choice.choice.clone()));
+                break;
+            }
+            match app.world().get::<ChildOf>(hit) {
+                Some(child_of) => hit = child_of.parent(),
+                None => break,
+            }
+        }
+        assert_eq!(found, Some((ask, "yes".to_owned())));
     }
 }

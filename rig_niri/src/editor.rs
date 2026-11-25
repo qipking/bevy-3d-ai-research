@@ -678,20 +678,11 @@ fn modifier_of(code: KeyCode) -> Modifiers {
     }
 }
 
-/// 输入面板的两行：提示行（带光标）+ 键位提示。
+/// 输入面板的一行：提示符 + 光标。
 ///
-/// 键位提示的宽度取输入面板这一帧的文字列数（rig-tui 用面板宽度做同一件事）。
-pub fn editor_rows(
-    mut panels: ResMut<PanelRows>,
-    editor: Res<Editor>,
-    theme: Res<Theme>,
-    areas: Res<PanelAreas>,
-    roots: Res<PanelRoots>,
-) {
-    let cols = roots
-        .entity(PanelId::Input)
-        .and_then(|root| areas.get(root))
-        .map_or(97, |area| usize::from(area.cols.max(1)));
+/// 键位提示行已经从输入面板里拆出去，成为独立的 [`PanelId::Hints`] tile
+/// （`hints::hint_panel_rows` 负责写它）——条带里所有东西都是 tile。
+pub fn editor_rows(mut panels: ResMut<PanelRows>, editor: Res<Editor>, theme: Res<Theme>) {
     // 光标是字节偏移；外部直接写 pub 字段时也保证切片落在字符边界上。
     let mut cursor = editor.cursor.min(editor.text.len());
     while cursor > 0 && !editor.text.is_char_boundary(cursor) {
@@ -709,14 +700,6 @@ pub fn editor_rows(
                 ratatui_span("▏", Style::default().fg(RColor::LightCyan)),
                 ratatui_span(after, theme.fg),
             ])),
-        },
-        KeyedRow {
-            key: 2,
-            hash: 2,
-            row: Row::new(rig_tui::ratatui::text::Line::from(vec![ratatui_span(
-                crate::hints::current_hints(cols, false),
-                theme.dim,
-            )])),
         },
     ];
     panels.set(PanelId::Input, rows);

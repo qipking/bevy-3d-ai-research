@@ -8,16 +8,18 @@
 //! FrameSize(96×28 格) ──> TileRect（米，整屏）
 //!                          │
 //!   layout::Node::rects ──> 每块叶子的 TileRect
+//!   layout::Node::containers ──> 容器面板（picker 那一列）的 TileRect
 //!                          │
 //!   TileRect × 1/UNITS_TO_WORLD ──> Node 尺寸（bevy_ui 像素）
 //!   TileRect.center ──────────────> WorldPanel.anchor（3D 位置）
 //!   TileRect − 面板装饰 ──────────> 文字列数 / 行数（look 换行、pane 高度）
 //! ```
 //!
-//! [`Placement`] 现在**只给浮层用**：picker / 补全 / 确认这类盖在屏幕上的
-//! `Over` 盒子，以及它内部再分列的 `Within`。`Top/Bottom/Left/Right/BelowInput/
-//! Rest` 是旧槽位，保留只为不破坏既有调用（比如 `niri.rs` 在移除 `FramePanel`
-//! 前会先挂一个 `Rest`），它们不再参与布局。
+//! **没有浮层**：picker、补全、确认都是条带里的 tile。`Placement` 只剩
+//! [`Placement::Tree`]（树叶子）和一个旧槽位 [`Placement::Rest`]（`niri.rs`
+//! 在移除 `FramePanel` 前会先挂它，不参与布局）。一块面板画在哪一层由
+//! [`FramePanel::layer`] 决定：容器面板在 0，它内部的列表 / preview 在 1，
+//! 这样容器永远垫在内部面板下面。
 
 use std::collections::HashMap;
 
@@ -76,33 +78,6 @@ impl CellRect {
 
     pub fn bottom(&self) -> u16 {
         self.y.saturating_add(self.h)
-    }
-
-    /// 第 `part` 列，共 `of` 等分列（浮层内部的分列，旧的 `Within` 用）。
-    fn column(&self, part: u16, of: u16) -> Self {
-        if of == 0 || part >= of || self.is_empty() {
-            return Self::default();
-        }
-        let start = u32::from(self.w) * u32::from(part) / u32::from(of);
-        let end = u32::from(self.w) * u32::from(part + 1) / u32::from(of);
-        Self::new(
-            self.x.saturating_add(start as u16),
-            self.y,
-            (end - start) as u16,
-            self.h,
-        )
-    }
-
-    /// 在 `self` 里居中放 `w × h`（`Rect::centered`）。
-    fn centered(&self, w: u16, h: u16) -> Self {
-        let w = w.min(self.w);
-        let h = h.min(self.h);
-        Self::new(
-            self.x + (self.w - w) / 2,
-            self.y + (self.h - h) / 2,
-            w,
-            h,
-        )
     }
 }
 
@@ -167,83 +142,27 @@ impl Default for PanelInset {
 }
 
 // ---------------------------------------------------------------------------
-// 尺寸约束与放置
+// 放置
 // ---------------------------------------------------------------------------
-
-/// rig-tui 用到的那部分 `ratatui::layout::Constraint`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Extent {
-    /// 固定几格（`Constraint::Length`）。
-    Cells(u16),
-    /// 占这条边的百分之几（`Constraint::Percentage`）。
-    Percent(u16),
-    /// 剩下的全部（`Constraint::Fill(1)` / `Constraint::Min(0)`）。
-    Rest,
-}
-
-impl Extent {
-    /// 在 `total` 格里的实际格数。
-    pub fn resolve(self, total: u16) -> u16 {
-        match self {
-            Self::Cells(cells) => cells.min(total),
-            Self::Percent(percent) => {
-                (u32::from(total) * u32::from(percent.min(100)) / 100) as u16
-            }
-            Self::Rest => total,
-        }
-    }
-}
 
 /// 面板放在哪。
 ///
-/// 普通面板（转写 / 输入 / 状态）由分裂树决定区域，挂 [`Placement::Tree`]；
-/// 浮层用 [`Placement::Over`] + [`Placement::Within`]。其余变体是旧 rig-tui
-/// 槽位留下的兼容占位，**不再参与布局**。
+/// 所有窗口都是 niri 式平铺：区域由 [`crate::layout`] 的分裂树决定，挂
+/// [`Placement::Tree`]。**没有浮层**——picker 是条带最右边的一列，补全 / 确认
+/// 是列里的 tile，`Over` / `Within` 已经删掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
-    /// 由 `layout::Node` 的叶子决定区域（分裂树）。
+    /// 由 `layout::Node` 的叶子（或容器）决定区域（分裂树）。
     Tree,
-    /// 旧槽位：剩余区的上边（仅保留 API）。
-    Top(Extent),
-    /// 旧槽位：剩余区的下边（仅保留 API）。
-    Bottom(Extent),
-    /// 旧槽位：剩余区的左边（仅保留 API）。
-    Left(Extent),
-    /// 旧槽位：剩余区的右边（仅保留 API）。
-    Right(Extent),
-    /// 旧槽位：输入框下面（仅保留 API）。
-    BelowInput(Extent),
-    /// 盖在整屏中央的浮层盒子。
-    Over { width: Extent, height: Extent },
-    /// 旧槽位：别人剩下的地方（仅保留 API；`niri.rs` 移除 `FramePanel` 前会先挂它）。
+    /// 旧槽位：别人剩下的地方（仅保留 API；`niri.rs` 移除 `FramePanel` 前会先
+    /// 挂它，随后立刻换成 Niri 的 `Tile`，不参与这里的布局）。
     Rest,
-    /// 浮层内部的第 `part` 列，共 `of` 列（picker 的列表 / preview）。
-    Within { panel: Entity, part: u16, of: u16 },
-}
-
-impl Placement {
-    /// 绘制层，对应 rig-tui `render.rs` 的 `stacking`：0 是屏幕本身，
-    /// 1 是 `Over` 盒子，2 是普通 `Within`，3 是 picker 里的 `Within`。
-    pub fn stacking(&self, picker: Option<Entity>) -> u16 {
-        match self {
-            Self::Over { .. } => 1,
-            Self::Within { panel, .. } if Some(*panel) == picker => 3,
-            Self::Within { .. } => 2,
-            _ => 0,
-        }
-    }
 }
 
 /// 一块参与布局的面板。
 #[derive(Clone, Copy, Debug)]
 pub struct ToLayOut {
     pub entity: Entity,
-    /// 树里的面板挂 [`Placement::Tree`]；浮层挂 `Over` / `Within`。
-    pub placement: Placement,
-    /// 浮层（及浮层内分列）的先后：小的先放，`Within` 才能找到宿主。
-    pub order: u32,
-    /// 旧槽位按内容收行用；树布局的尺寸由 [`crate::layout`] 决定，这里不读。
-    pub fits: Option<u16>,
     /// 面板装饰（文字区 = 区域减掉它）。
     pub inset: PanelInset,
 }
@@ -313,68 +232,32 @@ impl PanelArea {
     }
 }
 
-/// 把分裂树铺到 `screen` 上，再叠浮层，返回每块面板的区域。
+/// 把分裂树铺到 `screen` 上，返回每块面板的区域。
 ///
-/// 1. 树的叶子按 [`LayoutNode::rects`] 拿矩形；`PanelId` 经 `roots` 找到实体。
-/// 2. `Over` 盒子居中盖在整屏上（picker / 补全 / 确认）。
-/// 3. `Within` 取宿主（先在 `boxes` 里找，再找本帧刚放好的 `Over`）的一列。
-///
-/// 旧的 `Top/Bottom/Left/Right/BelowInput/Rest` 不再参与布局：普通面板一律
-/// 由树决定位置。
+/// 树的**叶子**和**容器**都按 [`LayoutNode::placements`] 拿矩形（容器先出现、
+/// 和内部叶子重叠，靠 [`FramePanel::layer`] 画在下面）；`PanelId` 经 `roots`
+/// 找到实体。没有浮层，所以不需要旧的槽位/叠放逻辑。
 pub fn lay_out(
     tree: &LayoutNode,
     panels: impl IntoIterator<Item = ToLayOut>,
     roots: &HashMap<PanelId, Entity>,
     screen: CellRect,
-    boxes: &[(Entity, CellRect)],
 ) -> HashMap<Entity, PanelArea> {
-    let mut panels: Vec<ToLayOut> = panels.into_iter().collect();
-    panels.sort_by_key(|panel| panel.order);
+    let panels: Vec<ToLayOut> = panels.into_iter().collect();
 
     let frame_tile = TileRect {
         center: Vec2::ZERO,
         size: Vec2::new(f32::from(screen.w), f32::from(screen.h)) * CELL * UNITS_TO_WORLD,
     };
     let mut out: HashMap<Entity, PanelArea> = HashMap::new();
-    let mut rects: Vec<(Entity, CellRect)> = boxes.to_vec();
-
-    for (id, tile) in tree.rects(frame_tile) {
+    for (id, tile, _container) in tree.placements(frame_tile) {
         let Some(entity) = roots.get(&id).copied() else {
             continue;
         };
         let Some(panel) = panels.iter().find(|panel| panel.entity == entity) else {
             continue;
         };
-        let area = PanelArea::from_tile(tile, screen, panel.inset);
-        rects.push((entity, area.rect));
-        out.insert(entity, area);
-    }
-
-    // 浮层：`Over` 先按 order 放好，`Within` 再取宿主的一列。
-    let mut within = Vec::new();
-    for panel in &panels {
-        match panel.placement {
-            Placement::Over { width, height } => {
-                let area = screen.centered(width.resolve(screen.w), height.resolve(screen.h));
-                rects.push((panel.entity, area));
-                out.insert(panel.entity, PanelArea::new(area, panel.inset));
-            }
-            Placement::Within { panel: host, part, of } => {
-                within.push((panel.entity, host, part, of, panel.inset));
-            }
-            // 树叶子已经放过；旧槽位不再参与布局。
-            _ => {}
-        }
-    }
-    for (entity, host, part, of, inset) in within {
-        let host_area = rects
-            .iter()
-            .find(|(candidate, _)| *candidate == host)
-            .map(|(_, area)| *area)
-            .unwrap_or_default();
-        let area = host_area.column(part, of);
-        rects.push((entity, area));
-        out.insert(entity, PanelArea::new(area, inset));
+        out.insert(entity, PanelArea::from_tile(tile, screen, panel.inset));
     }
     out
 }
@@ -386,10 +269,11 @@ pub fn lay_out(
 /// 一块参与帧布局的面板（`bevy_ui` 子树根 + 3D 面板）。
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct FramePanel {
-    /// 树叶子（[`Placement::Tree`]）或浮层（`Over` / `Within`）。
+    /// 位置：树叶子挂 [`Placement::Tree`]。
     pub placement: Placement,
-    /// 浮层的先后（`Within` 要等宿主先有区域）；树面板不看它。
-    pub order: u32,
+    /// 绘制层：0 是屏幕本身，1 画在 0 上面（picker 容器是 0，内部的列表 /
+    /// preview 是 1，所以容器永远垫在它们下面）。
+    pub layer: u16,
     /// 面板装饰：内边距 + 边框。
     pub inset: PanelInset,
 }
@@ -398,18 +282,19 @@ impl FramePanel {
     pub fn new(placement: Placement) -> Self {
         Self {
             placement,
-            order: 0,
+            layer: 0,
             inset: PanelInset::DEFAULT,
         }
     }
 
-    /// 树布局的一块面板：位置由 [`FrameTree`] 的叶子决定。
+    /// 树布局的一块面板：位置由 [`FrameTree`] 的叶子（或容器）决定。
     pub fn tree() -> Self {
         Self::new(Placement::Tree)
     }
 
-    pub fn order(mut self, order: u32) -> Self {
-        self.order = order;
+    /// 这块面板画在第几层（高的盖住低的）。
+    pub fn layer(mut self, layer: u16) -> Self {
+        self.layer = layer;
         self
     }
 
@@ -419,7 +304,8 @@ impl FramePanel {
     }
 }
 
-/// 面板按内容收成几行（编辑器、提示条）；旧槽位用它覆盖尺寸，树布局不读。
+/// 面板按内容收成几行。旧槽位布局用它覆盖尺寸；树布局不读它，保留类型只为
+/// 不破坏既有调用。
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FitRows(pub u16);
 
@@ -485,7 +371,7 @@ pub fn lay_out_frame(
     roots: Option<Res<PanelRoots>>,
     tree: Option<Res<FrameTree>>,
     set: Option<Res<WorkspaceSet>>,
-    panels: Query<(Entity, &FramePanel, Option<&FitRows>, Option<&WorkspacePanel>)>,
+    panels: Query<(Entity, &FramePanel, Option<&WorkspacePanel>)>,
     mut workspaces: Query<(&Workspace, &mut WorkspacePanels)>,
 ) {
     if let Some(set) = set.as_deref().filter(|set| !set.items.is_empty()) {
@@ -501,17 +387,14 @@ pub fn lay_out_frame(
                 (true, Some(tree), Some(roots)) => (&tree.0, &roots.0),
                 _ => (&workspace.tree, &stored.roots.0),
             };
-            let to_lay_out = panels.iter().filter_map(|(entity, panel, fits, tag)| {
+            let to_lay_out = panels.iter().filter_map(|(entity, panel, tag)| {
                 tag.filter(|tag| tag.0 == *workspace_entity)
                     .map(|_| ToLayOut {
                         entity,
-                        placement: panel.placement,
-                        order: panel.order,
-                        fits: fits.map(|fits| fits.0),
                         inset: panel.inset,
                     })
             });
-            let next = lay_out(want_tree, to_lay_out, want_roots, size.screen(), &[]);
+            let next = lay_out(want_tree, to_lay_out, want_roots, size.screen());
             if stored.areas != next {
                 stored.areas = next.clone();
             }
@@ -531,16 +414,13 @@ pub fn lay_out_frame(
     let Some(tree) = tree.as_deref() else {
         return;
     };
-    let to_lay_out = panels.iter().map(|(entity, panel, fits, _)| ToLayOut {
+    let to_lay_out = panels.iter().map(|(entity, panel, _)| ToLayOut {
         entity,
-        placement: panel.placement,
-        order: panel.order,
-        fits: fits.map(|fits| fits.0),
         inset: panel.inset,
     });
     let empty = HashMap::new();
     let roots = roots.as_deref().map_or(&empty, |roots| &roots.0);
-    let next = lay_out(&tree.0, to_lay_out, roots, size.screen(), &[]);
+    let next = lay_out(&tree.0, to_lay_out, roots, size.screen());
     if next != areas.0 {
         areas.0 = next;
     }
@@ -606,7 +486,7 @@ pub fn place_panels(
                 node.height = height;
             }
             let center_px = area_center_px(&area, frame_px);
-            let want_layer = panel.placement.stacking(None);
+            let want_layer = panel.layer;
             // 帧内局部位姿（世界原点时的锚点），再乘工作区的绝对位姿。
             let local = Transform::from_translation(
                 geometry.center
@@ -650,7 +530,7 @@ pub fn place_panels(
             node.height = height;
         }
         let center_px = area_center_px(&area, frame_px);
-        let want_layer = panel.placement.stacking(None);
+        let want_layer = panel.layer;
         let anchor = geometry.center
             + Vec3::new(center_px.x, center_px.y, 0.0) * geometry.units_to_world
             + Vec3::Z * (f32::from(want_layer) * geometry.layer_depth);
@@ -733,19 +613,63 @@ pub(crate) fn default_screen_panels(
             8.0,
         ),
     );
+    // 键位提示行：固定 1 行，窄条（THIN inset），内容由 `hints::hint_panel_rows` 写。
+    let hints = spawn(
+        commands,
+        PanelId::Hints,
+        // 无内边距：这一格只有 1 行高，任何 padding 都会把字裁掉。
+        FramePanel::tree().inset(PanelInset { pad: 0, border: 0 }),
+        Look {
+            bg: Color::srgb(0.035, 0.045, 0.065),
+            border: Color::srgb(0.16, 0.22, 0.32),
+            radius: 4.0,
+            justify: JustifyContent::FlexStart,
+        },
+    );
+    // 确认行（Ask）：没有待确认时树里是 0 高度，有就长成 n 行。
+    let confirm = spawn(
+        commands,
+        PanelId::Confirm,
+        FramePanel::tree().inset(PanelInset::THIN),
+        Look::new(
+            Color::srgb(0.07, 0.06, 0.04),
+            Color::srgb(0.55, 0.45, 0.20),
+            6.0,
+        ),
+    );
     roots.0.insert(PanelId::Input, input);
     roots.0.insert(PanelId::Status, status);
     roots.0.insert(PanelId::Transcript, transcript);
     roots.0.insert(PanelId::Complete, complete);
+    roots.0.insert(PanelId::Hints, hints);
+    roots.0.insert(PanelId::Confirm, confirm);
     for id in [
         PanelId::Input,
         PanelId::Status,
         PanelId::Transcript,
         PanelId::Complete,
+        PanelId::Hints,
+        PanelId::Confirm,
     ] {
         rows.0.entry(id).or_default();
     }
     (roots, rows)
+}
+
+/// 确认行 tile 的高度跟着行数走（没有待确认时 0 高度，不占地方）。
+fn sync_confirm_tile(
+    rows: Res<PanelRows>,
+    tree: Option<ResMut<FrameTree>>,
+) {
+    let Some(mut tree) = tree else {
+        return;
+    };
+    let lines = rows.get(PanelId::Confirm).len() as f32;
+    let want = crate::layout::Size::Fixed(lines * crate::transcript::ROW_HEIGHT);
+    if tree.0.leaf_size(PanelId::Confirm) == Some(want) {
+        return;
+    }
+    tree.0.set_leaf_size(PanelId::Confirm, want);
 }
 
 /// 装默认屏幕（rig-tui `screen.rs` 的布局在分裂树里重排）：左列转写，右列从上
@@ -824,7 +748,7 @@ pub fn spawn_panel(
                 units_to_world: UNITS_TO_WORLD,
                 anchor: Transform::default(),
             },
-            WorldLayer(0),
+            WorldLayer(panel.layer),
             MirrorRoot,
         ))
         .id()
@@ -918,7 +842,7 @@ impl Plugin for FramePlugin {
             .add_systems(Startup, spawn_default_screen)
             .add_systems(
                 Update,
-                (lay_out_frame, place_panels)
+                (sync_confirm_tile, lay_out_frame, place_panels)
                     .chain()
                     .in_set(crate::FeathersSystems::Layout),
             );
@@ -937,21 +861,8 @@ mod tests {
         Entity::from_raw_u32(index).expect("entity")
     }
 
-    fn panel(entity: Entity, placement: Placement) -> ToLayOut {
-        ToLayOut {
-            entity,
-            placement,
-            order: 0,
-            fits: None,
-            inset: PanelInset::DEFAULT,
-        }
-    }
-
     fn tree_panel(entity: Entity, inset: PanelInset) -> ToLayOut {
-        ToLayOut {
-            inset,
-            ..panel(entity, Placement::Tree)
-        }
+        ToLayOut { entity, inset }
     }
 
     fn roots(items: &[(PanelId, Entity)]) -> HashMap<PanelId, Entity> {
@@ -964,13 +875,7 @@ mod tests {
         panels: Vec<ToLayOut>,
         roots: &HashMap<PanelId, Entity>,
     ) -> HashMap<u32, PanelArea> {
-        lay_out(
-            tree,
-            panels,
-            roots,
-            CellRect::new(0, 0, screen.0, screen.1),
-            &[],
-        )
+        lay_out(tree, panels, roots, CellRect::new(0, 0, screen.0, screen.1))
         .into_iter()
         .map(|(entity, area)| (entity.index_u32(), area))
         .collect()
@@ -998,9 +903,10 @@ mod tests {
         );
         assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 64, 28));
         // 右列：顶部留白 + 补全(0) + 输入(固定 4 行) + 状态(2 行) 贴底。
-        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 22, 32, 4));
+        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
         assert_eq!(areas[&status.index_u32()].rect, CellRect::new(64, 26, 32, 2));
         // 精确中心来自树的 TileRect（不是格子取整后的矩形）。
+        // 精确中心来自树的 TileRect：转写占上半部分（25 行），所以 y 中心不再是 0。
         let center = areas[&transcript.index_u32()].center.expect("树给精确中心");
         assert!((center.x - -16.0 * CELL.x).abs() < 1e-3);
         assert_eq!(center.y, 0.0);
@@ -1095,28 +1001,50 @@ mod tests {
         assert_eq!(areas[&right.index_u32()].rect, CellRect::new(48, 0, 48, 28));
     }
 
-    /// `Over` 浮层盖在整屏中央，不占树里的地方（树叶子在这里没有实体）。
+    /// 容器面板（picker 那一列）自己拿到整列区域；它不算叶子，所以和内部
+    /// 列表区域几何重叠是允许的（容器靠 [`FramePanel::layer`] 垫在下面）。
     #[test]
-    fn over_is_centred_and_free() {
-        let overlay = entity(0);
+    fn a_container_panel_gets_the_whole_column_area() {
+        use crate::layout::{NO_GAP, Split};
+
+        let (picker, list, transcript) = (entity(0), entity(1), entity(2));
+        let tree = LayoutNode::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::proportion(2.0, LayoutNode::leaf(PanelId::Transcript)),
+                Child::new(
+                    Size::Proportion(1.0),
+                    LayoutNode::container(PanelId::Picker, LayoutNode::leaf(PanelId::List)),
+                ),
+            ],
+        );
+        let roots = roots(&[
+            (PanelId::Picker, picker),
+            (PanelId::List, list),
+            (PanelId::Transcript, transcript),
+        ]);
         let areas = laid_out(
             (96, 28),
-            &layout::default_tree(),
-            vec![panel(
-                overlay,
-                Placement::Over {
-                    width: Extent::Percent(50),
-                    height: Extent::Cells(10),
-                },
-            )],
-            &HashMap::new(),
+            &tree,
+            vec![
+                tree_panel(picker, PanelInset::DEFAULT),
+                tree_panel(list, PanelInset::DEFAULT),
+                tree_panel(transcript, PanelInset::DEFAULT),
+            ],
+            &roots,
         );
+        assert_eq!(areas[&list.index_u32()].rect, CellRect::new(64, 0, 32, 28));
         assert_eq!(
-            areas[&overlay.index_u32()].rect,
-            CellRect::new(24, 9, 48, 10)
+            areas[&picker.index_u32()].rect,
+            CellRect::new(64, 0, 32, 28),
+            "容器面板 = 整列"
         );
-        // 浮层不改变树：没有实体映射时树不产生任何区域。
-        assert_eq!(areas.len(), 1);
+        // 叶子只有两块（容器不算）。
+        assert_eq!(tree.rects(TileRect {
+            center: Vec2::ZERO,
+            size: Vec2::new(96.0 * CELL.x, 28.0 * CELL.y) * UNITS_TO_WORLD,
+        }).len(), 2);
     }
 
     /// 默认树的右列：输入在上、状态 2 行贴底（不是旧的 `Bottom(4)/Bottom(2)`）。
@@ -1134,39 +1062,13 @@ mod tests {
             &roots,
         );
         assert_eq!(areas[&status.index_u32()].rect, CellRect::new(64, 26, 32, 2));
+        // 输入与状态之间现在夹着 1 行键位提示（它也是 tile）。
+        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
         assert_eq!(
             areas[&input.index_u32()].rect.bottom(),
-            areas[&status.index_u32()].rect.y,
-            "输入与状态在右列上下相接"
+            areas[&status.index_u32()].rect.y - 1,
+            "输入与状态之间隔 1 行提示行"
         );
-    }
-
-    /// `Within` 取宿主（picker 的 `Over` 容器）的一列。
-    #[test]
-    fn within_takes_a_column_of_its_host() {
-        let host = entity(7);
-        let list = entity(1);
-        let screen = CellRect::new(0, 0, 96, 28);
-        let mut areas = lay_out(
-            &layout::default_tree(),
-            vec![
-                panel(
-                    list,
-                    Placement::Within {
-                        panel: host,
-                        part: 1,
-                        of: 2,
-                    },
-                ),
-            ],
-            &HashMap::new(),
-            screen,
-            &[(host, CellRect::new(0, 0, 60, 20))],
-        )
-        .into_iter()
-        .map(|(entity, area)| (entity.index_u32(), area.rect))
-        .collect::<HashMap<_, _>>();
-        assert_eq!(areas.remove(&1), Some(CellRect::new(30, 0, 30, 20)));
     }
 
     /// 文字区 = 面板区域减掉装饰。
@@ -1217,12 +1119,12 @@ mod tests {
         let status = roots.entity(PanelId::Status).expect("状态面板");
         let complete = roots.entity(PanelId::Complete).expect("补全面板");
         let areas = app.world().resource::<PanelAreas>();
-        assert_eq!(areas.0.len(), 4, "四块面板都由树放好（留白叶子没有面板）");
+        assert_eq!(areas.0.len(), 6, "六块面板都由树放好（留白叶子没有面板）");
         assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 28));
         assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(64, 26, 32, 2));
         // 补全 tile 关着：0 高度，但仍然有区域（这样每帧都能把它写成 0 高）。
         let closed = areas.get(complete).expect("补全区域");
-        assert_eq!(closed.rect, CellRect::new(64, 22, 32, 0), "补全贴输入上方");
+        assert_eq!(closed.rect, CellRect::new(64, 21, 32, 0), "补全贴输入上方");
         assert!(closed.is_empty());
 
         // `Node` 尺寸 = 树给的精确像素；3D 锚点 = 树给的精确中心（不是格子中心）。
@@ -1230,6 +1132,7 @@ mod tests {
         match (node.width, node.height) {
             (bevy_ui::Val::Px(width), bevy_ui::Val::Px(height)) => {
                 assert!((width - 64.0 * CELL.x).abs() < 1e-3, "width = {width}");
+                // 转写只占上半部分 25 行（下面两条横跨的 tile 各占 1/2 行）。
                 assert!((height - 28.0 * CELL.y).abs() < 1e-3, "height = {height}");
             }
             other => panic!("Node 尺寸应当是像素：{other:?}"),
@@ -1241,7 +1144,13 @@ mod tests {
             "anchor.x = {}",
             world.anchor.translation.x
         );
-        assert_eq!(world.anchor.translation.y, 0.0);
+        // y：转写占条带上半部分 25 行，中心在 1.5 行处（下面还有提示/状态两条）。
+        let want_y = 0.0;
+        assert!(
+            (world.anchor.translation.y - want_y).abs() < 1e-5,
+            "锚点 y = {}",
+            world.anchor.translation.y
+        );
     }
 
     /// 默认树里补全 tile 关着：0 行高度，输入仍从右列顶部开始。
@@ -1267,11 +1176,11 @@ mod tests {
             &roots,
         );
         let tile = areas[&complete.index_u32()];
-        assert_eq!(tile.rect, CellRect::new(64, 22, 32, 0), "补全贴输入上方");
+        assert_eq!(tile.rect, CellRect::new(64, 21, 32, 0), "补全贴输入上方");
         assert!(tile.is_empty(), "0 高度的 tile 这一帧没有文字区");
         assert_eq!(
             areas[&input.index_u32()].rect,
-            CellRect::new(64, 22, 32, 4),
+            CellRect::new(64, 21, 32, 4),
             "关着的 tile 不挤输入（输入固定 4 行贴底）"
         );
     }
@@ -1322,7 +1231,7 @@ mod tests {
             "Pane2 的行槽要建好"
         );
         let leaves = app.world().resource::<FrameTree>().0.leaves();
-        assert_eq!(leaves.len(), 6, "默认树 5 叶子（含留白）+ 新拆的 Pane2");
+        assert_eq!(leaves.len(), 8, "默认树 7 叶子（含留白/确认/提示）+ 新拆的 Pane2");
         assert!(leaves.contains(&PanelId::Pane2));
 
         // 第二次：返回 false，树不变，也不会多一个 Pane2 实体。
@@ -1380,7 +1289,7 @@ mod tests {
             .resource::<PanelRoots>()
             .entity(PanelId::Pane2)
             .expect("Alt+S 要拆出 Pane2");
-        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 6);
+        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 8);
         assert_eq!(
             app.world().resource::<crate::editor::Editor>().text(),
             "",

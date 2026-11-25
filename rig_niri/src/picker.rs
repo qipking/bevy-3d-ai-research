@@ -4,11 +4,13 @@
 //! 选中项高亮，回车 `Pick::person(picker, Some(Chosen::item(i)))`，Esc 关闭；
 //! 打字过滤列表（每个词都要出现，标签命中的排在前面），`free_text` 的 picker
 //! 还能把打的字本身当答案；`multiple` 的 picker 用 Tab 打勾、回车交 `Chosen::items`；
-//! 有 `PickItem::parent` 时是一棵树，←/→ 折叠；插件给 picker 挂 `PickPreview`
-//! 时右边多一列 preview（帧布局的 `Placement::Within`）。
+//! 有 `PickItem::parent` 时是一棵树，←/→ 折叠。
 //!
-//! 这里用帧布局的 `Over` 画主浮层、`Within { part: 1, of: 2 }` 画 preview 列——
-//! 终端里浮层只能占满屏，3D 里它是浮在界面上方的一块对话框。
+//! **这里没有浮层**：picker 是条带最右边的一列——在 `FrameTree` 根的
+//! `Split::Horizontal` 末尾追加一个 `Child`，里面是一块 [`PanelId::Picker`]
+//! 容器（底色 + 边框），容器内部再竖着分成 [`PanelId::List`]（标题 / 说明 /
+//! 过滤 / 列表 / 键位行）和可选的 [`PanelId::Preview`]。关掉时把这一列摘掉、
+//! despawn 三块面板、清掉行槽。这就是 niri 的"新窗口 = 右边新加一列"。
 
 use bevy::prelude::*;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -17,21 +19,16 @@ use rig_harness::prelude::{Chosen, Highlighted, Pick, Picker};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
-use crate::frame::{Extent, FramePanel, Look, PanelAreas, PanelRoots, Placement, spawn_panel};
+use crate::frame::{FramePanel, FrameTree, Look, PanelAreas, PanelRoots, spawn_panel};
+use crate::layout::{Child, Node, NO_GAP, Size, Split};
 use crate::panels::{KeyedRow, PanelId, PanelRows, PanelSpawned};
 use crate::theme::Theme;
 use crate::transcript::Row;
+use crate::workspaces::{Workspace, WorkspaceSet};
 use crate::FeathersSystems;
 
 /// rig-tui 的 `PAGE`：PgUp/PgDn 一次跳几个。
 const PAGE: usize = 10;
-
-/// 浮层在帧里的布局顺序（比默认屏幕的面板都晚）。
-const PICKER_ORDER: u32 = 9;
-
-/// 列表列面板的标记（要改它的 `Within` 宽度）。
-#[derive(Component)]
-pub struct ListPanel;
 
 /// 一行就是一个选项：点它回答这个 picker。
 #[derive(Component, Clone)]
@@ -45,11 +42,11 @@ pub struct PickerChoice {
 pub struct PickerInput {
     /// 打开的是哪个 picker。
     pub picker: Option<Entity>,
-    /// 浮层的容器面板。
-    pub panel: Option<Entity>,
-    /// 列表列（容器里的 `Within`）。
+    /// picker 那一列的容器面板（[`PanelId::Picker`]：底色 + 边框，本身不产行）。
+    pub column: Option<Entity>,
+    /// 列里的列表 tile（[`PanelId::List`]，picker 的所有行都写在这里）。
     pub list_panel: Option<Entity>,
-    /// preview 列（`PickPreview` 在时才有）。
+    /// 列里的 preview tile（[`PanelId::Preview`]，`PickPreview` 在时才有）。
     pub preview_panel: Option<Entity>,
     /// 打进去的过滤词。
     pub filter: String,
@@ -276,53 +273,144 @@ fn span(text: impl Into<String>, style: Style) -> Span<'static> {
     Span::styled(text.into(), style)
 }
 
-/// 有 picker 就开浮层（容器 + 列表列），没有就关掉；顺便按过滤词和折叠状态算出可见行。
+/// picker 那一列的树节点：容器 [`PanelId::Picker`] 里竖着排列表 / preview。
 ///
-/// 结构照 rig-tui 的 picker 布局：**容器**占浮层那块地方，**列表列**是它的
-/// `Within { part: 0, of }`（有 preview 时 `of = 2`，于是列表只占左半），
-/// preview 是 `Within { part: 1, of: 2 }`。
+/// 没有 preview 时容器里只有一块 [`PanelId::List`]；有 preview 时是一列内部的
+/// 竖直分裂（`List` 2 份、`Preview` 1 份，`NO_GAP`——两个 tile 自己带边框）。
+fn picker_column(preview: bool) -> Node {
+    let inner = if preview {
+        Node::split(
+            Split::Vertical,
+            NO_GAP,
+            vec![
+                Child::proportion(2.0, Node::leaf(PanelId::List)),
+                Child::proportion(1.0, Node::leaf(PanelId::Preview)),
+            ],
+        )
+    } else {
+        Node::leaf(PanelId::List)
+    };
+    Node::container(PanelId::Picker, inner)
+}
+
+/// 在聚焦工作区的树（有 [`WorkspaceSet`] 时）和全局 [`FrameTree`] 上做同一件事。
+///
+/// 两处都要改：布局对聚焦工作区读全局 `FrameTree`（见 `frame::lay_out_frame`），
+/// 而 `commit_focused_panels` 在 `Render` 把全局树写回 `Workspace.tree`；直接
+/// 改组件能让"只跑 picker、不跑 PanelsPlugin"的 App 也看到同一棵树。
+fn edit_trees(
+    tree: &mut Option<ResMut<FrameTree>>,
+    set: Option<&WorkspaceSet>,
+    workspaces: &mut Query<'_, '_, &mut Workspace>,
+    mut edit: impl FnMut(&mut Node) -> bool,
+) -> bool {
+    let mut changed = false;
+    if let Some(set) = set
+        && let Some(focused) = set.focused
+        && let Ok(mut workspace) = workspaces.get_mut(focused)
+    {
+        changed |= edit(&mut workspace.tree);
+    }
+    if let Some(tree) = tree.as_deref_mut() {
+        changed |= edit(&mut tree.0);
+    }
+    changed
+}
+
+/// 把 picker 列从每一棵工作区的树里摘掉（关闭时用，防聚焦切换时留下残叶）。
+fn remove_columns_everywhere(
+    tree: &mut Option<ResMut<FrameTree>>,
+    set: Option<&WorkspaceSet>,
+    workspaces: &mut Query<'_, '_, &mut Workspace>,
+) {
+    if let Some(set) = set {
+        for entity in set.items.iter().copied() {
+            if let Ok(mut workspace) = workspaces.get_mut(entity) {
+                workspace.tree.remove_column(PanelId::List);
+            }
+        }
+    }
+    if let Some(tree) = tree.as_deref_mut() {
+        tree.0.remove_column(PanelId::List);
+    }
+}
+
+/// 把 preview 加进 / 移出 picker 列（[`Node::split_leaf_sized`] /
+/// [`Node::remove_leaf`]；列宽和容器都不动）。
+fn set_preview_in_tree(
+    tree: &mut Option<ResMut<FrameTree>>,
+    set: Option<&WorkspaceSet>,
+    workspaces: &mut Query<'_, '_, &mut Workspace>,
+    preview: bool,
+) {
+    edit_trees(tree, set, workspaces, |node| match preview {
+        true => node.split_leaf_sized(
+            PanelId::List,
+            Split::Vertical,
+            PanelId::Preview,
+            NO_GAP,
+            Size::Proportion(2.0),
+            Size::Proportion(1.0),
+        ),
+        false => node.remove_leaf(PanelId::Preview),
+    });
+}
+
+/// 有 picker 就在条带最右边加一列；没有就关掉。顺便按过滤词和折叠状态算可见行。
+///
+/// 开：根 `Split::Horizontal` 末尾追加 `Child`（`Picker` 容器 + 列内 `List`，
+/// 列宽 = 条带的 1/3，见 [`Node::append_column`]），spawn 容器 + 列表 panel。
+/// 关：摘掉这一列、despawn 三块面板、清 `PanelRoots` / `PanelRows` / `PanelSpawned`。
+#[allow(clippy::too_many_arguments)]
 pub fn sync_picker(
     mut commands: Commands,
     mut roots: ResMut<PanelRoots>,
     mut rows: ResMut<PanelRows>,
     mut spawned: ResMut<PanelSpawned>,
     mut state: ResMut<PickerInput>,
+    mut tree: Option<ResMut<FrameTree>>,
+    set: Option<Res<WorkspaceSet>>,
+    mut workspaces: Query<&mut Workspace>,
     pickers: Query<(Entity, &Picker)>,
 ) {
     let open = pickers.iter().next();
-    match (open, state.panel) {
+    match (open, state.column) {
         (Some((picker_entity, picker)), None) => {
-            let container = spawn_panel(
+            // 没有可改的树（只装 PickerPlugin 的最小 App）也照旧 spawn 面板：
+            // 没有区域时 `picker_rows` 自己会跳过，不影响逻辑。
+            let has_tree = tree.is_some()
+                || set
+                    .as_deref()
+                    .is_some_and(|set| set.focused.is_some());
+            let added = edit_trees(&mut tree, set.as_deref(), &mut workspaces, |node| {
+                node.append_column_at(PanelId::Transcript, picker_column(false))
+            });
+            if has_tree && !added {
+                // 树里已经有 picker 列（不该发生）：不 spawn 第二套面板。
+                return;
+            }
+            let column = spawn_panel(
                 &mut commands,
-                PanelId::Overlay,
-                FramePanel::new(Placement::Over {
-                    width: Extent::Percent(84),
-                    height: Extent::Percent(74),
-                })
-                .order(PICKER_ORDER),
+                PanelId::Picker,
+                FramePanel::tree(),
                 Look::new(
                     Color::srgb(0.07, 0.085, 0.12),
                     Color::srgb(0.95, 0.82, 0.35),
                     12.0,
                 ),
             );
-            // 列表列：默认占容器的全部（`of = 1`），有 preview 时切成一半。
+            // 列表 tile 透明：底色和边框由容器面板给，行只负责文字。
             let list = spawn_panel(
                 &mut commands,
                 PanelId::List,
-                FramePanel::new(Placement::Within {
-                    panel: container,
-                    part: 0,
-                    of: 1,
-                })
-                .order(PICKER_ORDER + 1),
+                FramePanel::tree().layer(1),
                 Look::new(Color::NONE, Color::NONE, 0.0),
             );
-            commands.entity(list).insert(ListPanel);
-            roots.0.insert(PanelId::Overlay, container);
+            roots.0.insert(PanelId::Picker, column);
             roots.0.insert(PanelId::List, list);
+            rows.0.entry(PanelId::List).or_default();
             state.picker = Some(picker_entity);
-            state.panel = Some(container);
+            state.column = Some(column);
             state.list_panel = Some(list);
             state.filter.clear();
             state.ticked.clear();
@@ -353,8 +441,9 @@ pub fn sync_picker(
             }
         }
         (None, Some(_)) => {
+            remove_columns_everywhere(&mut tree, set.as_deref(), &mut workspaces);
             for (id, panel) in [
-                (PanelId::Overlay, state.panel),
+                (PanelId::Picker, state.column),
                 (PanelId::List, state.list_panel),
                 (PanelId::Preview, state.preview_panel),
             ] {
@@ -371,47 +460,35 @@ pub fn sync_picker(
     }
 }
 
-/// 插件给 picker 挂了 `PickPreview::Text` 时，右边开一列 preview（`Placement::Within`），
-/// 同时把列表列从"整块容器"改成"左半"。
+/// 插件给 picker 挂了 `PickPreview::Text` 时，把这一列竖着切成"列表 / preview"；
+/// preview 没了就把那一半摘掉，列表重新占满整列。
+///
+/// 两种状态都只是改同一棵树（[`Node::split_leaf_sized`] / [`Node::remove_leaf`]），
+/// 不做任何浮层/叠放——preview 就是这一列下面的另一块 tile。
+#[allow(clippy::too_many_arguments)]
 pub fn sync_preview_panel(
     mut commands: Commands,
     mut roots: ResMut<PanelRoots>,
     mut rows: ResMut<PanelRows>,
     mut spawned: ResMut<PanelSpawned>,
     mut state: ResMut<PickerInput>,
-    mut lists: Query<&mut FramePanel, With<ListPanel>>,
+    mut tree: Option<ResMut<FrameTree>>,
+    set: Option<Res<WorkspaceSet>>,
+    mut workspaces: Query<&mut Workspace>,
     previews: Query<&PickPreview>,
 ) {
     let wanted = state
         .picker
         .filter(|picker| matches!(previews.get(*picker), Ok(PickPreview::Text(_))));
-    let width = match wanted {
-        Some(_) => 2,
-        None => 1,
-    };
-    // 列表列的宽度跟着 preview 有无走。
-    if let Some(list) = state.list_panel
-        && let Ok(mut panel) = lists.get_mut(list)
-        && let Placement::Within { part, of, .. } = &mut panel.placement
-        && *of != width
-    {
-        *of = width;
-        let _ = part;
-    }
     match (wanted, state.preview_panel) {
         (Some(_), None) => {
-            let Some(overlay) = roots.entity(PanelId::Overlay) else {
+            if state.column.is_none() {
                 return;
-            };
+            }
             let panel = spawn_panel(
                 &mut commands,
                 PanelId::Preview,
-                FramePanel::new(Placement::Within {
-                    panel: overlay,
-                    part: 1,
-                    of: 2,
-                })
-                .order(PICKER_ORDER + 2),
+                FramePanel::tree().layer(1),
                 Look::new(
                     Color::srgb(0.06, 0.07, 0.10),
                     Color::srgb(0.45, 0.55, 0.75),
@@ -419,7 +496,9 @@ pub fn sync_preview_panel(
                 ),
             );
             roots.0.insert(PanelId::Preview, panel);
+            rows.0.entry(PanelId::Preview).or_default();
             state.preview_panel = Some(panel);
+            set_preview_in_tree(&mut tree, set.as_deref(), &mut workspaces, true);
         }
         (None, Some(panel)) => {
             commands.entity(panel).despawn();
@@ -427,6 +506,7 @@ pub fn sync_preview_panel(
             rows.0.remove(&PanelId::Preview);
             spawned.forget(PanelId::Preview);
             state.preview_panel = None;
+            set_preview_in_tree(&mut tree, set.as_deref(), &mut workspaces, false);
         }
         _ => {}
     }
@@ -729,7 +809,7 @@ pub fn picker_rows(
         Row::new(Line::from(span(keys, dim))),
     ));
 
-    panels.set(PanelId::Overlay, rows);
+    panels.set(PanelId::List, rows);
 }
 
 /// preview 列的文本（rig 把 `PickPreview::Text` 用 `wrap_all` 按列宽折行）。
@@ -821,6 +901,11 @@ impl Plugin for PickerPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::KeyCode;
+
+    use crate::frame::{CELL, CellRect, PanelArea, PanelInset, UNITS_TO_WORLD};
+    use crate::niri::TileRect;
 
     fn picker(items: &[(&str, Option<&str>)], free_text: bool) -> Picker {
         let mut picker = Picker::new("test");
@@ -925,5 +1010,481 @@ mod tests {
         // 没有动过勾时回车交的是选中的那一个。
         state.touched = false;
         assert_eq!(answer(&state, &picker), Some(Chosen::item(1)));
+    }
+
+    // -----------------------------------------------------------------------
+    // 条带里的 picker 列（headless）
+    // -----------------------------------------------------------------------
+
+    /// 观察 `Picker` 回执，验证回车 / Esc 真的把选择报给了插件。
+    #[derive(Resource, Default)]
+    struct SeenPicks(Vec<(Entity, Option<Chosen>)>);
+
+    fn tiled_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<FrameTree>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelSpawned>()
+            .init_resource::<PanelAreas>()
+            .init_resource::<Theme>()
+            .init_resource::<SeenPicks>()
+            .add_message::<KeyboardInput>()
+            .add_plugins(PickerPlugin)
+            .add_observer(|pick: On<Pick>, mut seen: ResMut<SeenPicks>| {
+                seen.0.push((pick.entity, pick.chosen.clone()));
+            });
+        app
+    }
+
+    fn spawn_picker(app: &mut App, picker: Picker) -> Entity {
+        let entity = app.world_mut().spawn(picker).id();
+        app.update();
+        entity
+    }
+
+    fn frame_tile(cols: u16, rows: u16) -> TileRect {
+        TileRect {
+            center: Vec2::ZERO,
+            size: Vec2::new(f32::from(cols), f32::from(rows)) * CELL * UNITS_TO_WORLD,
+        }
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    fn left(rect: &TileRect) -> f32 {
+        rect.center.x - rect.size.x * 0.5
+    }
+
+    fn right(rect: &TileRect) -> f32 {
+        rect.center.x + rect.size.x * 0.5
+    }
+
+    fn top(rect: &TileRect) -> f32 {
+        rect.center.y + rect.size.y * 0.5
+    }
+
+    fn bottom(rect: &TileRect) -> f32 {
+        rect.center.y - rect.size.y * 0.5
+    }
+
+    /// 叶子精确铺满帧、互不重叠。
+    fn assert_tiles(rects: &[(PanelId, TileRect)], frame: TileRect) {
+        let mut area = 0.0;
+        for (index, (id, a)) in rects.iter().enumerate() {
+            area += a.size.x * a.size.y;
+            if a.size.x <= 0.0 || a.size.y <= 0.0 {
+                // 默认树里补全 tile 关着时就是 0 高度：允许，只是不参与铺满。
+                continue;
+            }
+            for (other, b) in rects.iter().skip(index + 1) {
+                let overlap_x = left(a) < right(b) - 1e-9 && left(b) < right(a) - 1e-9;
+                let overlap_y = bottom(a) < top(b) - 1e-9 && bottom(b) < top(a) - 1e-9;
+                assert!(!(overlap_x && overlap_y), "{id:?} 和 {other:?} 重叠");
+            }
+            assert!(left(a) >= left(&frame) - 1e-9 && right(a) <= right(&frame) + 1e-9);
+            assert!(bottom(a) >= bottom(&frame) - 1e-9 && top(a) <= top(&frame) + 1e-9);
+        }
+        assert!(
+            close(area, frame.size.x * frame.size.y),
+            "叶子面积之和 {area} != 帧面积"
+        );
+    }
+
+    fn press(app: &mut App, key_code: KeyCode, logical: Key) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code,
+            logical_key: logical,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    fn type_text(app: &mut App, text: &str, key_code: KeyCode) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code,
+            logical_key: Key::Character(text.into()),
+            state: ButtonState::Pressed,
+            text: Some(text.into()),
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    fn column_entities(app: &App) -> (Option<Entity>, Option<Entity>, Option<Entity>) {
+        let roots = app.world().resource::<PanelRoots>();
+        (
+            roots.entity(PanelId::Picker),
+            roots.entity(PanelId::List),
+            roots.entity(PanelId::Preview),
+        )
+    }
+
+    /// 打开 picker：条带最右边多一列（叶子 +1），列宽 1/3、已有列等比缩到 2/3。
+    #[test]
+    fn opening_a_picker_appends_a_third_width_column_at_the_right() {
+        let mut app = tiled_app();
+        let before = app.world().resource::<FrameTree>().0.clone();
+        let frame = frame_tile(96, 28);
+        let before_rects = before.rects(frame);
+        assert_eq!(before_rects.len(), 7, "默认树 7 个叶子（转写/留白/确认/补全/输入/提示/状态）");
+
+        let _picker = spawn_picker(
+            &mut app,
+            picker(&[("a", None), ("b", None)], false),
+        );
+        let tree = app.world().resource::<FrameTree>().0.clone();
+        let after = tree.rects(frame);
+
+        assert_eq!(after.len(), before_rects.len() + 1, "只多一列");
+        assert_eq!(after.last().map(|(id, _)| *id), Some(PanelId::List), "列在最后");
+        let column = after.last().expect("picker 列").1;
+        assert!(close(column.size.x, frame.size.x / 3.0), "新列占 1/3");
+        assert!(close(right(&column), right(&frame)), "新列贴住条带最右");
+        assert_eq!(
+            tree.containers(frame).last().map(|(id, _)| *id),
+            Some(PanelId::Picker),
+            "容器面板在列的位置"
+        );
+        assert_tiles(&after, frame);
+
+        // 已有列全部乘同一个因子 2/3（相对宽度不变），高度不变。
+        for (id, old) in &before_rects {
+            let new = after
+                .iter()
+                .find(|(found, _)| found == id)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{id:?} 还在树上"));
+            assert!(
+                close(new.size.x, old.size.x * 2.0 / 3.0),
+                "{id:?} 按比例缩到 2/3"
+            );
+            assert!(close(new.size.y, old.size.y));
+            assert!(close(top(&new), top(old)));
+        }
+
+        // 面板实体登记齐全；行槽只建列表那一块。
+        let (column, list, preview) = column_entities(&app);
+        assert!(column.is_some() && list.is_some());
+        assert!(preview.is_none(), "没有 PickPreview 就没有 preview tile");
+        assert!(app
+            .world()
+            .resource::<PanelRows>()
+            .0
+            .contains_key(&PanelId::List));
+    }
+
+    /// 打开 picker 后 rects() 仍然精确铺满、不重叠（容器不参与叶子铺满）。
+    #[test]
+    fn the_strip_still_tiles_exactly_after_the_picker_column() {
+        let mut app = tiled_app();
+        let _picker = spawn_picker(
+            &mut app,
+            picker(&[("a", None), ("b", None), ("c", None)], false),
+        );
+        let tree = app.world().resource::<FrameTree>().0.clone();
+        let frame = frame_tile(96, 28);
+        assert_tiles(&tree.rects(frame), frame);
+        // 容器面板和列表区域完全重合（容器垫在后面）。
+        let column = tree.containers(frame).last().expect("容器").1;
+        let list = tree.rects(frame).last().expect("列表").1;
+        assert!(close(left(&column), left(&list)));
+        assert!(close(right(&column), right(&list)));
+        assert!(close(top(&column), top(&list)));
+        assert!(close(bottom(&column), bottom(&list)));
+    }
+
+    /// 关闭：列摘掉、叶子数回到原值、三块面板实体 despawn、行槽没有残留。
+    #[test]
+    fn closing_the_picker_removes_the_column_and_its_panels() {
+        let mut app = tiled_app();
+        let before = app.world().resource::<FrameTree>().0.clone();
+        let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        let (column, list, _) = column_entities(&app);
+        let (column, list) = (column.expect("容器"), list.expect("列表"));
+        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 8);
+
+        app.world_mut().entity_mut(picker).despawn();
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<FrameTree>().0,
+            before,
+            "树恢复原样（叶子、权重、顺序都不差）"
+        );
+        assert_eq!(app.world().resource::<FrameTree>().0.leaves().len(), 7);
+        assert!(app.world().get_entity(column).is_err(), "容器已 despawn");
+        assert!(app.world().get_entity(list).is_err(), "列表已 despawn");
+        let roots = app.world().resource::<PanelRoots>();
+        assert!(roots.entity(PanelId::Picker).is_none());
+        assert!(roots.entity(PanelId::List).is_none());
+        assert!(roots.entity(PanelId::Preview).is_none());
+        let rows = app.world().resource::<PanelRows>();
+        for id in [PanelId::Picker, PanelId::List, PanelId::Preview] {
+            assert!(!rows.0.contains_key(&id), "{id:?} 的行槽要清掉");
+            assert!(
+                !app.world().resource::<PanelSpawned>().0.contains_key(&id),
+                "{id:?} 的已生成行要忘掉"
+            );
+        }
+    }
+
+    /// 开/关两次不重复加列：每次打开叶子数都一样，树每次关完都精确复原。
+    #[test]
+    fn opening_and_closing_twice_does_not_stack_columns() {
+        let mut app = tiled_app();
+        let before = app.world().resource::<FrameTree>().0.clone();
+        for round in 0..2 {
+            let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+            let leaves = app.world().resource::<FrameTree>().0.leaves();
+            assert_eq!(leaves.len(), 8, "第 {round} 次打开只加一列");
+            assert_eq!(
+                leaves.iter().filter(|id| **id == PanelId::List).count(),
+                1,
+                "列表叶子只有一个"
+            );
+            app.world_mut().entity_mut(picker).despawn();
+            app.update();
+            assert_eq!(
+                app.world().resource::<FrameTree>().0,
+                before,
+                "第 {round} 次关完精确复原"
+            );
+        }
+    }
+
+    /// 有 `PickPreview::Text`：列内竖直分裂成列表 2 份 + preview 1 份。
+    #[test]
+    fn the_preview_splits_the_column_two_to_one() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, picker(&[("a", None), ("b", None)], false));
+        let frame = frame_tile(96, 28);
+        let no_preview = app.world().resource::<FrameTree>().0.clone();
+
+        app.world_mut()
+            .entity_mut(picker)
+            .insert(PickPreview::Text("hello".to_owned()));
+        app.update();
+
+        let tree = app.world().resource::<FrameTree>().0.clone();
+        let rects = tree.rects(frame);
+        assert_eq!(rects.len(), 9, "默认 7 叶 + 容器里的列表 + preview");
+        assert_eq!(rects[rects.len() - 2].0, PanelId::List);
+        assert_eq!(rects[rects.len() - 1].0, PanelId::Preview);
+        let container = tree.containers(frame).last().expect("容器").1;
+        let list = rects[rects.len() - 2].1;
+        let preview = rects[rects.len() - 1].1;
+        assert!(close(list.size.x, container.size.x));
+        assert!(close(preview.size.x, container.size.x));
+        assert!(close(list.size.y, container.size.y * 2.0 / 3.0), "列表 2/3");
+        assert!(close(preview.size.y, container.size.y / 3.0), "preview 1/3");
+        assert!(close(bottom(&list), top(&preview)), "上下相接、没有缝");
+        assert!(close(top(&list), top(&container)));
+        assert!(close(bottom(&preview), bottom(&container)));
+        assert_tiles(&rects, frame);
+
+        // 收起来的那棵树以后能恢复（preview 关掉时对比）。
+        app.world_mut().entity_mut(picker).remove::<PickPreview>();
+        app.update();
+        assert_eq!(
+            app.world().resource::<FrameTree>().0,
+            no_preview,
+            "preview 关掉后列内恢复成只有列表"
+        );
+    }
+
+    /// preview 关闭：preview 面板 despawn，列表重新占满整列（容器整高）。
+    #[test]
+    fn closing_the_preview_gives_the_list_the_whole_column() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        app.world_mut()
+            .entity_mut(picker)
+            .insert(PickPreview::Text("hello".to_owned()));
+        app.update();
+        let preview = column_entities(&app).2.expect("preview 面板");
+        let frame = frame_tile(96, 28);
+
+        app.world_mut().entity_mut(picker).remove::<PickPreview>();
+        app.update();
+
+        assert!(app.world().get_entity(preview).is_err(), "preview 已 despawn");
+        let tree = app.world().resource::<FrameTree>().0.clone();
+        let rects = tree.rects(frame);
+        assert_eq!(rects.len(), 8, "默认 7 叶 + 列表（preview 已摘）");
+        assert_eq!(rects.last().map(|(id, _)| *id), Some(PanelId::List));
+        let container = tree.containers(frame).last().expect("容器").1;
+        let list = rects.last().expect("列表").1;
+        assert!(close(left(&list), left(&container)));
+        assert!(close(right(&list), right(&container)));
+        assert!(close(top(&list), top(&container)));
+        assert!(close(bottom(&list), bottom(&container)));
+        assert!(app.world().resource::<PanelRoots>().entity(PanelId::Preview).is_none());
+        assert!(!app.world().resource::<PanelRows>().0.contains_key(&PanelId::Preview));
+    }
+
+    /// picker 的行写进列里的 `List` tile，不再有 Overlay 容器面板。
+    #[test]
+    fn the_picker_draws_its_rows_into_the_list_tile() {
+        let mut app = tiled_app();
+        let _picker = spawn_picker(&mut app, Picker::new("模型选择").item("gpt", "").item("claude", ""));
+        let list = column_entities(&app).1.expect("列表面板");
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .insert(list, PanelArea::new(CellRect::new(64, 0, 32, 28), PanelInset::DEFAULT));
+        app.update();
+
+        let rows = app.world().resource::<PanelRows>();
+        let list_rows = rows.get(PanelId::List);
+        assert!(!list_rows.is_empty(), "标题/列表行写到 List");
+        assert!(
+            list_rows.iter().any(|keyed| keyed
+                .row
+                .line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("模型选择"))),
+            "标题行在 List tile 里"
+        );
+        assert!(
+            rows.0.get(&PanelId::Picker).is_none(),
+            "容器面板不产行（没有 Overlay 那一层）"
+        );
+    }
+
+    /// ↑↓ 选、到边界夹住；选中条目写回 `Picker.selected`。
+    #[test]
+    fn arrow_keys_move_the_selection() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("a", None), ("b", None), ("c", None)], false),
+        );
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        assert_eq!(app.world().resource::<PickerInput>().selected, 2);
+        assert_eq!(app.world().get::<Picker>(picker).expect("picker").selected, 2);
+        press(&mut app, KeyCode::ArrowUp, Key::ArrowUp);
+        assert_eq!(app.world().resource::<PickerInput>().selected, 1);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::ArrowUp, Key::ArrowUp);
+        }
+        assert_eq!(app.world().resource::<PickerInput>().selected, 0, "夹在顶部");
+    }
+
+    /// 打字过滤列表，退格恢复。
+    #[test]
+    fn typing_filters_the_list() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(
+            &mut app,
+            picker(&[("alpha", None), ("beta", None), ("gamma", None)], false),
+        );
+        type_text(&mut app, "b", KeyCode::KeyB);
+        app.update();
+        {
+            let state = app.world().resource::<PickerInput>();
+            assert_eq!(state.filter, "b");
+            assert_eq!(state.rows, vec![Some(1)], "只剩 beta");
+            assert_eq!(state.selected, 0);
+        }
+        assert_eq!(app.world().get::<Picker>(picker).expect("picker").selected, 1);
+        press(&mut app, KeyCode::Backspace, Key::Backspace);
+        assert_eq!(app.world().resource::<PickerInput>().filter, "");
+        assert_eq!(app.world().resource::<PickerInput>().rows.len(), 3);
+    }
+
+    /// Tab 打勾（多选）：状态更新，下一帧把 `Ticked` 写回 picker；再按一次取消。
+    #[test]
+    fn tab_ticks_the_selected_item_in_a_multiple_picker() {
+        let mut app = tiled_app();
+        let mut picker = picker(&[("a", None), ("b", None)], false);
+        picker.multiple = true;
+        let picker = spawn_picker(&mut app, picker);
+        press(&mut app, KeyCode::Tab, Key::Tab);
+        assert_eq!(app.world().resource::<PickerInput>().ticked, vec![0]);
+        assert!(app.world().resource::<PickerInput>().touched);
+        app.update();
+        assert_eq!(
+            app.world().get::<Ticked>(picker).map(|ticked| ticked.0.clone()),
+            Some(vec![0])
+        );
+        press(&mut app, KeyCode::Tab, Key::Tab);
+        assert!(app.world().resource::<PickerInput>().ticked.is_empty());
+        app.update();
+        assert_eq!(
+            app.world().get::<Ticked>(picker).map(|ticked| ticked.0.clone()),
+            Some(Vec::new())
+        );
+    }
+
+    /// 回车：交选中项（箭头先移动到第二项）。
+    #[test]
+    fn enter_answers_with_the_selected_item() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, picker(&[("a", None), ("b", None)], false));
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        press(&mut app, KeyCode::Enter, Key::Enter);
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(1))))
+        );
+    }
+
+    /// Esc：关闭，不带选择。
+    #[test]
+    fn escape_closes_without_a_choice() {
+        let mut app = tiled_app();
+        let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        press(&mut app, KeyCode::Escape, Key::Escape);
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, None))
+        );
+    }
+
+    /// 聚焦工作区的 `Workspace.tree` 也跟着加/摘列（不只改全局代理）。
+    #[test]
+    fn the_column_is_added_to_the_focused_workspace_tree_too() {
+        let mut app = tiled_app();
+        let before = app.world().resource::<FrameTree>().0.clone();
+        let workspace = app
+            .world_mut()
+            .spawn(Workspace {
+                session: 1,
+                tree: before.clone(),
+                pose: Transform::IDENTITY,
+                order: 0,
+            })
+            .id();
+        let mut set = WorkspaceSet::default();
+        set.items.push(workspace);
+        set.focused = Some(workspace);
+        app.world_mut().insert_resource(set);
+
+        let picker = spawn_picker(&mut app, picker(&[("a", None)], false));
+        let focused = app
+            .world()
+            .get::<Workspace>(workspace)
+            .expect("workspace")
+            .tree
+            .clone();
+        assert_eq!(focused.leaves().len(), before.leaves().len() + 1);
+        assert!(focused.leaves().contains(&PanelId::List));
+
+        app.world_mut().entity_mut(picker).despawn();
+        app.update();
+        assert_eq!(
+            app.world().get::<Workspace>(workspace).expect("workspace").tree,
+            before,
+            "关掉后工作区的树也复原"
+        );
     }
 }

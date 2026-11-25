@@ -75,7 +75,7 @@ pub mod prelude {
     pub use crate::batch::{BatchPlugin, CompletedCalls, ReplyStream};
     pub use crate::editor::{Editor, PromptSubmitted, SubmittedPrompts};
     pub use crate::frame::{
-        CellRect, Extent, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
+        CellRect, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
     };
     pub use crate::frame::FrameTree;
     pub use crate::frame::{add_split_key, split_binding, split_transcript};

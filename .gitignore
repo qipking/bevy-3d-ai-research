@@ -38,3 +38,4 @@ experiments/rig-official/*
 render/ws*/
 render/layout_check/
 render/dbg*/
+render/final_check/

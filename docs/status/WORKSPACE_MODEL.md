@@ -49,10 +49,11 @@ pub struct WorkspaceSet {
 | **拖拽** `drag_workspace` | 指针在某个工作区上拖动 → `pose.translation` 跟着动 | 只动被拖的那一个；其它工作区像素级不动 |
 | **放置** `place_workspace` | 显式设置某个工作区的位姿（拖拽落点/命令） | 同上 |
 | **自动整理** `arrange_workspaces`（= niri 排列工作区的方式） | 按 `order` **重算所有位姿**，覆盖手放的位置 | niri 的工作区是**垂直堆叠**（见 §4），所以整理后顺序 = `order` 的垂直序列；同一次整理里每个工作区的间距一致 |
-| **聚焦** `focus_workspace` | 设置 `focused`；**只隐藏其它工作区**，不动相机、不做动画、不改变任何几何 | 被聚焦的工作区几何完全不变（niri 原则：聚焦不能让窗口自己动） |
+| **聚焦** `focus_workspace` | 只决定**内容写哪个工作区**（输入/转写进哪条）；**不隐藏任何工作区**、不动相机、不做动画、不改几何 | niri 的工作区是竖着摆的，靠视口移动去看，不靠隐藏（`README.md`：Workspaces are dynamic and arranged vertically） |
 
-**"无特殊动作"按字面实现**：聚焦不移动相机、不缩放、不淡入淡出，只是把非聚焦工作区的
-`Visibility` 设成 `Hidden`。相机怎么走到那儿是相机的事（自由相机 + 导航）。
+**"无特殊动作"按字面实现**：聚焦不移动相机、不缩放、不淡入淡出、**也不隐藏**任何工作区。
+它只决定"新内容写进哪条条带"。相机怎么走到那儿是相机的事（自由相机 + 导航）。
+（2026-11-25 修正：曾经实现成"聚焦隐藏其它"，用户否掉了——niri 没有隐藏工作区这回事。）
 
 ## 4. 自动整理为什么是"垂直堆叠"
 
@@ -96,3 +97,29 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 | 3 | 四个操作 + 可见性 | §5 的 6 条不变量逐条测试 |
 | 4 | 删 `Placement::Over`，picker/补全/确认 tile 化 | 无浮层：`grep -r 'Placement::Over' src` 为空 |
 | 5 | 应用层：3 个假工作区 + 拖拽/整理/聚焦按键 | 跑起来能拖、能整理、能聚焦 |
+
+## 8. 条带里没有"非 tile"的东西（进行中）
+
+niri 的设计原则（`Development:-Design-Principles.md`）：
+> Fullscreen windows are a normal part of the scrolling layout. They aren't on some
+> "special" layer that covers everything; instead, they are normal tiles that you can
+> switch away from.
+
+所以条带里**不存在浮层**。当前状态：
+
+| 东西 | 现在是 | 目标 |
+|---|---|---|
+| 转写 | tile（左列） | ✅ |
+| 输入框 | tile（右列，固定 4 行，贴底） | ✅ |
+| 状态行 | tile（右列，固定 2 行） | ✅ |
+| 补全 | tile（右列，打开时 6 行） | ✅ |
+| 右列顶部留白 | `PanelId::Spacer`（只吃空间，不画） | ✅ |
+| 键位提示行 | ✅ 独立 1 行 tile（`PanelId::Hints`，无内边距否则 1 行放不下 1 行字） | — |
+| 确认行（Ask） | ✅ 独立 tile（`PanelId::Confirm`，无 Ask 时 0 高度） | — |
+| picker | ✅ 条带**最右边新加一列**（打开时已有列等比缩到 2/3，关掉后逐字节复原） | — |
+
+**已知限制（下一步）**：状态行/提示行现在还在右列（1/3 宽）里，状态行按优先级只显示得下右侧几项。
+要横跨整条得把根改成竖 split，但 `layout::rects()` 在**嵌套**里会把 `Fixed` 二次换算
+（实测 `Fixed(36px)` 变成 0.1px），导致兄弟重叠——这个 bug 已经定位，修完再把两条挪到根上。
+
+验收标准：`grep -r 'Placement::Over\|Placement::Within' rig_niri/src` 为空。

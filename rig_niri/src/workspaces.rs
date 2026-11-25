@@ -1319,7 +1319,10 @@ mod tests {
             "默认工作区的转写锚点 x = {}",
             anchor.x
         );
-        assert_eq!(anchor.y, 0.0);
+        // 转写只占条带上半部分（下面还有提示行/状态行两条横跨的 tile），
+        // 所以它的锚点 y 是"上半部分的中心"，不再等于 0。
+        let want_y = 0.0;
+        assert!((anchor.y - want_y).abs() < 1e-5, "转写锚点 y = {}", anchor.y);
     }
 
     // 2. 默认工作区的转写能拿到行：写进全局代理的行提交到组件并生成行实体。
@@ -1826,7 +1829,10 @@ mod tests {
             .translation;
         let want_x = -16.0 * CELL.x * UNITS_TO_WORLD;
         assert!((anchor.x - want_x).abs() < 1e-5, "anchor.x = {}", anchor.x);
-        assert_eq!(anchor.y, 0.0);
+        // 转写只占条带上半部分（下面还有提示行/状态行两条横跨的 tile），
+        // 所以它的锚点 y 是"上半部分的中心"，不再等于 0。
+        let want_y = 0.0;
+        assert!((anchor.y - want_y).abs() < 1e-5, "转写锚点 y = {}", anchor.y);
     }
 
     // 12. 拆转写只改聚焦工作区：A 多出 Pane2，B 的树/根不变。

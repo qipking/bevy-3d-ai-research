@@ -27,13 +27,11 @@ use bevy::window::{PrimaryWindow, WindowRef};
 use crate::kernel::KernelPlugin;
 use rig_niri::batch::{BatchPlugin, CompletedCalls};
 use rig_niri::camera_rig::RigCamera;
-use rig_niri::frame::{
-    Extent, FramePanel, Look, PanelAreas, PanelRoots, Placement, spawn_panel,
-};
+use rig_niri::frame::{PanelAreas, PanelRoots};
 use rig_niri::pane::{PaneScroll, TranscriptRows};
 use rig_harness::pick::{PickItem, PickPreview};
 use rig_harness::prelude::{Highlighted, Picker};
-use rig_niri::panels::{PanelId, PanelRows};
+use rig_niri::panels::PanelId;
 use rig_niri::theme::Theme;
 use rig_niri::transcript::{RowText, TranscriptFont};
 use feathers_in_3d::{MirrorRoot, WorldPanel};
@@ -76,7 +74,7 @@ fn main() {
         .init_resource::<Selected>()
         .init_resource::<CompletedCalls>()
         .init_resource::<Theme>()
-        .add_systems(Startup, (setup, spawn_probe_pointer, spawn_overlay))
+        .add_systems(Startup, (setup, spawn_probe_pointer))
         .add_systems(
             Update,
             (
@@ -180,64 +178,6 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     let cjk: Handle<Font> = asset_server.load("fonts/NotoSansCJKsc-Subset.otf");
     let font: FontSource = FontSource::List(vec![mono.into(), cjk.into()]);
     commands.insert_resource(TranscriptFont(font));
-}
-
-/// 浮层示例（`RF_OVERLAY=1`）：一块 `Placement::Over` 面板，证明它盖在转写上面。
-///
-/// 这就是给业务看的扩展点：自己 spawn 一块 [`FramePanel`]、自己写行，
-/// 帧布局会把它放到该去的地方，层（`WorldLayer`）保证它画在最上面。
-fn spawn_overlay(mut commands: Commands, mut roots: ResMut<PanelRoots>, mut rows: ResMut<PanelRows>) {
-    if std::env::var("RF_OVERLAY").is_err() {
-        return;
-    }
-    let entity = spawn_panel(
-        &mut commands,
-        PanelId::Overlay,
-        FramePanel::new(Placement::Over {
-            width: Extent::Percent(52),
-            height: Extent::Cells(9),
-        })
-        .order(9),
-        Look::new(
-            Color::srgb(0.10, 0.12, 0.18),
-            Color::srgb(0.95, 0.82, 0.35),
-            10.0,
-        ),
-    );
-    roots.0.insert(PanelId::Overlay, entity);
-    let line = |text: &str, style: rig_tui::ratatui::style::Style| {
-        rig_niri::transcript::Row::new(rig_tui::ratatui::text::Line::from(
-            rig_tui::ratatui::text::Span::styled(text.to_string(), style),
-        ))
-    };
-    use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
-    let rows_out = vec![
-        rig_niri::panels::KeyedRow {
-            key: 1,
-            hash: 1,
-            row: line(
-                " overlay 面板（Placement::Over）",
-                Style::default().fg(RColor::LightYellow).add_modifier(Modifier::BOLD),
-            ),
-        },
-        rig_niri::panels::KeyedRow {
-            key: 2,
-            hash: 2,
-            row: line(
-                " 它只写自己的行；位置由帧布局算，层级由 WorldLayer 保证。",
-                Style::default().fg(RColor::Rgb(200, 206, 220)),
-            ),
-        },
-        rig_niri::panels::KeyedRow {
-            key: 3,
-            hash: 3,
-            row: line(
-                " rig-tui 里同一个位置是 picker / 补全弹窗。",
-                Style::default().fg(RColor::Rgb(150, 158, 175)),
-            ),
-        },
-    ];
-    rows.set(PanelId::Overlay, rows_out);
 }
 
 /// 演示插件侧的 preview：picker 的 `Highlighted` 变了就换 `PickPreview::Text`
@@ -625,8 +565,7 @@ fn run_tour(
             }
         }
         27 if sub == 0 => shoot(&mut runner, &mut commands, "07_gate_confirmed"),
-        28 if sub == 0 => shoot(&mut runner, &mut commands, "08_overlay"),
-        // picker：浮层面板（rig-harness 的 `Picker` -> `Placement::Over`）
+        // picker：条带最右边的一列（rig-harness 的 `Picker`）
         30 if sub == 0 => {
             commands.spawn(
                 Picker::new("选择模型")

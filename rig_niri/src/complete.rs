@@ -1754,7 +1754,8 @@ mod tests {
         // 输入/状态固定高度且贴底：打开补全时它们**不动**，让位的是顶部留白。
         assert!((input.size.y - input_closed.size.y).abs() < 1e-5, "输入高度不变");
         assert!((input.center.y - input_closed.center.y).abs() < 1e-5, "输入位置不变");
-        assert!((input.center.y - input.size.y * 0.5 - (status.center.y + status.size.y * 0.5)).abs() < 1e-5);
+        // 输入下面依次是提示行、状态行（都是 tile）；这里只断言输入在它们上方。
+        assert!(input.center.y > status.center.y, "输入在状态行上方");
         assert!(
             (complete.center.y - complete.size.y * 0.5
                 - (input.center.y + input.size.y * 0.5))
