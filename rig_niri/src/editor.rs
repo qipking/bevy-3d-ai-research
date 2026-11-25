@@ -8,26 +8,43 @@
 //! 历史模型也对齐上游：Up 先在第一行内上移，到第一行行首后再进历史；
 //! Down 往回走，翻过最新一条时把浏览前写的草稿带回来。`Ctrl+P`/`Ctrl+N`
 //! 分别对应上游的 `line_up`/`line_down`（不从补全走）。被清掉、被取走的
-//! 未发送文本也进 `history`（上游 `keep` 的行为）；Enter 发送的进 `history`
-//! 与 [`SubmittedPrompts`]。
+//! 未发送文本也进 `history`（上游 `keep` 的行为）；Enter 发送的（以及 Tab 排队
+//! 的）进 `history` 与 [`SubmittedPrompts`]。
 //!
-//! 未接的行为：补全（Tab 只停止浏览历史）、停止 agent（Esc）、粘贴图片
-//! （Ctrl+V）、转写区滚动/选择（由 `pane.rs` 现有系统负责）；这些动作在
-//! 表里已经能解析，`act` 里是空实现，等对应模块移植时再连。
+//! 发送、排队、停止与退出的通道（与上游 rig-tui `input.rs` 对齐）：
+//!
+//! - 非空输入 Enter -> [`rig_ecs::inbox::Deliver`]（[`DeliveryMode::Steer`]）给
+//!   [`ShownAgent`] 指的那个 agent，也就是当前聚焦工作区的 agent；同时本地回显、
+//!   记历史、转写窗格跟着末尾（[`PaneScroll::follow`]）；
+//! - turn 跑着时 Tab -> `Deliver`（[`DeliveryMode::Queue`]）；补全列表开着时
+//!   Tab 仍然是接受候选；
+//! - turn 跑着时 Esc -> [`rig_ecs::agent::StopTurn`]；补全列表开着时 Esc 仍然是
+//!   关列表；
+//! - 空输入 Ctrl+D -> [`bevy::app::AppExit`]（`built_in` 里 `ctrl('d')` 本来就是
+//!   [`InputAction::Exit`]，不用加绑定）。
+//!
+//! `/` 开头的行仍然由应用层的 `run_typed_prompts` 交给 `RunCommand`，这里**不再**
+//! 额外送一条普通消息（上游靠内核的 `Incoming::command` 分流；本 crate 没有
+//! refused 概念，所以也不做 `Deliver::literal` 重发）。
+//!
+//! 未接的行为：粘贴图片（Ctrl+V）、转写区滚动/选择（由 `pane.rs` 现有系统负责）；
+//! 这些动作在表里已经能解析，`act` 里是空实现，等对应模块移植时再连。
 
 use bevy::ecs::entity_disabling::Disabled;
 use bevy::ecs::query::Allow;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
 use bevy::prelude::*;
+use rig_ecs::prelude::{ActiveTurn, Deliver, DeliveryMode, StopTurn};
+use rig_harness::main_agent::ShownAgent;
 use rig_tui::ratatui::style::{Color as RColor, Style};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::frame::{PanelAreas, PanelRoots};
 use crate::keys::{
     self, BindingRef, Found, InputAction, KeyBinding, KeyFocus, KeyPressed, KeyScope, Modifiers,
     PendingInput,
 };
+use crate::pane::PaneScroll;
 use crate::panels::{KeyedRow, PanelId, PanelRows};
 use crate::theme::Theme;
 use crate::transcript::Row;
@@ -436,20 +453,55 @@ impl Editor {
     }
 }
 
-/// 已提交的提示词（真接大模型时改成发给 agent；模板里先记下来）。
+/// 已提交的提示词：输入框的本地回显（面板行之外的一份记录，测试/插件可读）。
+///
+/// 真正送达 agent 走 [`Deliver`]；这份回显没有别的用途，也不再是"假装发送"。
 #[derive(Resource, Default)]
 pub struct SubmittedPrompts(pub Vec<String>);
 
-/// 提交事件（其他插件可以监听）。
+/// 提交事件（其他插件可以监听）：Enter 与 Tab 排队的文本都从这里过一遍。
+///
+/// 斜杠命令由应用层从这条消息接到 `RunCommand`；普通消息另外触发 [`Deliver`]。
 #[derive(Message, Debug, Clone)]
 pub struct PromptSubmitted(pub String);
 
-/// 执行一个内置动作；`Send` 时返回要提交的文本，由调用方写事件。
-fn act(action: InputAction, editor: &mut Editor) -> Option<String> {
+/// 一次发送：Trim 过的文本 + 送达模式。
+///
+/// 模式与上游一致：Enter 是 [`DeliveryMode::Steer`]（空闲时开一轮、忙时插进
+/// 这一轮的下一趟模型调用），Tab 是 [`DeliveryMode::Queue`]（等这一轮结束再作为
+/// 下一步一起送）。
+#[derive(Debug)]
+struct Sending {
+    text: String,
+    mode: DeliveryMode,
+}
+
+/// [`act`] 做完编辑器该做的事之后，调用方还要执行的副作用。
+///
+/// 动作本身（清空、移动、删除……）在 `act` 里就地做完；发送/停止/退出需要
+/// agent 与 `Commands`，由 [`keys`] 统一接线。
+#[derive(Debug)]
+enum Act {
+    /// 把文本送给 agent。
+    Send(Sending),
+    /// 停掉 agent 正在跑的这一轮。
+    Stop,
+    /// 输入为空时按了 Ctrl+D：退出程序。
+    Exit,
+}
+
+/// 执行一个内置动作；需要 agent 或 `Commands` 的留给调用方。
+///
+/// `busy` 是 [`ShownAgent`] 上有没有 [`ActiveTurn`]（和状态行的 `turn` 条目
+/// 同一个事实来源）：它只影响 Tab（排队还是停止浏览历史）与 Esc（停 agent
+/// 还是什么也不做）。
+fn act(action: InputAction, editor: &mut Editor, busy: bool) -> Option<Act> {
     use InputAction as Do;
     match action {
         Do::Clear => editor.clear(),
-        // 本 crate 还没有退出通道：输入为空时的 Ctrl+D 先什么也不做。
+        // 输入为空时 Ctrl+D 退出（上游 `Do::Exit if input.is_empty()`）；有字时
+        // 不退也不清空，和上游一样当作按错。
+        Do::Exit if editor.is_empty() => return Some(Act::Exit),
         Do::Exit => {}
         Do::NewLine => editor.insert_char('\n'),
         Do::LineStart => editor.home(),
@@ -479,32 +531,62 @@ fn act(action: InputAction, editor: &mut Editor) -> Option<String> {
         | Do::AnswerInline(_)
         | Do::DismissInline
         | Do::PasteImage => {}
-        // 没有补全：Tab 把正在浏览的历史提示词变成用户自己的文本。
+        // 一轮正在跑：Tab 是排队（上游 `send(.., queue = true)`）。补全列表开着
+        // 时走不到这里——[`completion_act`] 先把它吃掉了。空输入不排队，也不
+        // 停止浏览历史（上游 `send` 先返回，`stop_browsing` 不会被执行）。
+        Do::Tab if busy => return send(editor, DeliveryMode::Queue),
+        // 没在跑：Tab 把正在浏览的历史提示词变成用户自己的文本。
         Do::Tab => editor.stop_browsing(),
-        Do::Send => {
-            let text = editor.text.trim().to_string();
-            if text.is_empty() {
-                return None;
-            }
-            editor.sent(text.clone());
-            return Some(text);
-        }
-        // 没有补全、也还没有停 agent 的通道。
+        Do::Send => return send(editor, DeliveryMode::Steer),
+        // 补全列表开着时 Esc 先在 [`completion_act`] 里关列表；到这里就是停
+        // agent。没有正在跑的 turn 时什么也不做（上游也会触发 `StopTurn` 去停
+        // 插件的工作，本 crate 没有这类工作，就不空触发）。
+        Do::Stop if busy => return Some(Act::Stop),
         Do::Stop => {}
     }
     None
+}
+
+/// 取走输入，trim 后记进编辑器历史（[`Editor::sent`]），返回要送出的文本。
+///
+/// 空输入（只有空白也算）不发送，也不清空——与上游 `send` 开头的
+/// `input.text().trim().is_empty()` 早退一致。
+fn send(editor: &mut Editor, mode: DeliveryMode) -> Option<Act> {
+    let text = editor.text.trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    editor.sent(text.clone());
+    Some(Act::Send(Sending { text, mode }))
+}
+
+/// 这一行是不是应用层要按 `/命令` 跑的（与 `run_typed_prompts` 同一条入口
+/// 规则：trim 过、`/` 开头）。命令走 `RunCommand`，视图不再额外送普通消息。
+///
+/// 这里只判断"是不是命令形状"，命令名在不在由应用层的命令表决定：本 crate
+/// 没有上游的 `refused` 概念，所以没有 `Deliver::new(..).literal()` 的重发。
+fn is_command(text: &str) -> bool {
+    text.trim().starts_with('/')
 }
 
 /// 补全列表开着时先吃掉这个动作；返回 `true` 表示已处理。
 ///
 /// 对应上游 `input.rs::accept_completion` 与列表导航：↑↓ 改选中项、Tab/Enter 接受、
 /// Esc 关掉（并记住这个 token，直到它变了才允许重开）。
+///
+/// 列表关着时这里一律返回 `false`，把动作交回 [`act`]：那是上游
+/// `view.completion.is_none()` 的分支——↑↓ 走编辑器历史/行移动，Tab 排队或
+/// 停止浏览历史，Enter 发送，Esc 停 agent。以前的实现在列表关着时也把
+/// ↑↓/Tab/Esc 吃掉，发送与停止因此永远到不了。
 fn completion_act(
     action: InputAction,
     state: &mut crate::complete::CompletionState,
     editor: &mut Editor,
 ) -> bool {
     use InputAction as Do;
+    if !state.is_open() {
+        return false;
+    }
     match action {
         Do::Up => {
             if let Some(completion) = state.completion_mut() {
@@ -546,6 +628,14 @@ fn completion_act(
 
 /// 输入系统的键处理：走 [`crate::keys`] 的绑定表；编辑动作在这里执行，
 /// 插件绑定（没有 [`InputAction`] 的）触发 [`KeyPressed`]。
+///
+/// 发送/排队/停止/退出在这里落到内核与 bevy 上：
+/// * [`Deliver`] 给 [`ShownAgent`]（应用层在切工作区时更新它，见
+///   `rig_harness_in_3d::workspaces_demo`），斜杠命令让给应用层的
+///   `RunCommand` 桥，不重复送；
+/// * [`StopTurn`] 给同一个 agent；
+/// * [`AppExit`] 是空输入 Ctrl+D。
+#[allow(clippy::too_many_arguments)]
 pub fn keys(
     mut input: MessageReader<KeyboardInput>,
     mut editor: ResMut<Editor>,
@@ -557,6 +647,9 @@ pub fn keys(
     mut pending: ResMut<PendingInput>,
     mut commands: Commands,
     mut completion: Option<ResMut<crate::complete::CompletionState>>,
+    shown: Option<Res<ShownAgent>>,
+    entering: Query<(), With<ActiveTurn>>,
+    mut scroll: Option<ResMut<PaneScroll>>,
 ) {
     let rows: Vec<BindingRef> = bindings
         .iter()
@@ -616,9 +709,38 @@ pub fn keys(
                                 continue;
                             }
                         }
-                        if let Some(text) = act(action, &mut editor) {
-                            prompts.0.push(text.clone());
-                            submitted.write(PromptSubmitted(text));
+                        // 要送的 agent 是 `ShownAgent`：应用层在切聚焦工作区时更新它。
+                        let agent = shown.as_deref().and_then(|shown| shown.0);
+                        let busy = agent.is_some_and(|agent| entering.contains(agent));
+                        match act(action, &mut editor, busy) {
+                            Some(Act::Send(Sending { text, mode })) => {
+                                // 本地回显与历史照旧；历史由 `history` 模块从
+                                // `Editor.history` + `PromptSubmitted` 收一次。
+                                prompts.0.push(text.clone());
+                                submitted.write(PromptSubmitted(text.clone()));
+                                if let Some(scroll) = scroll.as_mut() {
+                                    // 新行到来时跟着末尾（上游 `pane.scroll.follow()`）。
+                                    scroll.follow = true;
+                                }
+                                // 斜杠命令行由应用层从 `PromptSubmitted` 接到
+                                // `RunCommand`，这里不再多送一条普通消息。上游靠内核的
+                                // `Incoming::command` 分流；本 crate 没有 `refused` 概念，
+                                // 所以也不做 `Deliver::new(..).literal()` 的重发。
+                                if !is_command(&text)
+                                    && let Some(agent) = agent
+                                {
+                                    commands.trigger(Deliver::new(agent, text, mode));
+                                }
+                            }
+                            Some(Act::Stop) => {
+                                if let Some(agent) = agent {
+                                    commands.trigger(StopTurn::new(agent));
+                                }
+                            }
+                            Some(Act::Exit) => {
+                                commands.write_message(AppExit::Success);
+                            }
+                            None => {}
                         }
                     }
                     None => commands.trigger(KeyPressed {
@@ -763,7 +885,10 @@ fn place(index: usize, shown: &str, history: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::complete::{Candidate, Completion, CompletionKind, CompletionState};
     use crate::keys::{AppKeyBindingsExt, KeyPress};
+    use bevy::ecs::event::EntityEvent;
+    use rig_ecs::prelude::TurnOf;
 
     fn ed(text: &str) -> Editor {
         let mut editor = Editor::default();
@@ -1022,13 +1147,64 @@ mod tests {
     #[test]
     fn enter_sends_the_trimmed_text_and_clears_the_editor() {
         let mut editor = ed("  hello  ");
-        assert_eq!(act(InputAction::Send, &mut editor), Some("hello".to_owned()));
+        assert!(matches!(
+            act(InputAction::Send, &mut editor, false),
+            Some(Act::Send(Sending { text, mode }))
+                if text == "hello" && mode == DeliveryMode::Steer
+        ));
         assert_eq!(editor.text(), "");
         assert_eq!(editor.cursor(), 0);
         assert_eq!(editor.history, vec!["hello".to_owned()]);
         let mut empty = ed("   ");
-        assert_eq!(act(InputAction::Send, &mut empty), None);
-        assert_eq!(empty.text(), "   ", "空白不发送，也不清空");
+        assert!(
+            matches!(act(InputAction::Send, &mut empty, false), None),
+            "空白不发送，也不清空"
+        );
+        assert_eq!(empty.text(), "   ");
+        assert!(
+            matches!(act(InputAction::Send, &mut empty, true), None),
+            "turn 跑着时空输入也不排队"
+        );
+    }
+
+    #[test]
+    fn tab_queues_only_while_a_turn_runs() {
+        let mut editor = ed("later");
+        assert!(matches!(
+            act(InputAction::Tab, &mut editor, true),
+            Some(Act::Send(Sending { text, mode }))
+                if text == "later" && mode == DeliveryMode::Queue
+        ));
+        assert!(editor.is_empty(), "排队也把输入取走");
+        assert_eq!(editor.history, vec!["later".to_owned()]);
+
+        // 没在跑：Tab 还是停止浏览历史，不发送。
+        let mut idle = ed("draft");
+        assert!(matches!(act(InputAction::Tab, &mut idle, false), None));
+        assert_eq!(idle.text(), "draft", "不忙时 Tab 不动输入");
+    }
+
+    #[test]
+    fn escape_stops_only_while_a_turn_runs() {
+        let mut editor = ed("keep");
+        assert!(matches!(
+            act(InputAction::Stop, &mut editor, true),
+            Some(Act::Stop)
+        ));
+        assert_eq!(editor.text(), "keep", "停 agent 不动输入");
+        assert!(matches!(act(InputAction::Stop, &mut editor, false), None));
+    }
+
+    #[test]
+    fn ctrl_d_quits_only_on_an_empty_input() {
+        let mut empty = Editor::default();
+        assert!(matches!(
+            act(InputAction::Exit, &mut empty, false),
+            Some(Act::Exit)
+        ));
+        let mut typed = ed("draft");
+        assert!(matches!(act(InputAction::Exit, &mut typed, false), None));
+        assert_eq!(typed.text(), "draft", "非空输入时 Ctrl+D 不退、也不清空");
     }
 
     // ---- keys 系统：动作表真的接上了 ----
@@ -1193,6 +1369,262 @@ mod tests {
         assert_eq!(text(&app), "T", "全局插件绑定遮住打字");
         assert!(app.world().resource::<SubmittedPrompts>().0.is_empty());
     }
+
+    // ---- 发送 / 排队 / 停止 / 退出：键 -> 内核事件的整条链路 ----
+
+    /// 观察到的事件（无窗口 app 里由观察者收）。
+    #[derive(Resource, Default)]
+    struct Observed {
+        delivered: Vec<(Entity, String, DeliveryMode)>,
+        stopped: Vec<Entity>,
+    }
+
+    fn record_deliver(deliver: On<Deliver>, mut observed: ResMut<Observed>) {
+        observed.delivered.push((
+            deliver.entity,
+            deliver.message.text().to_owned(),
+            deliver.message.mode,
+        ));
+    }
+
+    fn record_stop(stop: On<StopTurn>, mut observed: ResMut<Observed>) {
+        observed.stopped.push(stop.event_target());
+    }
+
+    /// `test_app` + 一个真 agent + `ShownAgent` + 转写窗格 + `Deliver`/`StopTurn`
+    /// 观察者；不建窗口、不装渲染。
+    fn sending_app() -> (App, Entity) {
+        let mut app = test_app();
+        let agent = app.world_mut().spawn(Name::new("agent")).id();
+        app.insert_resource(ShownAgent(Some(agent)))
+            .insert_resource(PaneScroll {
+                top: 3,
+                follow: false,
+            })
+            .init_resource::<Observed>()
+            .add_observer(record_deliver)
+            .add_observer(record_stop);
+        (app, agent)
+    }
+
+    /// 让 `agent` 看起来有一轮正在跑：`TurnOf` 的关系目标就是 `ActiveTurn`。
+    fn run_a_turn(app: &mut App, agent: Entity) {
+        app.world_mut().spawn(TurnOf(agent));
+        app.update();
+        assert!(
+            app.world().entity(agent).contains::<ActiveTurn>(),
+            "TurnOf 应给 agent 挂上 ActiveTurn"
+        );
+    }
+
+    fn observed(app: &App) -> &Observed {
+        app.world().resource::<Observed>()
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            self::character(app, character);
+        }
+    }
+
+    /// 这一帧的 `AppExit`。
+    fn exits(app: &App) -> Vec<AppExit> {
+        app.world()
+            .resource::<Messages<AppExit>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn enter_delivers_the_trimmed_text_to_the_shown_agent_as_steer() {
+        let (mut app, agent) = sending_app();
+        assert_eq!(app.world().resource::<ShownAgent>().0, Some(agent));
+        type_text(&mut app, "  hi  ");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "hi".to_owned(), DeliveryMode::Steer)],
+            "非空 Enter 应把 trim 过的文本以 Steer 送给 ShownAgent"
+        );
+        assert_eq!(
+            app.world().resource::<SubmittedPrompts>().0,
+            ["hi"],
+            "本地回显照旧"
+        );
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.text(), "", "发送后输入清空");
+        assert_eq!(editor.history, ["hi"], "历史照旧记一条");
+        assert!(
+            app.world().resource::<PaneScroll>().follow,
+            "发送后转写窗格跟着末尾"
+        );
+
+        // 空输入不触发。
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+        assert_eq!(observed(&app).delivered.len(), 1, "空输入不再送");
+        assert_eq!(app.world().resource::<SubmittedPrompts>().0, ["hi"]);
+    }
+
+    #[test]
+    fn enter_while_a_turn_runs_still_steers() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        type_text(&mut app, "now");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "now".to_owned(), DeliveryMode::Steer)],
+            "Enter 永远是 Steer（忙时插进这一轮）"
+        );
+    }
+
+    #[test]
+    fn tab_queues_while_a_turn_runs() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        type_text(&mut app, "later");
+        send(&mut app, Key::Tab, KeyCode::Tab, None);
+
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "later".to_owned(), DeliveryMode::Queue)],
+            "turn 跑着时 Tab 是排队"
+        );
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.text(), "", "排队也把输入取走");
+        assert_eq!(editor.history, ["later"]);
+        assert!(app.world().resource::<PaneScroll>().follow);
+    }
+
+    #[test]
+    fn tab_accepts_the_completion_instead_of_queueing_when_the_list_is_open() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        app.init_resource::<CompletionState>();
+        app.world_mut().resource_mut::<Editor>().set("he");
+        app.world_mut()
+            .resource_mut::<CompletionState>()
+            .show(Completion::from_items(
+                CompletionKind::Command,
+                0,
+                "he",
+                vec![Candidate {
+                    text: "help".into(),
+                    detail: "Show help".into(),
+                }],
+            ));
+
+        send(&mut app, Key::Tab, KeyCode::Tab, None);
+
+        assert!(
+            !app.world().resource::<CompletionState>().is_open(),
+            "补全开着时 Tab 仍然接受候选"
+        );
+        assert!(
+            observed(&app).delivered.is_empty(),
+            "接受补全不能顺手发一条消息"
+        );
+        assert!(text(&app).contains("help"), "候选落进输入：{:?}", text(&app));
+    }
+
+    #[test]
+    fn escape_stops_the_running_turn() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        type_text(&mut app, "keep");
+        send(&mut app, Key::Escape, KeyCode::Escape, None);
+
+        assert_eq!(observed(&app).stopped, [agent], "Esc 停的是 ShownAgent");
+        assert!(observed(&app).delivered.is_empty(), "Esc 不发送");
+        assert_eq!(text(&app), "keep", "停 agent 不动输入");
+    }
+
+    #[test]
+    fn escape_closes_the_completion_without_stopping_the_turn() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        app.init_resource::<CompletionState>();
+        app.world_mut().resource_mut::<Editor>().set("he");
+        app.world_mut()
+            .resource_mut::<CompletionState>()
+            .show(Completion::from_items(
+                CompletionKind::Command,
+                0,
+                "he",
+                vec![Candidate {
+                    text: "help".into(),
+                    detail: "Show help".into(),
+                }],
+            ));
+
+        send(&mut app, Key::Escape, KeyCode::Escape, None);
+
+        assert!(
+            !app.world().resource::<CompletionState>().is_open(),
+            "补全开着时 Esc 只关列表"
+        );
+        assert!(
+            observed(&app).stopped.is_empty(),
+            "关补全不能顺手停掉正在跑的 turn"
+        );
+        assert_eq!(text(&app), "he", "Esc 不动输入");
+    }
+
+    #[test]
+    fn ctrl_d_exits_only_when_the_input_is_empty() {
+        let mut app = test_app();
+        with_modifier(&mut app, KeyCode::ControlLeft, Key::Character("d".into()), KeyCode::KeyD);
+        assert_eq!(exits(&app), [AppExit::Success], "空输入 Ctrl+D 退出");
+
+        app.world_mut().resource_mut::<Editor>().set("draft");
+        with_modifier(&mut app, KeyCode::ControlLeft, Key::Character("d".into()), KeyCode::KeyD);
+        assert!(exits(&app).is_empty(), "有字时 Ctrl+D 不退");
+        assert_eq!(text(&app), "draft", "有字时 Ctrl+D 也不清空");
+    }
+
+    #[test]
+    fn a_slash_command_is_submitted_but_not_delivered() {
+        let (mut app, _agent) = sending_app();
+        type_text(&mut app, "/hello");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert!(
+            observed(&app).delivered.is_empty(),
+            "斜杠命令交给应用层的 RunCommand，视图不再额外送普通消息"
+        );
+        assert_eq!(
+            app.world().resource::<SubmittedPrompts>().0,
+            ["/hello"],
+            "本地回显照旧"
+        );
+        let messages: Vec<&PromptSubmitted> = app
+            .world()
+            .resource::<Messages<PromptSubmitted>>()
+            .iter_current_update_messages()
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "/hello");
+    }
+
+    #[test]
+    fn arrows_reach_history_when_the_completion_list_is_closed() {
+        let mut app = test_app();
+        app.init_resource::<CompletionState>();
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.set("draft");
+        editor.history = vec!["one".to_owned()];
+        drop(editor);
+
+        // 补全资源在、但列表关着：↑ 应该先到行首、再进历史（以前被补全吃掉）。
+        send(&mut app, Key::ArrowUp, KeyCode::ArrowUp, None);
+        assert_eq!(text(&app), "draft");
+        send(&mut app, Key::ArrowUp, KeyCode::ArrowUp, None);
+        assert_eq!(text(&app), "one", "补全关着时 ↑ 进历史");
+        send(&mut app, Key::ArrowDown, KeyCode::ArrowDown, None);
+        assert_eq!(text(&app), "draft", "Down 回到草稿");
+    }
 }
 
 #[cfg(test)]
@@ -1264,5 +1696,42 @@ mod completion_key_tests {
         let mut state = CompletionState::default();
         let mut editor = Editor::default();
         assert!(!completion_act(InputAction::Left, &mut state, &mut editor));
+    }
+
+    #[test]
+    fn a_closed_list_does_not_eat_tab_enter_escape_or_arrows() {
+        let mut state = CompletionState::default();
+        let mut editor = Editor::default();
+        for action in [
+            InputAction::Tab,
+            InputAction::Send,
+            InputAction::Stop,
+            InputAction::Up,
+            InputAction::Down,
+        ] {
+            assert!(
+                !completion_act(action, &mut state, &mut editor),
+                "列表关着时 {action:?} 应交回 act（发送/排队/停止/历史）"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_an_exact_list_closes_it_and_lets_the_send_through() {
+        let mut state = CompletionState::default();
+        state.show(Completion::from_items(
+            CompletionKind::Command,
+            0,
+            "help",
+            vec![Candidate {
+                text: "help".into(),
+                detail: "Show help".into(),
+            }],
+        ));
+        let mut editor = Editor::default();
+        editor.set("/help");
+        // 返回 false = 调用方继续 `act(Send)`，精确命中时 Enter 就是发送。
+        assert!(!completion_act(InputAction::Send, &mut state, &mut editor));
+        assert!(!state.is_open(), "发送前列表关掉");
     }
 }

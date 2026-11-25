@@ -476,7 +476,7 @@ pub struct RefusedKeys(pub Vec<String>);
 pub enum InputAction {
     /// 清空输入。
     Clear,
-    /// 输入为空时退出（本 crate 还没有退出通道，先留空实现）。
+    /// 输入为空时退出（`editor` 里写 [`bevy::app::AppExit`]；非空时什么也不做）。
     Exit,
     /// 打一个换行。
     NewLine,
@@ -520,11 +520,11 @@ pub enum InputAction {
     PageUp,
     /// 转写区下翻一页。
     PageDown,
-    /// 补全；本 crate 还没有补全，先当作“停止浏览历史”。
+    /// 补全；列表关着时，turn 跑着就排队，否则停止浏览历史。
     Tab,
     /// 发送（Enter）。
     Send,
-    /// 关补全，否则停 agent；本 crate 先留空实现。
+    /// 关补全；列表关着、turn 跑着时停 agent（`StopTurn`）。
     Stop,
     /// 粘贴图片；本 crate 还没有接图片剪贴板，先留空实现。
     PasteImage,

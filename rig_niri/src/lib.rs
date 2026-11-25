@@ -72,7 +72,9 @@ pub enum FeathersSystems {
 
 /// 业务代码只需要从这里拿东西。
 pub mod prelude {
-    pub use crate::batch::{BatchPlugin, CompletedCalls, ReplyStream};
+    pub use crate::batch::{
+        BatchPlugin, CompletedCalls, ReplyStream, dialogue_batch, live_additions,
+    };
     pub use crate::editor::{Editor, PromptSubmitted, SubmittedPrompts};
     pub use crate::frame::{
         CellRect, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,

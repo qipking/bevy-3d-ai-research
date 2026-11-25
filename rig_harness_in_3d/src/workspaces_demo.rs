@@ -39,15 +39,17 @@
 //!
 //! * 聚焦工作区：`ShownAgent` 指向它的 agent，`rig_niri::batch` 的真管线
 //!   （`rebuild_batch -> run_looks -> collect_rows`）每帧读这个 agent 的
-//!   `Conversation`，`apply_focus`/`commit_focused_panels` 负责和全局工作副本同步；
-//! * 非聚焦工作区：全局管线只服务聚焦工作区，所以本文件用 `rig_niri::transcript::Transcript`
-//!   （同一个对话引擎）为它自己的 `Conversation` 建行，再按它自己的转写面板高度
-//!   窗口化，写进 `WorkspacePanels.rows[PanelId::Transcript]`。
+//!   `Conversation` 和内核里还没结算的效应，`apply_focus`/`commit_focused_panels`
+//!   负责和全局工作副本同步；
+//! * 非聚焦工作区：全局管线只服务聚焦工作区，所以本文件用
+//!   `rig_niri::batch::dialogue_batch`（和真管线同一个 `conversation_frame`）
+//!   把它自己的对话拼成 batch + 文字块，再用 `rig_niri::batch::live_additions`
+//!   补上**实时内容**（在飞的调用、流式正文/推理、待回答的 Ask），按它自己的
+//!   转写面板高度窗口化，写进 `WorkspacePanels.rows[PanelId::Transcript]`。
+//!   切走的工作区不再"冻住"到回合结束。
 //!
-//! 注意：`rig_niri::batch::conversation_frame` 目前是私有的，应用层只能自己把
-//! `Conversation` 拼成 `RenderBatch`（本文件 [`workspace_batch`]）。这是**等待
-//! 上游公开** `build_batch_for(agent) -> RenderBatch` 的临时接缝；公开后本文件
-//! 的这段拼装应整段删掉，见回报。
+//! 这两半都在 `rig_niri::batch` 里，纯函数可测；本文件只负责"哪个工作区绑哪个
+//! agent"和窗口化。
 //!
 //! # 按键
 //!
@@ -60,8 +62,6 @@
 use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
-use rig_core::conversation::{self as talk, pairing::answered_by};
-use rig_core::message::{AssistantContent, AssistantMessage, Message, ToolResult, UserContent};
 use rig_ecs::prelude::{Agent, AgentId, Conversation, SpawnedBy};
 use rig_ecs::spawn::spawn_root;
 use rig_harness::prelude::{Answerer, SessionPaths, ShownAgent};
@@ -72,11 +72,8 @@ use rig_niri::transcript::{Row, TextId, Transcript, row_hash};
 use rig_niri::workspaces::{
     Workspace, WorkspacePanels, WorkspaceSet, arrange_workspaces, focus_workspace, spawn_workspace,
 };
-use rig_tui::ratatui::style::{Color as RColor, Style, Stylize};
+use rig_tui::ratatui::style::{Color as RColor, Style};
 use rig_tui::ratatui::text::{Line, Span};
-use rig_tui::{
-    CallState, RenderBatch, RenderInput, RenderKey, RenderOutput, RenderRequest, ToolRender,
-};
 
 /// 一个会话条带在世界里的高度（米）：帧高 × 行高 × 单位换算。
 const STRIP_HEIGHT_M: f32 = 28.0 * 18.0 * 0.0018;
@@ -353,68 +350,96 @@ fn focus_workspace_and_show(world: &mut World, workspace: Entity) {
 // 非聚焦工作区的转写
 // ---------------------------------------------------------------------------
 
-/// 非聚焦工作区：把**它自己的 agent** 的对话喂给对话引擎，窗口化后写进它自己的面板。
+/// 非聚焦工作区：把**它自己的 agent** 的对话 + 实时内容写进它自己的面板。
+///
+/// 对话历史由 [`batch::dialogue_batch`] 拼成 batch（和真管线同一个
+/// `conversation_frame`），实时内容（在飞的调用、流式正文/推理、待回答的 Ask）
+/// 由 [`batch::live_additions`] 直接读内核，两者接成一条行流，窗口化后写进
+/// `WorkspacePanels.rows[PanelId::Transcript]`。切走的工作区因此不再"冻住"。
+///
+/// 是独占系统：`live_additions` 要在世界上跑查询，这段逻辑本来也要逐个工作区
+/// 读写它自己的 `WorkspacePanels`；排在 `Fit` 里保证它在真管线建行之后跑。
 ///
 /// 聚焦工作区跳过：它的行由 `rig_niri::batch` 的真管线写全局 `PanelRows`，
 /// 再由 `commit_focused_panels` 提交进 `WorkspacePanels`（唯一写入口径）。
-fn sync_workspace_transcripts(
-    set: Res<WorkspaceSet>,
-    agents: Res<WorkspaceAgents>,
-    mut engines: ResMut<WorkspaceTranscripts>,
-    mut workspaces: Query<(&Workspace, &mut WorkspacePanels)>,
-    conversations: Query<&Conversation>,
-    ids: Query<&AgentId>,
-) {
-    engines
+fn sync_workspace_transcripts(world: &mut World) {
+    let Some((items, focused)) = world
+        .get_resource::<WorkspaceSet>()
+        .map(|set| (set.items.clone(), set.focused))
+    else {
+        return;
+    };
+    world
+        .resource_mut::<WorkspaceTranscripts>()
         .0
-        .retain(|workspace, _| set.items.contains(workspace));
+        .retain(|workspace, _| items.contains(workspace));
 
-    for workspace_entity in &set.items {
-        if set.focused == Some(*workspace_entity) {
+    for workspace_entity in items {
+        if focused == Some(workspace_entity) {
             continue;
         }
-        let Some(agent) = agents.agent_of(*workspace_entity) else {
+        let Some(agent) = world
+            .get_resource::<WorkspaceAgents>()
+            .and_then(|agents| agents.agent_of(workspace_entity))
+        else {
             continue;
         };
-        let Ok(conversation) = conversations.get(agent) else {
-            continue;
-        };
-        let Ok((workspace, mut panels)) = workspaces.get_mut(*workspace_entity) else {
-            continue;
-        };
-        let Some(root) = panels.roots.entity(PanelId::Transcript) else {
-            continue;
-        };
-        let Some(area) = panels.areas.get(&root).copied() else {
+        // 这个工作区自己的转写面板区域：宽高都来自它自己的树。
+        let Some((order, area)) = world
+            .get::<Workspace>(workspace_entity)
+            .zip(world.get::<WorkspacePanels>(workspace_entity))
+            .and_then(|(workspace, panels)| {
+                let root = panels.roots.entity(PanelId::Transcript)?;
+                let area = panels.areas.get(&root).copied()?;
+                Some((workspace.order, area))
+            })
+        else {
             continue;
         };
         if area.cols == 0 || area.rows == 0 {
-            panels.rows.set(PanelId::Transcript, Vec::new());
+            if let Some(mut panels) = world.get_mut::<WorkspacePanels>(workspace_entity) {
+                panels.rows.set(PanelId::Transcript, Vec::new());
+            }
             continue;
         }
+        // 对话：和真管线同一个 `conversation_frame`（纯函数，产物是 owned 的）。
+        let Some((batch, texts)) = world
+            .get::<Conversation>(agent)
+            .map(|conversation| batch::dialogue_batch(conversation, agent, area.cols))
+        else {
+            continue;
+        };
+        // 实时：在飞的调用、流式正文/推理、待回答的 Ask（只取本 agent 的）。
+        let live = batch::live_additions(world, agent, area.cols);
 
-        let engine = engines.0.entry(*workspace_entity).or_default();
-        engine.set_width(area.cols);
-        let (batch, texts) = workspace_batch(conversation, agent, area.cols);
-        engine.apply(&batch);
-        let mut kept: HashSet<TextId> = HashSet::new();
-        for (id, lines) in texts {
-            engine.set_text(id.clone(), lines);
-            kept.insert(id);
-        }
-        // 对话里已经删掉的文字块不能留在面板上（请求块由 `apply` 每帧 finalize）。
-        engine.retain_text(|id| matches!(id, TextId::Message { .. }) && kept.contains(id));
-
-        let rows = engine.keyed_rows().to_vec();
+        let rows = {
+            let mut engines = world.resource_mut::<WorkspaceTranscripts>();
+            let engine = engines.0.entry(workspace_entity).or_default();
+            engine.set_width(area.cols);
+            engine.apply(&batch);
+            let mut kept: HashSet<TextId> = HashSet::new();
+            for (id, lines) in texts {
+                engine.set_text(id.clone(), lines);
+                kept.insert(id);
+            }
+            // 对话里已经删掉的文字块不能留在面板上（请求块由 `apply` 每帧 finalize）。
+            engine.retain_text(|id| matches!(id, TextId::Message { .. }) && kept.contains(id));
+            let mut rows = engine.keyed_rows().to_vec();
+            // 实时内容接在对话之后（和真管线里"流式块在消息之后"同一顺序）。
+            rows.extend(live);
+            rows
+        };
         let height = usize::from(area.rows);
         let visible = if rows.is_empty() {
             // 还没有对话：显示**真实**绑定信息（不是假会话号），否则条带是白的。
-            vec![workspace_label_row(workspace.order, agent, ids.get(agent).ok())]
+            vec![workspace_label_row(order, agent, world.get::<AgentId>(agent))]
         } else {
             let max_top = rows.len().saturating_sub(height);
             rows[max_top..].to_vec()
         };
-        panels.rows.set(PanelId::Transcript, visible);
+        if let Some(mut panels) = world.get_mut::<WorkspacePanels>(workspace_entity) {
+            panels.rows.set(PanelId::Transcript, visible);
+        }
     }
 }
 
@@ -433,142 +458,6 @@ fn workspace_label_row(order: usize, agent: Entity, id: Option<&AgentId>) -> Key
         hash: row_hash(&row),
         row,
     }
-}
-
-/// 一个 agent 的 `Conversation` -> 这一帧的 `RenderBatch` + 没有 `RenderKey` 的文字块。
-///
-/// 这是 `rig_niri::batch::conversation_frame`（私有）在应用层的**最小**复制：
-/// 用户文字、assistant 正文/推理、工具调用（默认 look + 结果）会画；
-/// 送达的 entry / 内容块 / aside 暂不画（它们需要 rig_niri 的 Content/Entry look
-/// 兜底，属于等 `build_batch_for(agent)` 公开后统一的部分）。
-fn workspace_batch(
-    conversation: &Conversation,
-    agent: Entity,
-    width: u16,
-) -> (RenderBatch, Vec<(TextId, Vec<Line<'static>>)>) {
-    let theme = rig_tui::Theme::default();
-    let entries: Vec<_> = conversation.entries().collect();
-    let mut batch = RenderBatch {
-        pane: None,
-        agent: Some(agent),
-        width,
-        requests: HashMap::new(),
-    };
-    let mut texts = Vec::new();
-
-    for (at, entry) in entries.iter().enumerate() {
-        let next = entries.get(at + 1).map(|entry| entry.message);
-        match entry.message {
-            Message::System { .. } => {}
-            Message::User { content } => {
-                for (block, item) in content.iter().enumerate() {
-                    let UserContent::Text(text) = item else {
-                        // 工具结果画在调用下面；图片/音频/文档等暂时不画（见函数文档）。
-                        continue;
-                    };
-                    // rig 自己写的停止标记、没挂上的附件不画（和 batch 的过滤一致）。
-                    if entry.is_stop_marker() || talk::unattached(&text.text).is_some() {
-                        continue;
-                    }
-                    let mut lines = vec![Line::default()];
-                    lines.extend(workspace_user_lines(&text.text));
-                    texts.push((TextId::Message { at, block }, lines));
-                }
-            }
-            Message::Assistant(assistant) => {
-                let results = answers(assistant, next);
-                let mut results = results.into_iter();
-                for (block, item) in assistant.content.iter().enumerate() {
-                    match item {
-                        AssistantContent::Text(text) => {
-                            let mut lines = vec![Line::default()];
-                            lines.extend(workspace_reply_lines(&text.text, &theme, width));
-                            texts.push((TextId::Message { at, block }, lines));
-                        }
-                        AssistantContent::Reasoning(reasoning) => {
-                            texts.push((
-                                TextId::Message { at, block },
-                                workspace_reasoning_lines(&reasoning.text, &theme, width),
-                            ));
-                        }
-                        AssistantContent::ToolCall(call) => {
-                            let result = results.next().flatten();
-                            let state = match result {
-                                Some(_) => CallState::Done,
-                                None => CallState::Running(None),
-                            };
-                            let render = ToolRender::new(call.clone(), result.cloned(), state);
-                            let output = RenderOutput {
-                                lines: render.default_lines(),
-                                decorations: Vec::new(),
-                            };
-                            batch.requests.insert(
-                                RenderKey::Tool(at, block),
-                                RenderRequest {
-                                    input: RenderInput::Tool(render),
-                                    output,
-                                },
-                            );
-                        }
-                        // 图片 / opaque 等块：等 rig_niri 的 Content look 公开后再画。
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    (batch, texts)
-}
-
-/// 回复里的每个调用后面那条消息里的结果，按调用顺序（同 `batch::answers`）。
-fn answers<'a>(
-    reply: &AssistantMessage,
-    results: Option<&'a Message>,
-) -> Vec<Option<&'a ToolResult>> {
-    let calls = reply.tool_calls().map(|call| &call.id);
-    let results = results.into_iter().flat_map(Message::results);
-    answered_by(calls, results.map(|result| (&result.call, result)))
-}
-
-/// 用户自己敲的一段：`› ` + 粗体（和 `rig_niri` 的 look 同形）。
-fn workspace_user_lines(text: &str) -> Vec<Line<'static>> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 { "› " } else { "  " };
-            Line::from(vec![
-                Span::from(prefix).dim(),
-                Span::from(line.replace('\t', "    ")).bold(),
-            ])
-        })
-        .collect()
-}
-
-/// assistant 正文的 markdown 排版（未折行，折行归对话引擎）。
-fn workspace_reply_lines(
-    text: &str,
-    theme: &rig_tui::Theme,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    rig_tui::markdown::render(text, theme, Some(width))
-        .into_iter()
-        .map(|line| line.line().clone())
-        .collect()
-}
-
-/// 推理：dim + italic 的 markdown（和 `rig_niri` 的 look 同形）。
-fn workspace_reasoning_lines(
-    text: &str,
-    theme: &rig_tui::Theme,
-    width: u16,
-) -> Vec<Line<'static>> {
-    let style = Style::new().dim().italic();
-    workspace_reply_lines(text, theme, width)
-        .into_iter()
-        .map(|line| line.patch_style(style))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +552,14 @@ mod tests {
     //! 不建窗口、不渲染、不截图：`FramePlugin` 只算布局，`BatchPlugin` 只建行。
 
     use super::*;
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
     use bevy::text::FontSource;
+    use rig_core::message::{CallId, Message, ToolCall, ToolFunction, ToolName};
+    use rig_core::tool::{Tool, ToolContext};
+    use rig_ecs::prelude::{CallOf, Deliver, DeliveryMode, ForAgent, Partial, TurnOf};
+    use rig_ecs::tools::AppToolsExt;
+    use rig_harness::prelude::{Ask, ToolRequest};
     use rig_niri::FeathersSystems;
     use rig_niri::editor::SubmittedPrompts;
     use rig_niri::frame::{FramePlugin, FrameSize};
@@ -672,6 +568,45 @@ mod tests {
     use rig_niri::transcript::TranscriptFont;
     use rig_niri::workspaces::WorkspacesPlugin;
     use rig_tui::AppStatus;
+
+    /// 一个永不返回的工具：调它一次就一直是"在飞"的，测试要断言的就是这个状态。
+    struct NeverReturns;
+
+    #[derive(serde::Deserialize)]
+    struct NeverArgs {
+        #[serde(default)]
+        #[allow(dead_code)] // 只为让参数 schema 过得去：调用根本不看参数。
+        q: String,
+    }
+
+    impl Tool for NeverReturns {
+        const NAME: &'static str = "search_beta";
+        type Args = NeverArgs;
+        type Output = String;
+        type Error = std::io::Error;
+
+        fn description(&self) -> String {
+            "a tool whose call never returns, so the test keeps it in flight".to_owned()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } }
+            })
+        }
+
+        fn call(
+            &self,
+            _context: &mut ToolContext,
+            _args: Self::Args,
+        ) -> impl std::future::Future<Output = Result<Self::Output, Self::Error>> + Send {
+            async move {
+                std::future::pending::<()>().await;
+                Ok(String::new())
+            }
+        }
+    }
 
     /// 装真内核 + 视图数据层 + 2 个工作区（和生产的插件顺序一致），不建窗口。
     fn headless(count: usize) -> App {
@@ -836,5 +771,184 @@ mod tests {
         );
         assert!(global.contains("beta"), "切焦点后全局应是 1 号对话：{global:?}");
         assert!(!global.contains("alpha"), "切焦点后不能还显示旧对话：{global:?}");
+    }
+
+    #[test]
+    fn a_non_focused_workspace_shows_its_agents_live_content() {
+        let mut app = headless(2);
+        let (ws0, ws1, agent0, agent1) = two_workspaces(&mut app);
+
+        // 对话里已经落地的消息（两边各一条）。
+        app.world_mut()
+            .get_mut::<Conversation>(agent0)
+            .expect("agent 0 的对话")
+            .0
+            .push(Message::user("alpha 已完成"));
+        app.world_mut()
+            .get_mut::<Conversation>(agent1)
+            .expect("agent 1 的对话")
+            .0
+            .push(Message::user("beta 已完成"));
+
+        // 1 号工作区（非聚焦）：一个在飞的调用、一段流式正文、一个待回答的 Ask。
+        // 工具永不返回，所以内核会把它留在 `Running` 里，不结算成结果。
+        app.add_tool(NeverReturns);
+        app.world_mut().spawn((
+            ToolRequest {
+                call: ToolCall::new(
+                    CallId::from_wire("call_beta"),
+                    ToolFunction::new(
+                        ToolName::new("search_beta").expect("工具名非空"),
+                        serde_json::json!({ "q": "beta" }),
+                    ),
+                ),
+            },
+            ForAgent(agent1),
+        ));
+        let turn = app.world_mut().spawn(TurnOf(agent1)).id();
+        app.world_mut().spawn((
+            CallOf(turn),
+            Partial {
+                text: "beta 正在流式输出".to_owned(),
+                ..Default::default()
+            },
+        ));
+        app.world_mut().spawn((
+            Ask::new("keep beta?").choice("yes", "Yes"),
+            ForAgent(agent1),
+        ));
+        app.update();
+
+        // 非聚焦条带有自己的实时内容：以前这里只有已经落进对话的消息。
+        let text1 = panel_text(&workspace_rows(&app, ws1));
+        assert!(text1.contains("beta 已完成"), "非聚焦工作区要有自己的对话：{text1:?}");
+        assert!(
+            text1.contains("beta 正在流式输出"),
+            "非聚焦工作区要显示流式正文：{text1:?}"
+        );
+        assert!(
+            text1.contains("search_beta"),
+            "非聚焦工作区要显示在飞调用的标题：{text1:?}"
+        );
+        assert!(
+            text1.contains("running"),
+            "在飞的调用要画成 running（和聚焦条带同一个默认 look）：{text1:?}"
+        );
+        assert!(
+            text1.contains("keep beta?"),
+            "非聚焦工作区要显示待回答的 Ask：{text1:?}"
+        );
+
+        // 聚焦工作区（0 号）走真管线，行为和改动前一样：它不读 1 号的流式
+        // 正文/Ask，自己那条消息还在。
+        let text0 = panel_text(&workspace_rows(&app, ws0));
+        assert!(text0.contains("alpha 已完成"), "聚焦工作区显示自己的对话：{text0:?}");
+        assert!(
+            !text0.contains("beta 正在流式输出"),
+            "聚焦工作区不能串入别的 agent 的流式正文：{text0:?}"
+        );
+        assert!(
+            !text0.contains("keep beta?"),
+            "聚焦工作区不能串入别的 agent 的 Ask：{text0:?}"
+        );
+        let full_text = panel_text(&app.world().resource::<TranscriptRows>().0);
+        assert!(
+            full_text.contains("alpha 已完成"),
+            "真管线的整段行还是聚焦 agent 的：{full_text:?}"
+        );
+        assert!(
+            !full_text.contains("beta 正在流式输出"),
+            "真管线只读聚焦 agent 的流式正文：{full_text:?}"
+        );
+    }
+
+    // ---- 输入框 -> 当前聚焦工作区的 agent ----
+
+    /// 观察到的 `Deliver`。
+    #[derive(Resource, Default)]
+    struct Delivered(Vec<(Entity, String, DeliveryMode)>);
+
+    fn record_deliver(deliver: On<Deliver>, mut delivered: ResMut<Delivered>) {
+        delivered.0.push((
+            deliver.entity,
+            deliver.message.text().to_owned(),
+            deliver.message.mode,
+        ));
+    }
+
+    /// 视图输入层 + 真内核 + 工作区（和生产同插件顺序），不建窗口。
+    fn typing_headless(count: usize) -> App {
+        let mut app = headless(count);
+        app.add_plugins(rig_niri::editor::EditorPlugin);
+        // 输入行系统要的 `Theme` 在生产里由 `FeathersViewPlugin` 初始化。
+        app.init_resource::<rig_niri::theme::Theme>()
+            .add_message::<KeyboardInput>()
+            .init_resource::<Delivered>()
+            .add_observer(record_deliver);
+        app
+    }
+
+    fn key(app: &mut App, code: KeyCode, key: Key, text: Option<&str>) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: code,
+            logical_key: key,
+            state: ButtonState::Pressed,
+            text: text.map(|text| text.into()),
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    fn type_prompt(app: &mut App, text: &str) {
+        for character in text.chars() {
+            let typed = character.to_string();
+            key(
+                app,
+                KeyCode::KeyA, // 测试只关心字符，不关心物理键
+                Key::Character(typed.clone().into()),
+                Some(&typed),
+            );
+        }
+        key(app, KeyCode::Enter, Key::Enter, None);
+    }
+
+    #[test]
+    fn enter_sends_to_the_focused_workspaces_agent() {
+        let mut app = typing_headless(2);
+        let (ws0, ws1, agent0, agent1) = two_workspaces(&mut app);
+        assert_eq!(
+            app.world().resource::<ShownAgent>().0,
+            Some(agent0),
+            "默认聚焦 0 号工作区"
+        );
+        assert_eq!(
+            app.world().resource::<WorkspaceSet>().focused,
+            Some(ws0),
+            "先确认 F2 之前焦点在 0 号"
+        );
+
+        // F2：走演示按键 -> `focus_workspace_and_show`（真实焦点路径）。
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F2);
+        app.update();
+        assert_eq!(
+            app.world().resource::<WorkspaceSet>().focused,
+            Some(ws1),
+            "F2 应聚焦 1 号工作区"
+        );
+        assert_eq!(
+            app.world().resource::<ShownAgent>().0,
+            Some(agent1),
+            "切焦点后 `ShownAgent` 跟到 1 号工作区的 agent"
+        );
+
+        type_prompt(&mut app, "hello 1");
+        assert_eq!(
+            app.world().resource::<Delivered>().0,
+            [(agent1, "hello 1".to_owned(), DeliveryMode::Steer)],
+            "Enter 应送给当前聚焦工作区的 agent，而不是 0 号"
+        );
     }
 }

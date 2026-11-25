@@ -26,18 +26,25 @@
 ```rust
 /// 一个工作区 = 一个 agent 会话的完整界面 + 它在世界里的绝对位姿。
 pub struct Workspace {
-    pub session: SessionId,        // 来自 rig-harness，用于接真会话
+    pub session: u64,              // 会话 id 的占位（接真会话时换成 rig-harness 的类型）
     pub tree: layout::Node,        // 内部 niri 分裂树（Split/Leaf）
     pub pose: Transform,           // 绝对世界坐标（不是相对相机！）
     pub order: usize,              // niri 的工作区顺序（自动整理用）
 }
 
-/// 所有工作区。`focused` 决定可见性，不影响位置。
+/// 所有工作区。`focused` 决定内容写哪条，不决定位置。
 pub struct WorkspaceSet {
-    pub items: Vec<Workspace>,
-    pub focused: Option<SessionId>,
+    pub items: Vec<Entity>,        // 工作区实体（`Workspace` 是 Component）
+    pub focused: Option<Entity>,
 }
+
+/// 每个工作区自己的面板状态（挂在 `Workspace` 实体上）：
+/// `rows` / `roots` / `spawned` / `areas` 各一份，聚焦时与全局代理互换。
+pub struct WorkspacePanels { /* PanelRows, PanelRoots, PanelSpawned, HashMap<Entity, PanelArea> */ }
 ```
+
+（2026-11-25 复核：上面是 `rig_niri/src/workspaces.rs:79`–`:150` 的实际形状。旧版本这里写的是
+`session: SessionId`、`items: Vec<Workspace>`、`focused: Option<SessionId>`，与代码不符。）
 
 每个 `Leaf(PanelId)` 的几何 = `tree.rects(area)` 算出的帧内矩形 → 乘 `pose` 变成世界坐标。
 **面板不存位置**，位置永远由「树 + 位姿」推导。
@@ -74,21 +81,29 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 ## 5. 不变量（拿它们当测试）
 
 1. 新工作区出现 **不能** 改变已有工作区的位姿或尺寸（niri 第一原则）。
-2. 聚焦 / 取消聚焦 **不改变任何位姿**，只改可见性。
+2. 聚焦 / 取消聚焦 **不改变任何位姿、也不改任何 `Visibility`**，只决定"新内容写哪条"；
+   非聚焦工作区只是不再接受拖拽（抓取区域，`workspace_under_pointer`，`workspaces.rs:836`），
+   画面照常显示、点选照常。
 3. `arrange_workspaces` 之后：顺序 = `order`、间距一致、x/z 为 0、朝向一致。
-4. 工作区内部：`rects()` 的叶子面积之和 = 条带面积（已有 15 个测试保证）。
+4. 工作区内部：`rects()` 的叶子面积之和 = 条带面积（由 `layout.rs` 的测试保证，当前 24 个测试）。
 5. 相机在空间里任意移动，所有工作区位姿保持不变（世界坐标，不是相对相机）。
 6. 拖拽中其它工作区不动；拖拽结束位置被记住（不会自动弹回，除非调用整理）。
 
-## 6. 对现有代码的影响
+## 6. 对现有代码的影响（2026-11-25 复核：都已落地）
 
-- `rig_niri` → **`rig_niri`**（改名）：这个 crate 就是"条带内部那套"，名字要对得上。
-- `PanelRows`/`PanelRoots`/`FrameTree` 现在是全局单例 → 要变成 **每个工作区一份**（否则两条条带
-  共用一个转写）。这是第 1 个要做的结构改动。
-- `Placement::Over`（picker/确认/补全浮层）全部删掉，改成条带里的 tile。
-- 应用层 `rig_harness_in_3d` 不再"装一个界面"，而是"装一个 `WorkspaceSet` + 相机 + 导航手势"。
+- crate 名已定 `rig_niri`，不再改名。
+- `PanelRows`/`PanelRoots`/`FrameTree` 已从全局单例改成 **每个工作区一份**：权威状态在
+  `WorkspacePanels`（`workspaces.rs:119`），聚焦时与全局代理互换（`apply_focus` `:321`）。
+- `Placement::Over`/`Within` 已全部删掉（`grep -r 'Placement::Over\|Placement::Within' rig_niri/src`
+  为空），picker/确认/补全都是条带里的 tile；`Placement` 现在只剩 `Tree`/`Rest`。
+- 应用层 `rig_harness_in_3d` 现在是"装一个 `WorkspaceSet` + 相机 + 导航手势"
+  （`workspaces_demo.rs`，F1–F8 聚焦、F10 整理）。
 
 ## 7. 分批（每批都能单独验收）
+
+> 2026-11-25 复核：五批均已完成（`WorkspacePanels` = 批 2，四个操作 = 批 3，
+> picker/确认 tile = 批 4，`workspaces_demo` 的 F1–F8/F10 = 批 5）。下表保留当时的分批与
+> 验收标准；“255 个测试”是当时的基线，现在 `rig_niri` 是 317。
 
 | 批 | 内容 | 验收 |
 |---|---|---|
@@ -98,7 +113,7 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 | 4 | 删 `Placement::Over`，picker/补全/确认 tile 化 | 无浮层：`grep -r 'Placement::Over' src` 为空 |
 | 5 | 应用层：3 个假工作区 + 拖拽/整理/聚焦按键 | 跑起来能拖、能整理、能聚焦 |
 
-## 8. 条带里没有"非 tile"的东西（进行中）
+## 8. 条带里没有"非 tile"的东西（已完成）
 
 niri 的设计原则（`Development:-Design-Principles.md`）：
 > Fullscreen windows are a normal part of the scrolling layout. They aren't on some

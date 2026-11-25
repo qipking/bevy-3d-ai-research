@@ -15,6 +15,11 @@
 //! 独立的 [`PanelId::Confirm`] tile（见 [`confirm_panel_rows`]），和转写互不
 //! 挤占。这样待确认的操作既不会跟着转写滚走，也不会因为转写滚动被裁掉。
 //!
+//! 没有自己管线的工作区（多工作区前端的非聚焦条带）用两个公开函数拿同样的内容：
+//! [`dialogue_batch`] 把对话历史拼成批，[`live_additions`] 补上在飞调用、流式
+//! 正文/推理和待回答的 Ask —— 后者把 Ask 当普通行画在同一块面板里（那些条带
+//! 没有自己的确认 tile 在跑），并按 agent 过滤，两个条带的实时内容不会串台。
+//!
 //! 以前这里写死过一句中文"回复"，由每两帧吐一个字的假流式驱动 —— 已经删掉：
 //! 正文现在只来自真实的 `Partial`（运行中的流）或对话里的 assistant 消息。
 
@@ -62,6 +67,13 @@ pub struct CallFact {
     pub parent: Option<EffectId>,
     /// 它属于哪个 agent（结算时的名字，子 agent 可能已经没了）。
     pub agent: Option<String>,
+    /// 它的所有者 agent **实体**（`ForAgent` 指的那个），聚焦条带按它过滤。
+    ///
+    /// `agent` 只是显示名；`owner` 让建批能判断"这条是不是 shown agent 的
+    /// 根"，以及子 agent 的调用该挂在谁下面。`None` = 效果本来就没有
+    /// `ForAgent`（app 自己的效应），或者更早的历史里没记 owner —— 建批时
+    /// 按"没主的根"处理，任何条带都画（见 [`CallTree::scope`]）。
+    pub owner: Option<Entity>,
     /// 它在"对话之外的调用"里的固定序号（`RenderKey::Streaming` 的位置）。
     pub ordinal: usize,
     pub call: ToolCall,
@@ -196,11 +208,50 @@ struct CallTree {
 impl CallTree {
     /// 记下效应 `effect`（父是 `parent`）作为调用长什么样。
     fn add(&mut self, effect: EffectId, parent: Option<EffectId>, call: ChildCall) {
+        self.link(effect, parent);
+        self.nodes.insert(effect, call);
+    }
+
+    /// 只记父子关系（[`live_additions`] 不画调用树，但要用同一套"根 + 后代"
+    /// 过滤，见 [`CallTree::scope`]）。
+    fn link(&mut self, effect: EffectId, parent: Option<EffectId>) {
         if let Some(parent) = parent.filter(|parent| *parent != effect) {
             self.parents.insert(effect, parent);
             self.children.entry(parent).or_default().push(effect);
         }
-        self.nodes.insert(effect, call);
+    }
+
+    /// `roots` 连同它们在树里的全部后代（含根）。
+    ///
+    /// 聚焦条带的根 = owner 是 shown agent 的效应（或 owner 缺失的老记录）；
+    /// 子 agent 的调用不在根里，但会作为发起它的调用的后代被收进来。
+    fn scope(&self, roots: impl IntoIterator<Item = EffectId>) -> HashSet<EffectId> {
+        let mut visible = HashSet::new();
+        let mut pending: Vec<EffectId> = roots.into_iter().collect();
+        while let Some(effect) = pending.pop() {
+            if !visible.insert(effect) {
+                continue;
+            }
+            if let Some(children) = self.children.get(&effect) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        visible
+    }
+
+    /// `effect` 要不要在本条带单独占一张卡。
+    ///
+    /// 范围里的后代不占：它们的行已经由父卡片的 `children` 画了
+    /// （[`child_calls_look`]），再插一张就是画两遍。
+    /// `scope` 为 `None` = 没有聚焦视图（没有 `ShownAgent`），退回旧行为：
+    /// 每个调用一张卡，不做树形去重。
+    fn is_card(&self, scope: Option<&HashSet<EffectId>>, effect: EffectId) -> bool {
+        let Some(scope) = scope else { return true };
+        scope.contains(&effect)
+            && self
+                .parents
+                .get(&effect)
+                .is_none_or(|parent| !scope.contains(parent))
     }
 
     /// `parent` 下面的调用，按效应 id 的顺序、各带自己的深度（上游
@@ -237,6 +288,22 @@ impl CallTree {
             }
         }
     }
+}
+
+/// `owner`（`None` = 没有 owner）在 `shown` 的条带里可不可见。
+///
+/// 没有 `ShownAgent`（`shown == None`）= 不过滤：无视图的测试/导出路径保留
+/// 全量。有视图时，shown 自己的和没有 owner 的（app 级效应 / 更早的历史）
+/// 可见，别的 agent 的不可见 —— 聚焦建批、非聚焦条带、确认面板共用这一条口径。
+fn focused_visible(shown: Option<Entity>, owner: Option<Entity>) -> bool {
+    shown.is_none_or(|shown| owner.is_none_or(|owner| owner == shown))
+}
+
+/// 这条调用是不是 `shown` 的根：owner 就是它，或者更早的历史里没有 owner。
+///
+/// 没有 shown agent（`None`）时不做过滤，这个判断不会被用到。
+fn is_root_of(shown: Option<Entity>, owner: Option<Entity>) -> bool {
+    shown.is_some_and(|shown| focused_visible(Some(shown), owner))
 }
 
 /// 建批要读的内核数据（分组，免得系统参数太多）。
@@ -350,6 +417,7 @@ fn record_calls(
         let took = started
             .and_then(|started| started.at.elapsed().ok())
             .filter(|took| !took.is_zero());
+        let owner = agent.map(|ForAgent(agent)| *agent);
         let agent = agent
             .and_then(|ForAgent(agent)| names.get(*agent).ok())
             .map(|name| name.as_str().to_owned());
@@ -357,6 +425,7 @@ fn record_calls(
             effect: effect.id(),
             parent: effect.parent,
             agent,
+            owner,
             ordinal: ordinals.of(effect.id()),
             call: request.call.clone(),
             result,
@@ -382,7 +451,10 @@ struct LiveCall {
     effect: EffectId,
     parent: Option<EffectId>,
     call: ToolCall,
+    /// `ForAgent` 的显示名（子调用的 `agent · tool` 要用）。
     agent: Option<String>,
+    /// `ForAgent` 的实体（聚焦条带按它判断谁是谁的根）。
+    owner: Option<Entity>,
     state: CallState,
     result: Option<ToolResult>,
     output: Option<String>,
@@ -390,22 +462,20 @@ struct LiveCall {
 }
 
 /// 还没结算的调用的状态（和上游 `render::CallStates` 同一套判断顺序）。
+///
+/// `hold_name` 给"在等谁"的那个名字：真管线从 `Name` 查询里取，
+/// [`live_additions`] 直接读同一个 `Name` 组件 —— 两条路必须说同一句话。
 fn live_state(
     outcome: Option<&Outcome>,
     running: Option<&Running>,
     holds: Option<&Holds>,
     progress: Option<&ToolProgress>,
-    names: &Query<&Name>,
+    hold_name: impl Fn(Entity) -> Option<String>,
 ) -> CallState {
     if let Some(holds) = holds.filter(|holds| holds.len() > 0) {
         let reasons = holds
             .iter()
-            .map(|hold| {
-                names
-                    .get(hold)
-                    .map(|name| name.as_str().to_owned())
-                    .unwrap_or_else(|_| "unnamed hold".to_owned())
-            })
+            .map(|hold| hold_name(hold).unwrap_or_else(|| "unnamed hold".to_owned()))
             .collect();
         return CallState::Held(reasons);
     }
@@ -444,7 +514,10 @@ pub fn rebuild_batch(
         batch.width = cols;
     }
     batch.pane = roots.entity(PanelId::Transcript);
-    batch.agent = turn.agent();
+    // 聚焦条带只画 shown agent 自己那棵树；没有 shown agent（无视图的
+    // 测试/导出路径）就退回全量，见下面的 `scope`。
+    let shown = turn.agent();
+    batch.agent = shown;
     let theme = RTheme::default();
     dialogue.clear();
 
@@ -453,6 +526,7 @@ pub fn rebuild_batch(
     for (request, effect, outcome, running, holds, agent, progress, output) in
         kernel.requests.iter()
     {
+        let owner = agent.map(|ForAgent(agent)| *agent);
         let agent = agent
             .and_then(|ForAgent(agent)| kernel.names.get(*agent).ok())
             .map(|name| name.as_str().to_owned());
@@ -461,7 +535,14 @@ pub fn rebuild_batch(
             parent: effect.parent,
             call: request.call.clone(),
             agent,
-            state: live_state(outcome, running, holds, progress, &kernel.names),
+            owner,
+            state: live_state(outcome, running, holds, progress, |hold| {
+                kernel
+                    .names
+                    .get(hold)
+                    .ok()
+                    .map(|name| name.as_str().to_owned())
+            }),
             result: outcome.map(|outcome| tool_result_of(outcome, &request.call)),
             output: output.map(CallOutput::text).filter(|text| !text.is_empty()),
             ordinal: ordinals.of(effect.id()),
@@ -470,7 +551,9 @@ pub fn rebuild_batch(
     live.sort_by_key(|call| call.effect);
 
     // 2) 调用树：结算过的 + 还在跑的（子 agent 的调用由此挂到发起它的调用下）。
+    //    仍然收全量：父卡片要拿到自己的孩子；过滤留到 `scope`/`is_card`。
     let mut tree = CallTree::default();
+    let mut roots: Vec<EffectId> = Vec::new();
     for fact in &history.0 {
         tree.add(
             fact.effect,
@@ -485,6 +568,9 @@ pub fn rebuild_batch(
                 answer: Some(tool_result_text(&fact.result)),
             },
         );
+        if is_root_of(shown, fact.owner) {
+            roots.push(fact.effect);
+        }
     }
     for call in &live {
         tree.add(
@@ -500,7 +586,13 @@ pub fn rebuild_batch(
                 answer: call.result.as_ref().map(tool_result_text),
             },
         );
+        if is_root_of(shown, call.owner) {
+            roots.push(call.effect);
+        }
     }
+    // 可见范围：shown agent 的根 + 全部后代（含子 agent 的调用）。
+    // `None` = 没有 shown agent：不过滤，退回旧行为。
+    let scope = shown.map(|_| tree.scope(roots));
 
     // 3) 对话：assistant 正文/推理进文字块，调用/entry/内容块/aside 进 batch。
     if let Some(conversation) = turn.conversation() {
@@ -530,9 +622,11 @@ pub fn rebuild_batch(
 
     // 4) 对话之外的调用：结算历史（结算了但还没落进对话）+ 还在跑的效应。
     //    上游用 `RenderKey::Streaming(n)` 表示"还没进任何消息的调用"。
+    //    聚焦条带里只画 shown agent 那棵树的根：后代的行由父卡片的
+    //    `children` 画（`child_calls_look`），这里不再单独插一张卡。
     let mut rendered: HashSet<CallId> = dialogue.calls.clone();
     for fact in &history.0 {
-        if !rendered.insert(fact.call.id.clone()) {
+        if !tree.is_card(scope.as_ref(), fact.effect) || !rendered.insert(fact.call.id.clone()) {
             continue;
         }
         let call = ToolRender {
@@ -557,7 +651,7 @@ pub fn rebuild_batch(
         );
     }
     for call in &live {
-        if !rendered.insert(call.call.id.clone()) {
+        if !tree.is_card(scope.as_ref(), call.effect) || !rendered.insert(call.call.id.clone()) {
             continue;
         }
         // TODO(streaming): 模型还在流参数、调用效应还没出现时，上游会先画一个
@@ -617,6 +711,45 @@ fn default_lines(input: &RenderInput, theme: &RTheme) -> Vec<LookLine> {
 // ---------------------------------------------------------------------------
 // 对话 -> 请求 / 文字块（纯函数，测试直接喂构造的 `Conversation`）
 // ---------------------------------------------------------------------------
+
+/// 一个 agent 的**对话历史** -> 这一帧的 `RenderBatch` + 没有 `RenderKey` 的文字块。
+///
+/// 这是 [`conversation_frame`] 的公开出口，给**没有自己管线**的工作区用（见
+/// `rig_harness_in_3d::workspaces_demo` 的非聚焦条带）：对话里已经落地的部分
+/// （用户请求、assistant 正文/推理、tool call、送达的 entry、内容块、aside）
+/// 和真管线画得一模一样 —— 请求先填上没 look 时的默认行（`default_lines`），
+/// look 调度不跑（非聚焦条带不该有两套 look 状态），调用树也没有。
+///
+/// 还没落进对话的东西（在飞的调用、流式正文/推理、待回答的 Ask）不在这里，
+/// 由 [`live_additions`] 补在行流后面。`width` 是文字列数。
+pub fn dialogue_batch(
+    conversation: &Conversation,
+    agent: Entity,
+    width: u16,
+) -> (RenderBatch, Vec<(TextId, Vec<Line<'static>>)>) {
+    let theme = RTheme::default();
+    let frame = conversation_frame(
+        conversation,
+        &CallHistory::default(),
+        &CallTree::default(),
+        &theme,
+        width,
+    );
+    let mut batch = RenderBatch {
+        pane: None,
+        agent: Some(agent),
+        width,
+        requests: HashMap::new(),
+    };
+    for (key, input) in frame.requests {
+        let output = RenderOutput {
+            lines: default_lines(&input, &theme),
+            decorations: Vec::new(),
+        };
+        batch.requests.insert(key, RenderRequest { input, output });
+    }
+    (batch, frame.text)
+}
 
 /// 从对话建出转写要的请求、文字块和 aside 落点。
 ///
@@ -1230,10 +1363,15 @@ fn push_ask_block(
 /// 多取一个 `Effect` 作为 FIFO 序号；宽度取树给 Confirm 叶子的文字列数，
 /// 根还不存在时用 97 兜底（和 `editor::editor_rows` 一致）。只装
 /// `BatchPlugin` 的测试 App 没有 `PanelRows`，这时什么也不做。
+///
+/// **按 shown agent 过滤**（[`focused_visible`]）：多会话时别的 agent 的
+/// 问题不能出现在本工作区的确认 tile 里 —— 点选项就是替它作答。没有
+/// `ShownAgent` 时退回全量（无视图的测试/导出路径）。
 pub fn confirm_panel_rows(
-    asks: Query<(Entity, &Ask, Option<&Effect>), Without<Outcome>>,
+    asks: Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
     roots: Option<Res<PanelRoots>>,
     areas: Option<Res<PanelAreas>>,
+    turn: ShownTurn,
     mut panels: Option<ResMut<PanelRows>>,
 ) {
     let Some(panels) = panels.as_deref_mut() else {
@@ -1244,12 +1382,17 @@ pub fn confirm_panel_rows(
         .and_then(|roots| roots.entity(PanelId::Confirm))
         .and_then(|root| areas.as_deref().and_then(|areas| areas.get(root)))
         .map_or(97, |area| area.cols.max(1));
+    let shown = turn.agent();
     let pending: Vec<PendingAsk<'_>> = asks
         .iter()
-        .map(|(entity, ask, effect)| PendingAsk {
+        .filter(|(_, _, _, for_agent)| {
+            focused_visible(shown, for_agent.map(|ForAgent(owner)| *owner))
+        })
+        .map(|(entity, ask, effect, _)| PendingAsk {
             entity,
             // 还没登记成效应的 Ask（正常一帧内就有）排最后，但不丢掉：
-            // 确认面板显示的是"世界里所有没回答的 Ask"，不只是有效应 id 的。
+            // 确认面板显示的是"这个 agent 的、所有没回答的 Ask"，不只是有
+            // 效应 id 的。
             effect: effect.map(Effect::id).unwrap_or(EffectId::from_raw(u64::MAX)),
             ask,
         })
@@ -1282,6 +1425,254 @@ fn push_ask_rows(
             row,
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// 实时内容（没有自己管线的工作区）
+// ---------------------------------------------------------------------------
+
+/// 一个 agent 的**实时**内容：在飞的工具调用、正在流的正文/推理、待回答的 Ask。
+///
+/// 聚焦工作区从 [`rebuild_batch`] 的整条管线拿这些（活效应 + 调用树 + look 调度
+/// + 流式 `Partial`）；没有自己管线的工作区（`rig_harness_in_3d::workspaces_demo`
+/// 的非聚焦条带）就调这个函数直接读内核，把结果**接在** [`dialogue_batch`] 的
+/// 行流后面。顺序和真管线一致：调用（按内核效应 id，先来先显示）→ 流式推理
+/// → 流式正文 → 待回答的 Ask。
+///
+/// * 调用：`ToolRender::default_lines`（对话之外的调用在真管线里也走这个默认
+///   画法），状态用 [`live_state`] 的同一套判断 —— running / held / failed /
+///   done 的说法和聚焦条带一字不差；不跑 look 调度，也不画调用树（那要 look），
+///   所以只画本 agent 树的**根**：子 agent 的调用挂在父卡片下的那些不在这里
+///   单独占一张卡（真管线由 `child_calls_look` 画）。已结算但还没落进对话的
+///   调用（[`CallHistory`]）也画，条件和 [`rebuild_batch`] 第 4 步一样：不在
+///   对话里、是这棵树的根；行 key 和它在飞时相同（`tool:<effect>`），结算时
+///   原地换状态，不会先消失再出现。owner 的口径和聚焦管线一致
+///   （[`focused_visible`]）：没有 `ForAgent` 的调用在两条条带里都可见；
+/// * 正文/推理：直接复用 [`reply_lines`] / [`reasoning_lines`]，按 `width` 折行
+///   （[`wrap_lines`]，和转写同一个折行器）；
+/// * Ask：复用 [`confirm_keyed_rows`]（FIFO 仍按内核效应 id），只取本 agent
+///   的（没有 `ForAgent` 的按无主处理，和确认面板同一口径）；`Row::choice`
+///   原样保留，点击语义和确认面板一样。
+///
+/// 已经落进对话的调用不会重复画（真管线里的 `rendered` 集合做同一件事）。
+pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<KeyedRow> {
+    let theme = RTheme::default();
+    let mut rows: Vec<KeyedRow> = Vec::new();
+
+    /// 一个还没结算的调用：建树只用到效应 id / 父 / owner，画卡用其余字段。
+    struct Live {
+        effect: EffectId,
+        parent: Option<EffectId>,
+        owner: Option<Entity>,
+        call: ToolCall,
+        result: Option<ToolResult>,
+        state: CallState,
+    }
+
+    // 1) 在飞的调用：还没结算的 `ToolRequest`。收全量（别的 agent 的也收）才能
+    //    把父子关系接起来；画的时候只画本 agent 那棵树的根。
+    let known = conversation_calls(world, agent);
+    let mut live: Vec<Live> = Vec::new();
+    {
+        let mut requests = world.query_filtered::<
+            (
+                &ToolRequest,
+                &Effect,
+                Option<&Outcome>,
+                Option<&Running>,
+                Option<&Holds>,
+                Option<&ToolProgress>,
+                Option<&ForAgent>,
+            ),
+            Without<Settled>,
+        >();
+        // 同一个 world 的两次共享借用：查询请求 + 在闭包里读持有者的名字。
+        let shared: &World = world;
+        for (request, effect, outcome, running, holds, progress, for_agent) in
+            requests.iter(shared)
+        {
+            live.push(Live {
+                effect: effect.id(),
+                parent: effect.parent,
+                owner: for_agent.map(|ForAgent(owner)| *owner),
+                call: request.call.clone(),
+                result: outcome.map(|outcome| tool_result_of(outcome, &request.call)),
+                state: live_state(outcome, running, holds, progress, |hold| {
+                    shared
+                        .get::<Name>(hold)
+                        .map(|name| name.as_str().to_owned())
+                }),
+            });
+        }
+    }
+    live.sort_by_key(|call| call.effect);
+
+    // 2) 调用树：实时 + 已结算（`CallHistory`）都接进来，才认得出谁是根、
+    //    谁挂在父卡片下。仍然收全量（别的 agent 的也收），过滤靠 `is_card`。
+    //    历史只借两次、不整段克隆（每帧每个非聚焦条带都会调这个函数）。
+    let mut tree = CallTree::default();
+    let mut roots: Vec<EffectId> = Vec::new();
+    for call in &live {
+        // 对话里已经有的调用也接进树：它下面的实时子调用不能因此升成根。
+        tree.link(call.effect, call.parent);
+        if focused_visible(Some(agent), call.owner) {
+            roots.push(call.effect);
+        }
+    }
+    if let Some(history) = world.get_resource::<CallHistory>() {
+        for fact in &history.0 {
+            tree.link(fact.effect, fact.parent);
+            if focused_visible(Some(agent), fact.owner) {
+                roots.push(fact.effect);
+            }
+        }
+    }
+    let scope = tree.scope(roots);
+
+    // 3) 根卡片：已结算的在前（和 `rebuild_batch` 第 4 步的插入顺序一致）再按
+    //    效应 id 排，先来先显示。已结算但还没落进对话的也画：不画的话，调用
+    //    结算到对话提交之间会在条带上先消失再出现（闪一下）；行 key 在飞时和
+    //    结算后都是 `tool:<effect>`，结算只原地换状态。子调用只出现在父卡片的
+    //    children 里（非聚焦条带没有 look 画它，不重复占卡）。
+    let mut cards: Vec<(EffectId, ToolRender)> = Vec::new();
+    let mut rendered: HashSet<CallId> = known;
+    if let Some(history) = world.get_resource::<CallHistory>() {
+        for fact in &history.0 {
+            if !tree.is_card(Some(&scope), fact.effect)
+                || !rendered.insert(fact.call.id.clone())
+            {
+                continue;
+            }
+            let mut render =
+                ToolRender::new(fact.call.clone(), Some(fact.result.clone()), CallState::Done);
+            render.took = fact.took;
+            render.item = Some(CallItem::Streaming(fact.ordinal));
+            cards.push((fact.effect, render));
+        }
+    }
+    for call in &live {
+        if !tree.is_card(Some(&scope), call.effect) || !rendered.insert(call.call.id.clone()) {
+            continue;
+        }
+        cards.push((
+            call.effect,
+            ToolRender::new(call.call.clone(), call.result.clone(), call.state.clone()),
+        ));
+    }
+    cards.sort_by_key(|(effect, _)| *effect);
+    for (effect, render) in cards {
+        push_live_block(
+            &mut rows,
+            &format!("tool:{}", effect.as_u64()),
+            render.default_lines().iter().map(LookLine::colored).collect(),
+            width,
+        );
+    }
+
+    // 4) 正在流的推理/正文：运行中 turn 的 `Partial`，和真管线同一条路径。
+    if let Some(partial) = agent_partial(world, agent) {
+        // 回复已经落进对话的那一帧，流式块让位，别画两份（真管线用
+        // `dialogue.has_reply` 做同一件事）。
+        let in_dialogue = !partial.text.is_empty()
+            && world.get::<Conversation>(agent).is_some_and(|conversation| {
+                conversation_has_text(conversation, &partial.text)
+            });
+        if !in_dialogue && !partial.reasoning.is_empty() {
+            push_live_block(
+                &mut rows,
+                "streaming-reasoning",
+                reasoning_lines(&partial.reasoning, width, &theme),
+                width,
+            );
+        }
+        if !in_dialogue && !partial.text.is_empty() {
+            // 推理和正文之间空一行（和 `collect_rows` 的流式块同形）。
+            let mut lines = vec![Line::default()];
+            lines.extend(reply_lines(&partial.text, width, &theme));
+            push_live_block(&mut rows, "streaming-reply", lines, width);
+        }
+    }
+
+    // 5) 待回答的 Ask：只取本 agent 的（无主 = 可见，和确认面板同一口径），
+    //    FIFO 仍由内核效应 id 决定。
+    let mut asks: Vec<(Entity, EffectId, Ask)> = Vec::new();
+    {
+        let mut pending = world.query_filtered::<
+            (Entity, &Ask, Option<&Effect>, Option<&ForAgent>),
+            Without<Outcome>,
+        >();
+        for (entity, ask, effect, for_agent) in pending.iter(world) {
+            if !focused_visible(Some(agent), for_agent.map(|ForAgent(owner)| *owner)) {
+                continue;
+            }
+            asks.push((
+                entity,
+                // 还没登记成效应的 Ask（正常一帧内就有）排最后，但不丢掉。
+                effect.map(Effect::id).unwrap_or(EffectId::from_raw(u64::MAX)),
+                ask.clone(),
+            ));
+        }
+    }
+    let pending: Vec<PendingAsk<'_>> = asks
+        .iter()
+        .map(|(entity, effect, ask)| PendingAsk {
+            entity: *entity,
+            effect: *effect,
+            ask,
+        })
+        .collect();
+    rows.extend(confirm_keyed_rows(&pending, width));
+    rows
+}
+
+/// 对话里已经有的调用 id：实时块不再重复画它们（真管线里的 `rendered`）。
+fn conversation_calls(world: &World, agent: Entity) -> HashSet<CallId> {
+    let Some(conversation) = world.get::<Conversation>(agent) else {
+        return HashSet::new();
+    };
+    let mut known = HashSet::new();
+    for entry in conversation.entries() {
+        if let Message::Assistant(assistant) = entry.message {
+            known.extend(assistant.tool_calls().map(|call| call.id.clone()));
+        }
+    }
+    known
+}
+
+/// agent 正在流式输出的回复：运行中 turn 的 `Partial`。
+///
+/// 和 [`ShownTurn::partial`] 同一条路径（`ActiveTurn` → `Calls` → 最后一个
+/// 带 `Partial` 的调用），两条条带对"正在流的是哪段"看法一致。
+fn agent_partial<'w>(world: &'w World, agent: Entity) -> Option<&'w Partial> {
+    let turn = world.get::<ActiveTurn>(agent)?.turn();
+    let calls = world.get::<Calls>(turn)?;
+    calls
+        .iter()
+        .filter_map(|call| world.get::<Partial>(call))
+        .next_back()
+}
+
+/// 把一块行按 `width` 折好，追加成带稳定 key 的 [`KeyedRow`]。
+fn push_live_block(
+    rows: &mut Vec<KeyedRow>,
+    part: &str,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) {
+    for (index, row) in wrap_lines(&lines, width).into_iter().enumerate() {
+        rows.push(KeyedRow {
+            key: live_key(part, index),
+            hash: row_hash(&row),
+            row,
+        });
+    }
+}
+
+/// 实时行的 key：0x4000 段避开引擎按位置发的 key（最高位 0）和 Ask 行
+/// （0x8000 段）；`part` 带效应 id / 种类，同一块内容每帧是同一个 key，
+/// 面板的增量 diff 才能原地改行。
+fn live_key(part: &str, index: usize) -> u64 {
+    0x4000_0000_0000_0000 | (key_of(&[part, &index.to_string()]) & 0x3FFF_FFFF_FFFF_FFFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,6 +2240,74 @@ mod tests {
             .join("\n")
     }
 
+    /// 一条聚焦条带的 App：`shown` 有对话，`ShownAgent` 指向它。
+    fn focused_app() -> (App, Entity) {
+        let mut app = headless_app();
+        let shown = app
+            .world_mut()
+            .spawn(Conversation(talk::Conversation::new()))
+            .id();
+        app.insert_resource(ShownAgent(Some(shown)));
+        (app, shown)
+    }
+
+    /// 直接跑一次 [`rebuild_batch`]（不跑内核的其它系统）。
+    fn rebuild_now(app: &mut App) {
+        use bevy::ecs::system::RunSystemOnce;
+
+        app.world_mut()
+            .run_system_once(rebuild_batch)
+            .expect("建批系统要能跑");
+    }
+
+    /// 一条结算过的调用事实（直接喂 `CallHistory`，绕开内核的结算）。
+    fn settled_fact(
+        effect: u64,
+        parent: Option<u64>,
+        owner: Option<Entity>,
+        ordinal: usize,
+        call: ToolCall,
+    ) -> CallFact {
+        let result = ToolResult {
+            call: call.id.clone(),
+            name: call.function.name.clone(),
+            content: vec![ToolResultContent::Text(Text::new(format!(
+                "{} result",
+                call.function.name
+            )))],
+            is_error: false,
+        };
+        CallFact {
+            effect: EffectId::from_raw(effect),
+            parent: parent.map(EffectId::from_raw),
+            // `agent` 只是显示名；过滤看 `owner`。
+            agent: owner.map(|_| "owner".to_owned()),
+            owner,
+            ordinal,
+            call,
+            result,
+            took: None,
+        }
+    }
+
+    /// 批里每张顶层 `Streaming` 卡：序号、工具名、父卡片上的子调用名。
+    fn streaming_cards(batch: &RenderBatch) -> Vec<(usize, String, Vec<String>)> {
+        let mut cards: Vec<_> = batch
+            .requests
+            .iter()
+            .filter_map(|(key, request)| match (key, &request.input) {
+                (RenderKey::Streaming(at), RenderInput::Tool(tool)) => Some((
+                    *at,
+                    tool.call.function.name.as_str().to_owned(),
+                    tool.children.iter().map(|child| child.name.clone()).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        cards.sort_by_key(|(at, ..)| *at);
+        cards
+    }
+
     #[test]
     fn a_headless_app_draws_a_live_tool_call() {
         use rig_ecs::spawn::spawn_root;
@@ -1918,6 +2377,283 @@ mod tests {
         assert_eq!(ordinals.of(second), 1);
         assert_eq!(ordinals.of(first), 0, "同一个效应每次都要同一个位置");
         assert_eq!(ordinals.of(EffectId::from_raw(8)), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // 聚焦条带只画 shown agent 自己的调用树
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_focused_batch_draws_only_the_shown_agents_calls() {
+        let (mut app, shown) = focused_app();
+        let other = app.world_mut().spawn_empty().id();
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_shown_live", "shown_live"),
+            },
+            ForAgent(shown),
+        ));
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_other_live", "other_live"),
+            },
+            ForAgent(other),
+        ));
+        app.world_mut()
+            .resource_mut::<CallHistory>()
+            .0
+            .extend([
+                settled_fact(
+                    100,
+                    None,
+                    Some(shown),
+                    50,
+                    named_call("call_shown_done", "shown_done"),
+                ),
+                settled_fact(
+                    101,
+                    None,
+                    Some(other),
+                    51,
+                    named_call("call_other_done", "other_done"),
+                ),
+            ]);
+        rebuild_now(&mut app);
+
+        let cards = streaming_cards(app.world().resource::<RenderBatch>());
+        let names: Vec<&str> = cards.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["shown_live", "shown_done"],
+            "聚焦条带只画 shown agent 的在飞 + 结算调用：{cards:?}"
+        );
+    }
+
+    #[test]
+    fn a_subagent_call_hangs_under_its_parent_and_gets_no_card_of_its_own() {
+        let (mut app, shown) = focused_app();
+        let helper = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<CallHistory>()
+            .0
+            .extend([
+                settled_fact(
+                    10,
+                    None,
+                    Some(shown),
+                    50,
+                    named_call("call_settled_parent", "settled_parent"),
+                ),
+                settled_fact(
+                    11,
+                    Some(10),
+                    Some(helper),
+                    51,
+                    named_call("call_settled_child", "settled_child"),
+                ),
+            ]);
+        let live_parent = app
+            .world_mut()
+            .spawn((
+                ToolRequest {
+                    call: named_call("call_live_parent", "live_parent"),
+                },
+                ForAgent(shown),
+            ))
+            .id();
+        let parent_effect = app
+            .world()
+            .get::<Effect>(live_parent)
+            .expect("活调用要有自己的效应")
+            .id();
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_live_child", "live_child"),
+            },
+            Effect::with_parent_id(Some(parent_effect)),
+            ForAgent(helper),
+        ));
+        rebuild_now(&mut app);
+
+        let cards = streaming_cards(app.world().resource::<RenderBatch>());
+        let names: Vec<&str> = cards.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(names.len(), 2, "只该有父调用两张卡：{cards:?}");
+        assert!(names.contains(&"settled_parent"), "{cards:?}");
+        assert!(names.contains(&"live_parent"), "{cards:?}");
+        assert!(!names.contains(&"settled_child"), "子调用不能再占一张卡：{cards:?}");
+        assert!(!names.contains(&"live_child"), "活的子调用也不能再占一张卡：{cards:?}");
+
+        let children_of = |name: &str| {
+            cards
+                .iter()
+                .find(|(_, card, _)| card == name)
+                .map(|(_, _, children)| children.clone())
+                .unwrap_or_else(|| panic!("批里没有 {name} 的卡：{cards:?}"))
+        };
+        assert_eq!(
+            children_of("settled_parent"),
+            vec!["settled_child".to_owned()],
+            "结算过的子 agent 调用挂在父卡片的 children 里"
+        );
+        assert_eq!(
+            children_of("live_parent"),
+            vec!["live_child".to_owned()],
+            "还在跑的子 agent 调用也挂在父卡片的 children 里"
+        );
+    }
+
+    #[test]
+    fn another_agents_call_tree_does_not_leak_into_the_focused_strip() {
+        let (mut app, _shown) = focused_app();
+        let other = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<CallHistory>()
+            .0
+            .extend([
+                settled_fact(
+                    20,
+                    None,
+                    Some(other),
+                    50,
+                    named_call("call_other_parent", "other_parent"),
+                ),
+                settled_fact(
+                    21,
+                    Some(20),
+                    Some(other),
+                    51,
+                    named_call("call_other_child", "other_child"),
+                ),
+            ]);
+        let live_parent = app
+            .world_mut()
+            .spawn((
+                ToolRequest {
+                    call: named_call("call_other_live_parent", "other_live_parent"),
+                },
+                ForAgent(other),
+            ))
+            .id();
+        let parent_effect = app
+            .world()
+            .get::<Effect>(live_parent)
+            .expect("活调用要有自己的效应")
+            .id();
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_other_live_child", "other_live_child"),
+            },
+            Effect::with_parent_id(Some(parent_effect)),
+            ForAgent(other),
+        ));
+        rebuild_now(&mut app);
+
+        let batch = app.world().resource::<RenderBatch>();
+        assert!(
+            batch.requests.is_empty(),
+            "别的 agent 的父调用连同子调用都不该出现：{:?}",
+            streaming_cards(batch)
+        );
+    }
+
+    #[test]
+    fn without_a_shown_agent_the_batch_falls_back_to_every_call() {
+        // 没有视图/导出的路径：没有 `ShownAgent` 就不过滤，免得丢掉调用。
+        let mut app = headless_app();
+        let alpha = app.world_mut().spawn_empty().id();
+        let beta = app.world_mut().spawn_empty().id();
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_alpha_live", "alpha_live"),
+            },
+            ForAgent(alpha),
+        ));
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_beta_live", "beta_live"),
+            },
+            ForAgent(beta),
+        ));
+        app.world_mut()
+            .resource_mut::<CallHistory>()
+            .0
+            .extend([
+                settled_fact(
+                    30,
+                    None,
+                    Some(alpha),
+                    50,
+                    named_call("call_alpha_done", "alpha_done"),
+                ),
+                settled_fact(
+                    31,
+                    None,
+                    Some(beta),
+                    51,
+                    named_call("call_beta_done", "beta_done"),
+                ),
+                // owner 缺失的老历史：没有 shown agent 时照旧全画。
+                settled_fact(
+                    32,
+                    None,
+                    None,
+                    52,
+                    named_call("call_legacy_done", "legacy_done"),
+                ),
+            ]);
+        rebuild_now(&mut app);
+
+        let cards = streaming_cards(app.world().resource::<RenderBatch>());
+        let names: Vec<&str> = cards.iter().map(|(_, name, _)| name.as_str()).collect();
+        for expected in [
+            "alpha_live",
+            "beta_live",
+            "alpha_done",
+            "beta_done",
+            "legacy_done",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "没有 ShownAgent 时退回全量，缺 {expected}：{names:?}"
+            );
+        }
+        assert_eq!(names.len(), 5, "每张调用卡都在：{names:?}");
+    }
+
+    #[test]
+    fn a_settled_call_keeps_the_agent_entity_as_its_owner() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.init_resource::<CompletedCalls>();
+        world.init_resource::<CallHistory>();
+        world.init_resource::<LiveOrdinals>();
+        let alpha = world.spawn_empty().id();
+        let beta = world.spawn_empty().id();
+        for (owner, id) in [(alpha, "call_alpha"), (beta, "call_beta")] {
+            let call = named_call(id, "search");
+            let outcome = Outcome::from(rig_core::tool::ToolResult::success(
+                rig_core::tool::ToolOutput::text("done"),
+            ));
+            world.spawn((ToolRequest { call }, outcome, ForAgent(owner)));
+        }
+        world.run_system_once(record_calls).unwrap();
+
+        let history = world.resource::<CallHistory>();
+        assert_eq!(history.0.len(), 2, "两个结算调用都要进历史");
+        let owner_of = |id: &str| {
+            history
+                .0
+                .iter()
+                .find(|fact| fact.call.id == CallId::from_wire(id))
+                .and_then(|fact| fact.owner)
+        };
+        assert_eq!(
+            owner_of("call_alpha"),
+            Some(alpha),
+            "owner 直接从 ForAgent 的实体来"
+        );
+        assert_eq!(owner_of("call_beta"), Some(beta));
     }
 
     // -----------------------------------------------------------------------
@@ -2109,6 +2845,53 @@ mod tests {
         assert_eq!(asks, vec![first, second]);
     }
 
+    #[test]
+    fn the_confirm_tile_lists_only_the_shown_agents_asks() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let (mut world, _root) = confirm_world(80);
+        let shown = world
+            .spawn(Conversation(talk::Conversation::new()))
+            .id();
+        let other = world.spawn_empty().id();
+        world.insert_resource(ShownAgent(Some(shown)));
+        let mine = world
+            .spawn((question("keep mine?", "", &[("ok", "OK")]), ForAgent(shown)))
+            .id();
+        world.spawn((
+            question("keep theirs?", "", &[("ok", "OK")]),
+            ForAgent(other),
+        ));
+        // 无主的 Ask（app 级）和调用同一口径：没有 owner 也可见。
+        let app_level = world
+            .spawn(question("keep app?", "", &[("ok", "OK")]))
+            .id();
+        world.flush();
+        assert!(
+            world.get::<Effect>(mine).is_some(),
+            "Ask 的效应应由内核登记"
+        );
+
+        world.run_system_once(confirm_panel_rows).unwrap();
+        let rows = world.resource::<PanelRows>().get(PanelId::Confirm);
+        let texts: Vec<String> = rows.iter().map(|keyed| text(&keyed.row.line)).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "(1/2) ? keep mine?".to_owned(),
+                "    [1] OK".to_owned(),
+                "(2/2) ? keep app?".to_owned(),
+                "    [1] OK".to_owned(),
+            ],
+            "确认 tile 只列 shown agent 的（加无主的）Ask：{texts:?}"
+        );
+        let asks: Vec<Entity> = rows
+            .iter()
+            .filter_map(|keyed| keyed.row.choice.as_ref().map(|(ask, _)| *ask))
+            .collect();
+        assert_eq!(asks, vec![mine, app_level], "答案不能落到别的 agent 身上");
+    }
+
     /// 点击语义不变：确认行经面板的同一套生成路径后，行实体上挂的就是
     /// `transcript::AskChoice`（前端 `answer_ask` 观察者查的就是它），
     /// 而且从行内文字子节点往上爬也能找到——和点击处理的做法一致。
@@ -2186,5 +2969,376 @@ mod tests {
             }
         }
         assert_eq!(found, Some((ask, "yes".to_owned())));
+    }
+
+    // -----------------------------------------------------------------------
+    // 实时内容（没有自己管线的工作区）
+    // -----------------------------------------------------------------------
+
+    /// 一行显示宽度（全角算 2），断言折行用。
+    fn line_width(line: &Line<'static>) -> usize {
+        use unicode_width::UnicodeWidthStr;
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref().width())
+            .sum()
+    }
+
+    /// 一组面板行的纯文本。
+    fn rows_text(rows: &[KeyedRow]) -> String {
+        rows.iter()
+            .map(|keyed| text(&keyed.row.line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 一个只有内核数据的 world：效果 id 递增（调用/Ask 的 FIFO 要用）。
+    fn live_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(rig_ecs::effects::Effects::default());
+        world
+    }
+
+    /// 一个带自己调用 id 的工具调用（两个 agent 各一个，不能共用一个 id）。
+    fn named_call(id: &str, name: &str) -> ToolCall {
+        let name = ToolName::new(name).expect("工具名非空");
+        ToolCall::new(
+            CallId::from_wire(id),
+            ToolFunction::new(name, serde_json::json!({ "q": id })),
+        )
+    }
+
+    /// 给 `agent` 开一个真 turn，把流式正文/推理挂在它的模型调用上。
+    ///
+    /// 走的是内核的真实形状：`TurnOf(agent)` 带出 `ActiveTurn`，
+    /// `CallOf(turn)` 带出 `Calls`，`Partial` 在调用上。
+    fn stream_into(world: &mut World, agent: Entity, text: &str, reasoning: &str) {
+        let turn = world.spawn(TurnOf(agent)).id();
+        world.spawn((
+            CallOf(turn),
+            Partial {
+                text: text.to_owned(),
+                reasoning: reasoning.to_owned(),
+                calls: Vec::new(),
+            },
+        ));
+        world.flush();
+    }
+
+    #[test]
+    fn dialogue_batch_draws_the_whole_conversation_from_one_pure_function() {
+        let (conversation, tool, note) = conversation();
+        let conversation = Conversation(conversation);
+        let agent = Entity::from_raw_u32(77).expect("合法实体");
+        let (batch, texts) = dialogue_batch(&conversation, agent, 80);
+
+        assert_eq!(batch.agent, Some(agent), "批要指认它属于哪个 agent");
+        assert_eq!(batch.width, 80, "宽度原样交给 look");
+
+        // 用户请求 + assistant 正文都进文字块（和聚焦条线同一个帧函数）。
+        let user = texts
+            .iter()
+            .find(|(id, _)| *id == TextId::Message { at: 0, block: 0 })
+            .map(|(_, lines)| lines_text(lines))
+            .expect("用户消息应进文字块");
+        assert!(user.contains("› Why tabs?"), "用户文字带 › 前缀：{user}");
+        let reply = texts
+            .iter()
+            .find(|(id, _)| *id == TextId::Message { at: 1, block: 0 })
+            .map(|(_, lines)| lines_text(lines))
+            .expect("assistant 正文应进文字块");
+        assert!(reply.contains("Tabs are the style."), "正文来自对话：{reply}");
+
+        // tool call 走 `Tool(m, b)`，默认行里有工具名。
+        let request = batch
+            .requests
+            .get(&RenderKey::Tool(1, 1))
+            .expect("对话里的调用要有请求");
+        let drawn = request
+            .output
+            .lines
+            .iter()
+            .map(|line| line.line().to_string())
+            .collect::<String>();
+        assert!(drawn.contains("search"), "默认行里要有工具名：{drawn}");
+        assert_eq!(tool.id, CallId::from_wire("call_test"));
+
+        // note（aside）也在：落点和文字块都对得上真管线。
+        assert!(
+            batch.requests.contains_key(&RenderKey::Aside(note)),
+            "note 要画成 aside 请求"
+        );
+    }
+
+    #[test]
+    fn live_additions_keep_each_agents_calls_and_stream_to_itself() {
+        let mut world = live_world();
+        let alpha = world.spawn(AgentId("alpha".into())).id();
+        let beta = world.spawn(AgentId("beta".into())).id();
+        // 真 `Running`（挂一个永不结束的任务）：在飞调用画成 running。
+        let pool = bevy::tasks::TaskPool::new();
+        let wake = Wake::new(|| {});
+        let running = Running::spawn_into::<Done<()>, ()>(&pool, &wake, std::future::pending());
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_alpha", "search_alpha"),
+            },
+            ForAgent(alpha),
+            running,
+        ));
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_beta", "search_beta"),
+            },
+            ForAgent(beta),
+        ));
+        // 正文故意比 24 列宽：要按宽度折行。
+        stream_into(
+            &mut world,
+            alpha,
+            "alpha streams a reply much wider than the strip",
+            "",
+        );
+        stream_into(&mut world, beta, "beta streams its own reply", "");
+        world.flush();
+
+        let rows = live_additions(&mut world, alpha, 24);
+        let text = rows_text(&rows);
+        assert!(text.contains("search_alpha"), "本 agent 的在飞调用要出现：{text:?}");
+        assert!(!text.contains("search_beta"), "别的 agent 的调用不能串台：{text:?}");
+        assert!(text.contains("alpha streams"), "本 agent 的流式正文要出现：{text:?}");
+        assert!(!text.contains("beta streams"), "别的 agent 的正文不能串台：{text:?}");
+        assert!(text.contains("running"), "在飞调用应画成 running：{text:?}");
+        let widest = rows
+            .iter()
+            .map(|keyed| line_width(&keyed.row.line))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest <= 24,
+            "流式正文要按宽度折行（最宽 {widest} 列）：{text:?}"
+        );
+    }
+
+    #[test]
+    fn live_additions_add_reasoning_and_only_this_agents_asks() {
+        let mut world = live_world();
+        let alpha = world.spawn(AgentId("alpha".into())).id();
+        let beta = world.spawn(AgentId("beta".into())).id();
+        stream_into(&mut world, alpha, "alpha body", "alpha thinks");
+        let alpha_ask = world
+            .spawn((
+                question("keep alpha?", "", &[("yes", "Yes")]),
+                ForAgent(alpha),
+            ))
+            .id();
+        world.spawn((question("keep beta?", "", &[("yes", "Yes")]), ForAgent(beta)));
+        world.flush();
+
+        let rows = live_additions(&mut world, alpha, 60);
+        let text = rows_text(&rows);
+        assert!(text.contains("alpha thinks"), "推理要出现：{text:?}");
+        assert!(text.contains("alpha body"), "正文要出现：{text:?}");
+        assert!(text.contains("keep alpha?"), "本 agent 的 Ask 要出现：{text:?}");
+        assert!(
+            !text.contains("keep beta?"),
+            "别的 agent 的 Ask 不能串台：{text:?}"
+        );
+        // 选项行原样带 `Row::choice`：点击回答的语义和确认面板一致。
+        let choices: Vec<(Entity, String)> = rows
+            .iter()
+            .filter_map(|keyed| keyed.row.choice.clone())
+            .collect();
+        assert_eq!(choices, vec![(alpha_ask, "yes".to_owned())]);
+    }
+
+    #[test]
+    fn live_additions_do_not_draw_a_call_the_conversation_already_has() {
+        let mut world = live_world();
+        let agent = world.spawn(AgentId("a".into())).id();
+        let known = named_call("call_known", "search_known");
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::ToolCall(known.clone()),
+        ])));
+        world.entity_mut(agent).insert(Conversation(conversation));
+        world.spawn((
+            ToolRequest {
+                call: known.clone(),
+            },
+            ForAgent(agent),
+        ));
+        world.flush();
+
+        let text = rows_text(&live_additions(&mut world, agent, 80));
+        assert!(
+            !text.contains("search_known"),
+            "对话里已经有的调用不重复画一份：{text:?}"
+        );
+    }
+
+    #[test]
+    fn live_additions_let_go_of_a_reply_the_conversation_already_has() {
+        let mut world = live_world();
+        let agent = world.spawn(AgentId("a".into())).id();
+        // 回复已经提交进对话，`Partial` 还没消失（提交和消失之间的一帧）。
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("already in the dialogue"),
+        ])));
+        world.entity_mut(agent).insert(Conversation(conversation));
+        stream_into(&mut world, agent, "already in the dialogue", "some thinking");
+
+        let text = rows_text(&live_additions(&mut world, agent, 80));
+        assert!(
+            !text.contains("already in the dialogue"),
+            "回复落进对话后流式块要让位（别画两份）：{text:?}"
+        );
+    }
+
+    #[test]
+    fn live_additions_only_draw_the_root_so_a_nested_call_is_not_duplicated() {
+        let mut world = live_world();
+        let alpha = world.spawn(AgentId("alpha".into())).id();
+        let beta = world.spawn(AgentId("beta".into())).id();
+        let parent = world
+            .spawn((
+                ToolRequest {
+                    call: named_call("call_parent", "parent_tool"),
+                },
+                ForAgent(alpha),
+            ))
+            .id();
+        world.flush();
+        let parent_effect = world
+            .get::<Effect>(parent)
+            .expect("活调用要有自己的效应")
+            .id();
+        // 两个子调用：一个还挂在 alpha 名下，一个是子 agent 的；都挂在同一个
+        // 父调用下面。它们不该在条带里各自再占一张卡。
+        for (id, name, owner) in [
+            ("call_child", "child_tool", alpha),
+            ("call_beta_child", "beta_child_tool", beta),
+        ] {
+            world.spawn((
+                ToolRequest {
+                    call: named_call(id, name),
+                },
+                Effect::with_parent_id(Some(parent_effect)),
+                ForAgent(owner),
+            ));
+        }
+        // 另一个 agent 自己的根调用：不能串台。
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_beta", "beta_tool"),
+            },
+            ForAgent(beta),
+        ));
+        world.flush();
+
+        let rows = live_additions(&mut world, alpha, 80);
+        let text = rows_text(&rows);
+        assert!(text.contains("parent_tool"), "本 agent 的根要画：{text:?}");
+        assert!(
+            !text.contains("child_tool"),
+            "父卡片下面的调用不单独占一张卡：{text:?}"
+        );
+        assert!(
+            !text.contains("beta_child_tool"),
+            "子 agent 的调用也不单独占一张卡：{text:?}"
+        );
+        assert!(!text.contains("beta_tool"), "别的 agent 的调用不能串台：{text:?}");
+    }
+
+    #[test]
+    fn live_additions_treat_a_call_without_an_owner_like_the_focused_pipeline() {
+        // 没有 `ForAgent` 的调用（app 级效应 / 老记录）：聚焦建批按"无主的根"
+        // 处理、可见；非聚焦条带也必须看得见，不能只有一条条带显示。
+        let (mut app, shown) = focused_app();
+        let other = app.world_mut().spawn_empty().id();
+        app.world_mut().spawn(ToolRequest {
+            call: named_call("call_unowned", "unowned_tool"),
+        });
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_other", "other_tool"),
+            },
+            ForAgent(other),
+        ));
+        rebuild_now(&mut app);
+        let cards = streaming_cards(app.world().resource::<RenderBatch>());
+        let names: Vec<&str> = cards.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["unowned_tool"],
+            "聚焦条带里无主调用可见：{cards:?}"
+        );
+
+        let text = rows_text(&live_additions(app.world_mut(), shown, 80));
+        assert!(
+            text.contains("unowned_tool"),
+            "非聚焦条带也要看到同一条无主调用：{text:?}"
+        );
+        assert!(
+            !text.contains("other_tool"),
+            "别的 agent 的调用仍然不可见：{text:?}"
+        );
+    }
+
+    #[test]
+    fn live_additions_keep_a_settled_call_until_the_conversation_has_it() {
+        let mut world = live_world();
+        world.init_resource::<CallHistory>();
+        let agent = world.spawn(AgentId("a".into())).id();
+        let call = named_call("call_settling", "settling_tool");
+        let entity = world
+            .spawn((ToolRequest { call: call.clone() }, ForAgent(agent)))
+            .id();
+        world.flush();
+        let effect = world.get::<Effect>(entity).expect("效应").id();
+
+        // 在飞：一张卡。
+        let live_rows = live_additions(&mut world, agent, 80);
+        let live_text = rows_text(&live_rows);
+        assert!(live_text.contains("settling_tool"), "在飞时要画：{live_text:?}");
+        let live_first = live_rows.first().expect("在飞时至少一行").key;
+
+        // 结算了、对话还没提交：卡不能消失，key 也不能变（原地换状态，不闪）。
+        world.entity_mut(entity).insert(Settled);
+        world.resource_mut::<CallHistory>().0.push(settled_fact(
+            effect.as_u64(),
+            None,
+            Some(agent),
+            7,
+            call.clone(),
+        ));
+        let settled_rows = live_additions(&mut world, agent, 80);
+        let settled_text = rows_text(&settled_rows);
+        assert!(
+            settled_text.contains("settling_tool"),
+            "结算到提交之间不能先消失：{settled_text:?}"
+        );
+        assert!(
+            settled_text.contains("settling_tool result"),
+            "结算后要带上结果（状态是 done）：{settled_text:?}"
+        );
+        assert_eq!(
+            settled_rows.first().map(|keyed| keyed.key),
+            Some(live_first),
+            "同一张卡结算前后第一行 key 不变"
+        );
+
+        // 对话提交后：由对话那份画，实时块让位。
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::ToolCall(call.clone()),
+        ])));
+        world.entity_mut(agent).insert(Conversation(conversation));
+        let text = rows_text(&live_additions(&mut world, agent, 80));
+        assert!(
+            !text.contains("settling_tool"),
+            "落进对话后实时块不再重复画：{text:?}"
+        );
     }
 }

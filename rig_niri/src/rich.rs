@@ -9,33 +9,33 @@
 //!    "某种东西的底色" band（`rig_tui::theme::Theme`），两个字段集不相交。这里用
 //!    [`upstream_theme`] 把我们的底色当基底、用我们自己的语义前景色去混出 band。
 //! 2. **行模型**：上游的 `Line` 有**两级**底色——行级（`.bg()`：diff 的整行红绿、
-//!    markdown 的代码块与提示块）和 span 级（改动的词、行内 code）。我们的 [`Row`]
-//!    只有整行一个底色 [`Row::band`]，而渲染层只读 `span.style.fg`
-//!    （`transcript.rs::spawn_text_line` 连 `Modifier` 都不读）。于是：
+//!    markdown 的代码块与提示块）和 span 级（改动的词、行内 code）。两级现在都
+//!    能画出来：
 //!    - 行级底色 → [`Row::band`]，**无损**；
-//!    - span 级底色 → [`expressible`] 里退化成"同色相更亮的前景色 + 下划线/加粗"
-//!      （Modifier 现在是死数据，渲染层将来读了才生效）。
+//!    - span 级底色 / 下划线 / 删除线 → 原样留在 span 样式上，渲染层按 span 挂
+//!      `TextBackgroundColor` / `Underline` / `Strikethrough` 组件真画
+//!      （`transcript.rs::span_paint`；bevy 0.20 的 `bevy_ui_render` 按 span
+//!      消费这些组件）。
 //!
-//!    想让行内 code、diff 改动词真的带底色，得由 lead 扩行模型/渲染层（见回报）。
+//!    画不出来的只剩**没有字形变体**的样式（`Modifier::ITALIC` 等），见
+//!    [`expressible`]。
 //!
 //! 三个入口：[`markdown_rows`]、[`highlight_rows`]、[`diff_rows`]（外加一个便利
 //! 入口 [`tool_result_rows`]）。宽度都要传进来：折行交给上游
 //! [`rig_tui::wrap::wrap_all`]，我们的渲染层不做折行，一行就是一行。
 
 use rig_tui::highlight::{Code, Language};
-use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
+use rig_tui::ratatui::style::{Color as RColor, Style};
 use rig_tui::ratatui::text::Line;
 use rig_tui::{LookLine, Theme as RigTheme};
 
 use crate::theme::Theme;
-use crate::transcript::Row;
+use crate::transcript::{Row, take_line_band};
 
 // ---------------------------------------------------------------------------
 // 主题适配
 // ---------------------------------------------------------------------------
 
-/// 白（混色的另一头）。
-const WHITE: (u8, u8, u8) = (255, 255, 255);
 /// 主题 token 没有颜色（`Reset`/解析不出）时的兜底前景：我们默认主题的主文字色。
 const FALLBACK_FG: (u8, u8, u8) = (210, 216, 228);
 /// [`Theme::band`] 解析不出 RGB 时的兜底底色：我们默认主题的 band。
@@ -97,8 +97,9 @@ pub fn markdown_rows(text: &str, width: usize, theme: &Theme) -> Vec<Row> {
 }
 
 /// 一段代码当代码块画：有语法就按 `language` 的语法着色，没语法就按
-/// [`Theme::dim`] 的暗前景色（上游 `code_rows` 的兜底是 `text_rows` + `Modifier::DIM`，
-/// 可我们的渲染层不读 `Modifier`，所以换成我们主题的 dim 前景色才看得出是"暗的"）。
+/// [`Theme::dim`] 的暗前景色（上游 `code_rows` 的兜底是 `text_rows` + `Modifier::DIM`；
+/// 渲染层没有字重字形，`DIM` 只能折成更暗的前景色，这里直接换成我们主题的
+/// dim 前景色，省掉一层混合）。
 ///
 /// `language` 是围栏上写的那个名字/扩展名（`rust`、`py`、`bash`）；
 /// 对应上游 `rig_tui::highlight::code_rows(code, Language::Named(language))`。
@@ -154,48 +155,24 @@ fn rows_of_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Row> {
 
 /// 把上游的 `Line` 塞进我们的行模型。
 ///
-/// - **行级底色**（`.bg()`）→ [`Row::band`]：这是 [`Row`] 唯一能表达的底色，
-///   上游 diff 的整行红绿、markdown 的代码块/提示块正好都用这一级，落过去是无损的。
-///   注意折行会把行级底色抄进每个 span（`rig-markdown` 的 `cells` 做
-///   `line.style.patch(span.style)`），所以和 `band` 同色的 span 底色要认出来丢掉。
-/// - **span 级底色**（和行级不同的那些，如 diff 改动词、行内 code）→ 退化成
-///   前景色 + `UNDERLINED | BOLD`（见 [`lifted`]）。
+/// - **行级底色**（`.bg()`）→ [`Row::band`]：上游 diff 的整行红绿、markdown 的
+///   代码块/提示块都用这一级。折行会把行级底色抄进每个 span（`rig-markdown` 的
+///   `cells` 做 `line.style.patch(span.style)`），所以同色的 span 底色要认出来
+///   丢掉，见 [`take_line_band`]。
+/// - **span 级底色**（和行级不同的那些，如 diff 改动词、行内 code）→ 原样留在
+///   span 样式上：渲染层用 `TextBackgroundColor` 真画，不再降级成前景色。
+/// - **下划线 / 删除线**（`UNDERLINED` / `CROSSED_OUT`）同样原样透传，
+///   渲染层挂 `Underline` / `Strikethrough` 组件画线。
+///
+/// 只有没有字形变体的样式（`ITALIC`、终端 `BOLD` 的字重差异等）渲染层表达不了；
+/// 这里不做任何降级，保持上游样式，将来有字形时直接生效。
 fn expressible(mut line: Line<'static>) -> Row {
-    let band = line.style.bg.take();
-    for span in &mut line.spans {
-        let Some(tint) = span.style.bg.take() else {
-            continue;
-        };
-        // 折行（`wrap_all`）会把行级底色抄进每个 span（`line.style.patch(span.style)`），
-        // 那不是"这一块被标出来"，已经由 `band` 表达，丢掉即可。
-        if Some(tint) == band {
-            continue;
-        }
-        span.style.fg = Some(lifted(tint));
-        span.style.add_modifier |= Modifier::UNDERLINED | Modifier::BOLD;
-    }
+    let band = take_line_band(&mut line);
     let mut row = Row::new(line);
     if let Some(band) = band {
         row = row.band(band);
     }
     row
-}
-
-/// span 级底色的退化：底色当不了底色，就当"这块被标出来的颜色"——取同色相、
-/// 朝白提亮的前景（暗底上的高亮块 → 亮字）。
-/// 解析不出 RGB 的颜色（`Reset`）退回渲染层的默认文字色（`Reset` 走 `style.rs`
-/// 的浅灰）。
-///
-/// 提亮比例 72% 是**猜的**：上游没有"底色转前景"这个操作，留着足够对比度又不至于
-/// 全白，是先拍一个值。
-fn lifted(tint: RColor) -> RColor {
-    match rgb(tint) {
-        Some(tint) => {
-            let (r, g, b) = blend(tint, WHITE, 0.72);
-            RColor::Rgb(r, g, b)
-        }
-        None => RColor::Reset,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +264,7 @@ fn rgb(color: RColor) -> Option<(u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_tui::ratatui::style::Modifier;
     use rig_tui::ratatui::text::Span;
 
     /// 一行按渲染层的方式拼出来的纯文本。
@@ -318,11 +296,16 @@ mod tests {
             })
     }
 
-    /// 我们的行模型没有 span 级底色：退化之后所有 span 的 `bg` 都必须是 `None`。
-    fn assert_no_span_backgrounds(rows: &[Row]) {
+    /// 行级底色只由 [`Row::band`] 表达：折行抄进 span 的那一份必须被摘掉，
+    /// 否则渲染层会在整行 band 上再叠一层同色的 `TextBackgroundColor`。
+    fn assert_no_line_band_on_spans(rows: &[Row]) {
         for row in rows {
             for span in &row.line.spans {
-                assert_eq!(span.style.bg, None, "span {:?} 还带着底色", span.content);
+                assert_eq!(
+                    span.style.bg, None,
+                    "span {:?} 还带着行级底色（应只落在 Row::band）",
+                    span.content
+                );
             }
         }
     }
@@ -368,7 +351,7 @@ mod tests {
         let item = row_with(&rows, "第一项");
         assert!(text(item).starts_with("• "), "{:?}", text(item));
         assert_eq!(span_with(item, "• ").style.fg, Some(RColor::Cyan));
-        assert_no_span_backgrounds(&rows);
+        assert_no_line_band_on_spans(&rows);
     }
 
     #[test]
@@ -390,7 +373,7 @@ mod tests {
         assert!(matches!(keyword, Some(RColor::Indexed(_))), "{keyword:?}");
         assert!(matches!(name, Some(RColor::Indexed(_))), "{name:?}");
         assert_ne!(keyword, name);
-        assert_no_span_backgrounds(&rows);
+        assert_no_line_band_on_spans(&rows);
     }
 
     #[test]
@@ -426,22 +409,39 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_becomes_a_bright_underlined_span() {
+    fn inline_code_keeps_its_own_background() {
         let theme = Theme::default();
+        let code = upstream_theme(&theme).code;
         let rows = markdown_rows("正文 `inline` 结束\n", 40, &theme);
         let row = row_with(&rows, "inline");
         let span = span_with(row, "inline");
-        // span 级底色表达不了：退化成亮前景 + 下划线，底色本身必须清掉。
-        assert_eq!(span.style.bg, None);
-        assert!(span.style.add_modifier.contains(Modifier::UNDERLINED));
-        let Some(RColor::Rgb(r, g, b)) = span.style.fg else {
-            panic!("退化后的前景应该是 RGB：{:?}", span.style.fg);
-        };
+        // span 级底色直接透传：渲染层会挂 `TextBackgroundColor` 真画，
+        // 不再降级成"亮前景 + 下划线"。
+        assert_eq!(span.style.bg, Some(code), "行内 code 的底色要原样保留");
         assert!(
-            r > 150 && g > 150 && b > 150,
-            "退化后的前景应该是亮的：{:?}",
-            span.style.fg
+            !span.style.add_modifier.contains(Modifier::UNDERLINED),
+            "上游没要下划线，别自己加"
         );
+        // 这一行的底色来自 span 而不是 `Row::band`。
+        assert_eq!(row.band, None);
+    }
+
+    #[test]
+    fn markdown_strikethrough_passes_through() {
+        let theme = Theme::default();
+        let rows = markdown_rows("~~old~~\n", 40, &theme);
+        let row = row_with(&rows, "old");
+        // `~~old~~` 上游用 `Modifier::CROSSED_OUT` 画：不再降级，原样交给
+        // 渲染层的 `Strikethrough` 组件。
+        assert!(
+            span_with(row, "old")
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT),
+            "删除线样式必须原样透传：{:?}",
+            row.line.spans
+        );
+        assert_eq!(row.band, None);
     }
 
     /// 一个两删两增的小 diff：旧文件 3 行、新文件 4 行。
@@ -465,25 +465,40 @@ mod tests {
         assert!(text(added).starts_with("      2 + "), "{:?}", text(added));
         // 没变的上下文行不该有底色。
         assert_eq!(row_with(&rows, "fn main() {").band, None);
-        assert_no_span_backgrounds(&rows);
+        // 整行底色只由 `Row::band` 表达；折行抄进 span 的同色底色要摘掉。
+        for row in &rows {
+            for span in &row.line.spans {
+                if span.style.bg.is_some() {
+                    assert_ne!(
+                        span.style.bg,
+                        row.band,
+                        "span {:?} 的底色和行级底色重复了",
+                        span.content
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn diff_changed_words_trade_the_deeper_band_for_a_brighter_foreground() {
+    fn diff_changed_words_keep_the_deeper_band() {
         let theme = Theme::default();
         let rig = upstream_theme(&theme);
         let rows = diff_rows(DIFF, 80, &theme).expect("是 unified diff");
-        // `x` → `value` 是改动词：上游给它更深的 added_word 底色，我们只能抬成亮前景。
+        // `x` → `value` 是改动词：上游给它更深的 added_word 底色，现在原样保留，
+        // 渲染层用 span 的 `TextBackgroundColor` 在整行 band 上再叠一层。
         let added = row_with(&rows, "let value = 42;");
         let word = span_with(added, "value");
-        assert_eq!(word.style.bg, None);
-        assert!(word.style.add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(word.style.fg, Some(lifted(rig.added_word)));
-        // 同一行没改的 `let` 还是语法色，不是改动词的亮色。
-        assert_ne!(span_with(added, "let").style.fg, word.style.fg);
+        assert_eq!(word.style.bg, Some(rig.added_word));
+        assert!(
+            !word.style.add_modifier.contains(Modifier::UNDERLINED),
+            "改动词的强调来自底色，不是我们自己加的下划线"
+        );
+        // 同一行没改的 `let` 没有 span 级底色（它的红/绿来自整行 band）。
+        assert_eq!(span_with(added, "let").style.bg, None);
         // 删行一侧同理。
         let removed = row_with(&rows, "let x = 1;");
-        assert_eq!(span_with(removed, "x").style.fg, Some(lifted(rig.removed_word)));
+        assert_eq!(span_with(removed, "x").style.bg, Some(rig.removed_word));
     }
 
     #[test]
@@ -524,7 +539,8 @@ mod tests {
         let rows = highlight_rows("just text\n", "no-such-language", 40, &theme);
         assert_eq!(rows.len(), 1);
         assert_eq!(text(&rows[0]), "   just text");
-        // 上游兜底是 `Modifier::DIM`，我们的渲染层不读 Modifier → 换成主题的 dim 前景。
+        // 上游兜底是 `Modifier::DIM`，DIM 没有字形变体，渲染层只能折成前景色；
+        // 这里直接从源头换成主题的 dim 前景，省掉一层混合。
         assert_eq!(rows[0].line.spans[0].style.fg, theme.dim.fg);
         assert_eq!(theme.dim.fg, Some(RColor::Rgb(120, 128, 145)));
     }

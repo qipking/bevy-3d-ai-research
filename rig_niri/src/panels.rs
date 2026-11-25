@@ -349,8 +349,8 @@ mod tests {
     use super::*;
     use crate::selection::{ClickKind, Selection};
     use crate::transcript::{RowText, TranscriptFont};
-    use bevy::text::FontSource;
-    use rig_tui::ratatui::style::{Modifier, Style};
+    use bevy::text::{FontSource, TextBackgroundColor};
+    use rig_tui::ratatui::style::Style;
     use rig_tui::ratatui::text::Line;
 
     fn keyed(key: u64, text: &str) -> KeyedRow {
@@ -510,8 +510,10 @@ mod tests {
         assert_eq!(layouts, vec![0, 1]);
     }
 
-    /// 一行的 span 列表：`(文本, 实际画出来的颜色)`。
-    fn spans(app: &App, row: Entity) -> Vec<(String, Color)> {
+    /// 一行的 span 列表：`(文本, 实际画出来的前景, 实际画出来的底色)`。
+    ///
+    /// 反色现在是真反色：前景换成底色、底色换成前景，两样都要断言。
+    fn spans(app: &App, row: Entity) -> Vec<(String, Color, Option<Color>)> {
         let text_node = app
             .world()
             .get::<Children>(row)
@@ -529,6 +531,9 @@ mod tests {
                         .0
                         .to_string(),
                     app.world().get::<TextColor>(span).expect("TextColor").0,
+                    app.world()
+                        .get::<TextBackgroundColor>(span)
+                        .map(|background| background.0),
                 )
             })
             .collect()
@@ -558,17 +563,16 @@ mod tests {
         );
 
         let theme = crate::theme::Theme::default();
-        let reversed = crate::transcript::span_style_color(
-            &Style::default().add_modifier(Modifier::REVERSED),
-            &theme,
-        );
         let plain = crate::transcript::span_style_color(&Style::default(), &theme);
+        // 选中 = 真反色：前景换成主题底色（`theme.band`），底色换成原来的前景。
+        let reversed_fg = crate::style::color(Some(theme.band));
         assert_eq!(
             spans(&app, rows[0]),
             vec![
-                ("hello ".to_owned(), plain),
-                ("world".to_owned(), reversed),
-            ]
+                ("hello ".to_owned(), plain, None),
+                ("world".to_owned(), reversed_fg, Some(plain)),
+            ],
+            "选中区间：前景 = 底色、底色 = 前景，且底色是 span 组件真画"
         );
 
         // 清掉选区：同一行要重画回普通 span（合成 hash 变了）。
@@ -578,7 +582,7 @@ mod tests {
         app.update();
         assert_eq!(
             spans(&app, rows[0]),
-            vec![("hello world".to_owned(), plain)],
+            vec![("hello world".to_owned(), plain, None)],
             "去高亮"
         );
     }
@@ -599,6 +603,10 @@ mod tests {
         let theme = crate::theme::Theme::default();
         let plain = crate::transcript::span_style_color(&Style::default(), &theme);
         let rows = row_entities(&app, root);
-        assert_eq!(spans(&app, rows[0]), vec![("hello".to_owned(), plain)]);
+        assert_eq!(
+            spans(&app, rows[0]),
+            vec![("hello".to_owned(), plain, None)],
+            "别的面板的选区不该给这一行上底色"
+        );
     }
 }

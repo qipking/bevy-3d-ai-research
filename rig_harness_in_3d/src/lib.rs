@@ -337,7 +337,12 @@ impl Plugin for HarnessExtPlugin {
 }
 
 /// 输入框提交以 `/` 开头的文本时，交给上游命令系统跑（`/hello`、`/setting`
-/// 就是这样到的）。发给哪个 agent 用 harness 的 `main_agent` 规则。
+/// 就是这样到的）。发给哪个 agent 用 harness 的 `main_agent` 规则
+/// （`CurrentAgentPlugin` 让它跟随 `ShownAgent`，也就是当前聚焦工作区的 agent）。
+///
+/// 不以 `/` 开头的提交不经过这里：视图层（[`rig_niri::editor::keys`]）直接
+/// `Deliver` 给 `ShownAgent`，这里只保留斜杠命令这一条桥——所以命令不会变成
+/// 一条普通消息。
 fn run_typed_prompts(
     mut submitted: MessageReader<editor::PromptSubmitted>,
     agents: MainAgentQuery,
@@ -393,9 +398,13 @@ mod tests {
 
     use super::*;
     use bevy::app::TaskPoolPlugin;
+    use bevy::input::ButtonState;
+    use bevy::input::keyboard::{Key, KeyboardInput};
     use rig_core::conversation::Conversation as Talk;
     use rig_core::message::{AssistantContent, AssistantMessage, Message};
-    use rig_ecs::prelude::{AgentId, Conversation, TurnOf, spawn_root};
+    use rig_ecs::prelude::{
+        AgentId, Conversation, Deliver, DeliveryMode, Recalled, TurnOf, spawn_root,
+    };
     use rig_niri::batch::BatchPlugin;
     use rig_niri::editor::SubmittedPrompts;
     use rig_niri::frame::{CellRect, PanelArea, PanelAreas, PanelInset, PanelRoots};
@@ -853,5 +862,178 @@ mod tests {
         for fake in ["312 tokens", "ctx 12%", "no model"] {
             assert!(!all.contains(fake), "演示数据 `{fake}` 不能再出现：{all:?}");
         }
+    }
+
+    // ---- 输入框 -> 内核：Deliver / RunCommand / AppExit ----
+
+    /// 视图输入层（真按键表 + 发送/排队/停止/退出）+ 内核 + 本模板扩展；
+    /// 不建窗口、不渲染。
+    fn typing_app() -> App {
+        let mut app = headless_app();
+        app.add_plugins(rig_niri::editor::EditorPlugin);
+        // EditorPlugin 的输入行系统要 Theme；生产里由 `FeathersViewPlugin` 初始化。
+        app.init_resource::<rig_niri::theme::Theme>()
+            .insert_resource(bevy::input::ButtonInput::<KeyCode>::default())
+            .add_message::<KeyboardInput>();
+        // AgentPlugin 会装 TimePlugin，消息的 `update` 不再每帧清（`Messages` 的
+        // 两帧窗口因此不可靠）；用 `MessageReader` 收 `AppExit`，和真实插件一样。
+        app.init_resource::<Exits>()
+            .add_systems(Update, watch_exits);
+        app
+    }
+
+    /// 收到过的 `AppExit`。
+    #[derive(Resource, Default)]
+    struct Exits(Vec<AppExit>);
+
+    fn watch_exits(mut exits: MessageReader<AppExit>, mut seen: ResMut<Exits>) {
+        seen.0.extend(exits.read().cloned());
+    }
+
+    /// 观察到的 `Deliver`。
+    #[derive(Resource, Default)]
+    struct Delivered(Vec<(Entity, String, DeliveryMode)>);
+
+    fn record_deliver(deliver: On<Deliver>, mut delivered: ResMut<Delivered>) {
+        delivered.0.push((
+            deliver.entity,
+            deliver.message.text().to_owned(),
+            deliver.message.mode,
+        ));
+    }
+
+    /// 给 app 挂上 `Deliver` 观察者。
+    fn watching(app: &mut App) {
+        app.init_resource::<Delivered>()
+            .add_observer(record_deliver);
+    }
+
+    fn key(app: &mut App, code: KeyCode, key: Key, text: Option<&str>) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: code,
+            logical_key: key,
+            state: ButtonState::Pressed,
+            text: text.map(|text| text.into()),
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+    }
+
+    /// 像用户那样一个字符一个字符打，最后按 Enter。
+    fn type_prompt(app: &mut App, text: &str) {
+        for character in text.chars() {
+            let typed = character.to_string();
+            key(
+                app,
+                KeyCode::KeyA, // 测试只关心字符，不关心物理键
+                Key::Character(typed.clone().into()),
+                Some(&typed),
+            );
+        }
+        key(app, KeyCode::Enter, Key::Enter, None);
+    }
+
+    /// 这几帧里内核写出的通知。
+    fn said(app: &mut App, frames: usize) -> Vec<Notice> {
+        let mut notices: Vec<Notice> = Vec::new();
+        for _ in 0..frames {
+            app.update();
+            notices.extend(
+                app.world()
+                    .resource::<Messages<Notice>>()
+                    .iter_current_update_messages()
+                    .cloned(),
+            );
+        }
+        notices
+    }
+
+    #[test]
+    fn a_typed_prompt_reaches_the_kernel_and_comes_back_as_recalled() {
+        let mut app = typing_app();
+        let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
+        app.insert_resource(ShownAgent(Some(agent)));
+        app.update();
+
+        type_prompt(&mut app, "  hello from the editor  ");
+
+        // 没有接模型：这一轮在 Start 失败，内核把用户这条消息作为 `Recalled` 还
+        // 回来。它出现说明 Deliver 真的进了内核——不只是被测试的观察者看见。
+        let mut recalled: Vec<Recalled> = Vec::new();
+        for _ in 0..6 {
+            app.update();
+            recalled.extend(
+                app.world()
+                    .resource::<Messages<Recalled>>()
+                    .iter_current_update_messages()
+                    .cloned(),
+            );
+        }
+        assert!(
+            recalled
+                .iter()
+                .any(|recall| recall.agent == agent && recall.text == "hello from the editor"),
+            "输入框的文本应经 Deliver 进入内核（没接模型时以 Recalled 返回），实际 {recalled:?}"
+        );
+    }
+
+    #[test]
+    fn a_typed_slash_command_runs_and_is_not_delivered() {
+        let mut app = typing_app();
+        let agent = spawn_root(app.world_mut(), AgentId("main".into())).id();
+        app.insert_resource(ShownAgent(Some(agent)));
+        watching(&mut app);
+        app.update();
+
+        type_prompt(&mut app, "/hello");
+
+        let notices = said(&mut app, 4);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.agent == Some(agent) && notice.text.contains("Hello")),
+            "斜杠命令应仍走 RunCommand（/hello 写通知），实际 {notices:?}"
+        );
+        assert!(
+            app.world().resource::<Delivered>().0.is_empty(),
+            "斜杠命令不能再额外送一条普通消息，实际 {:?}",
+            app.world().resource::<Delivered>().0
+        );
+        assert_eq!(
+            app.world().resource::<SubmittedPrompts>().0,
+            ["/hello"],
+            "本地回显照旧"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_on_an_empty_input_quits_the_app() {
+        let mut app = typing_app();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        key(&mut app, KeyCode::KeyD, Key::Character("d".into()), None);
+        app.update();
+        assert_eq!(
+            app.world().resource::<Exits>().0,
+            [AppExit::Success],
+            "空输入 Ctrl+D 应触发 AppExit"
+        );
+
+        // 有字时不退。
+        app.world_mut().resource_mut::<Editor>().set("draft");
+        key(&mut app, KeyCode::KeyD, Key::Character("d".into()), None);
+        app.update();
+        assert_eq!(
+            app.world().resource::<Exits>().0,
+            [AppExit::Success],
+            "有字时 Ctrl+D 不能再写一条 AppExit"
+        );
+        assert_eq!(
+            app.world().resource::<Editor>().text,
+            "draft",
+            "有字时 Ctrl+D 也不清空"
+        );
     }
 }

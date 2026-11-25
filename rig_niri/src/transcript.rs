@@ -26,10 +26,13 @@ use std::collections::HashMap;
 
 use bevy::picking::Pickable;
 use bevy::prelude::*;
-use bevy::text::{FontSource, LineBreak, TextLayout};
+use bevy::text::{
+    FontSource, LineBreak, Strikethrough, StrikethroughColor, TextBackgroundColor, TextLayout,
+    Underline, UnderlineColor,
+};
 use bevy_ui::{BorderRadius, Node, percent, px};
 use rig_tui::LookLine;
-use rig_tui::ratatui::style::Color as RColor;
+use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::Line;
 use rig_tui::wrap::wrap;
 use rig_tui::{RenderBatch, RenderKey, RenderRequest};
@@ -227,17 +230,31 @@ fn spawn_text_line(
                 // 行自己的样式压在 span 上（ratatui 画行时也是这么合的）：
                 // `Line::styled` 只设行样式，不并进来颜色就丢了。
                 let style = line.style.patch(span.style);
+                let paint = span_paint(&style, theme);
                 // 字体必须显式给：TextSpan 隐式要求的 TextFont 是 20px 默认字体，
                 // 不显式给会换字体、换图集（见 feathers_in_3d/README.md）。
-                text.spawn((
+                let mut entity = text.spawn((
                     TextSpan::new(span.content.clone()),
                     TextFont {
                         font: font.clone(),
                         font_size: FontSize::Px(FONT_SIZE),
                         ..default()
                     },
-                    TextColor(span_style_color(&style, theme)),
+                    TextColor(paint.fg),
                 ));
+                // 底色/下划线/删除线是 bevy_ui_render 按 span 消费的普通组件
+                // （`extract_text_decorations` 对每个 span 查它们），直接挂上。
+                // 没有底色时**不要**插 `TextBackgroundColor`：它的默认值是黑，
+                // 会给每一块普通文字刷一层黑底。
+                if let Some(bg) = paint.bg {
+                    entity.insert(TextBackgroundColor(bg));
+                }
+                if paint.underline {
+                    entity.insert((Underline, UnderlineColor(paint.fg)));
+                }
+                if paint.strikethrough {
+                    entity.insert((Strikethrough, StrikethroughColor(paint.fg)));
+                }
             }
         });
 }
@@ -254,43 +271,77 @@ pub fn spawn_rows(
         .collect()
 }
 
-/// 把 span 的样式折成一个**能画出来的**颜色。
+/// 一个 span 实际要画的东西：前景色 + 可选行内底色 + 装饰线。
 ///
-/// 渲染层只有一个字形颜色：bevy_text 的 `TextSpan` 不支持字重、下划线、行内底色。
-/// 所以这里把上游 `ratatui::Style` 里表达不了的部分降级成亮度/色相：
+/// 这是 [`spawn_text_line`] 给 span 实体挂组件的依据；[`span_style_color`]
+/// 只算其中的前景色。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpanPaint {
+    /// 字形颜色（`DIM` / `BOLD` / 反色的前景已折进来）。
+    pub fg: Color,
+    /// 行内底色。`None` 表示**不画底**（别给 span 插 `TextBackgroundColor`）。
+    pub bg: Option<Color>,
+    /// 上游 `Modifier::UNDERLINED`：给 span 挂 [`Underline`]。
+    pub underline: bool,
+    /// 上游 `Modifier::CROSSED_OUT`：给 span 挂 [`Strikethrough`]。
+    pub strikethrough: bool,
+}
+
+/// 把 span 的 `ratatui::Style` 折成渲染层能画的组件值。
+///
+/// bevy 0.20 的 `bevy_ui_render` 已经按 span 消费 `TextBackgroundColor` /
+/// `Underline` / `Strikethrough`（`extract_text_decorations` 对每个 span 查
+/// 这三个组件），它们就是普通 `Component`，直接挂在 `TextSpan` 实体上即可，
+/// 不需要把 span 改成 `Node`。所以：
+///
+/// - 行内底色（`style.bg`）→ [`TextBackgroundColor`]，原样透传；
+/// - 下划线 / 删除线 → [`Underline`] / [`Strikethrough`]，线色取前景色；
+/// - `Modifier::REVERSED` → **真反色**：前景换成原本的底色（`style.bg`，没设
+///   就用 `theme.band`），底色换成原本的前景。
+///
+/// 没有字重/斜体字形（`BOLD` / `DIM` / `ITALIC`）的部分仍由
+/// [`span_style_color`] 折算成前景色，见那里的表。
+pub fn span_paint(style: &Style, theme: &Theme) -> SpanPaint {
+    let reversed = style.add_modifier.contains(Modifier::REVERSED);
+    SpanPaint {
+        fg: span_style_color(style, theme),
+        bg: if reversed {
+            // 终端反色把前景/底色对调：底色要画的是"原本的前景色"。
+            Some(base_fg_color(style, theme))
+        } else {
+            style.bg.map(|bg| style::color(Some(bg)))
+        },
+        underline: style.add_modifier.contains(Modifier::UNDERLINED),
+        strikethrough: style.add_modifier.contains(Modifier::CROSSED_OUT),
+    }
+}
+
+/// 把 span 的样式折成**字形颜色**。
+///
+/// 底色、下划线、删除线由 span 实体上的组件真画（[`TextBackgroundColor`] /
+/// [`Underline`] / [`Strikethrough`]，`bevy_ui_render` 按 span 消费，见
+/// [`span_paint`]），函数只负责前景色：
 ///
 /// | 上游样式 | 这里怎么办 |
 /// |---|---|
-/// | `Modifier::BOLD` | 往白提亮 25% |
+/// | `Modifier::BOLD` | 往白提亮 25%（没有字重字形可用） |
 /// | `Modifier::DIM` | 往面板底色混 45%（picker 的 `.patch_style(dim)` 靠这条才有用） |
-/// | `Modifier::UNDERLINED` | 提亮 12%（行内 code 至少和正文区分得开） |
-/// | `Modifier::REVERSED` | 前景换成底色（`style.bg`，没设就用 `theme.band`）：选中就是"挖空" |
-/// | `Modifier::ITALIC` / `CROSSED_OUT` | 无字形，忽略（注释里写明，不再静默） |
-/// | `style.bg` | 按"和底色反着来"提/降 22%：深底提亮、浅底压暗 |
+/// | `Modifier::REVERSED` | 前景换成底色（`style.bg`，没设就用 `theme.band`）：和 [`span_paint`] 换出的底色合起来就是反色 |
+/// | `Modifier::UNDERLINED` / `CROSSED_OUT` | 不在这里处理：由 [`span_paint`] 给出组件，`bevy_ui_render` 画线 |
+/// | `Modifier::ITALIC` | 无字形变体，忽略 |
+/// | `style.bg` | 不在这里处理：由 [`span_paint`] 交给 `TextBackgroundColor` |
 ///
-/// 这是**退化实现**，不是像素级还原：真要画行内底色/下划线，得让每个 span 自带一层
-/// 带 `BackgroundColor` 的 Node（行高与基线会变，见 `docs/status/PARITY.md` §5）。
-pub fn span_style_color(style: &rig_tui::ratatui::style::Style, theme: &Theme) -> Color {
-    use rig_tui::ratatui::style::{Modifier, Style};
-
-    let fg = style
-        .fg
-        .or(theme.fg.fg)
-        .unwrap_or(RColor::Rgb(210, 216, 228));
-    let base = style::color(Some(fg));
-    let mut srgb = base.to_srgba();
-    let band = style::color(Some(theme.band)).to_srgba();
-    let luma = |c: bevy::color::Srgba| 0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue;
-
-    // 终端画选中时把前景/背景对调（`Modifier::REVERSED`）。bevy_text 的 span
-    // 没有自己的底色，所以这里只能把前景换成"本来会画的底色"：span 自带
-    // `bg` 就换它，否则换主题底色。选中文字因此在面板上呈"挖空"状——比不
-    // 处理强，但和终端的反色块仍有差距（见本函数文档的退化说明）。
+/// 画不出来的只剩字重/斜体这类**没有字形变体**的样式（见
+/// `docs/status/PARITY.md` §5），以及终端里才有的字符格对齐。
+pub fn span_style_color(style: &Style, theme: &Theme) -> Color {
+    // 真反色：前景 = "本来会画的底色"（底色组件由 [`span_paint`] 另给）。
     if style.add_modifier.contains(Modifier::REVERSED) {
         let bg = style.bg.unwrap_or(theme.band);
-        let bg = style::color(Some(bg)).to_srgba();
-        return Color::srgb(bg.red, bg.green, bg.blue);
+        return style::color(Some(bg));
     }
+
+    let mut srgb = base_fg_color(style, theme).to_srgba();
+    let band = style::color(Some(theme.band)).to_srgba();
 
     if style.add_modifier.contains(Modifier::DIM) {
         let k = 0.45;
@@ -304,26 +355,17 @@ pub fn span_style_color(style: &rig_tui::ratatui::style::Style, theme: &Theme) -
         srgb.green += (1.0 - srgb.green) * k;
         srgb.blue += (1.0 - srgb.blue) * k;
     }
-    if style.add_modifier.contains(Modifier::UNDERLINED) {
-        let k = 0.12;
-        srgb.red += (1.0 - srgb.red) * k;
-        srgb.green += (1.0 - srgb.green) * k;
-        srgb.blue += (1.0 - srgb.blue) * k;
-    }
-    // 行内底色：画不出来，但要让文字"和没底色的文字"区分开。
-    if let Some(bg) = style.bg {
-        let bg = style::color(Some(bg)).to_srgba();
-        let k = 0.22;
-        let toward_light = luma(bg) < luma(srgb);
-        for channel in [&mut srgb.red, &mut srgb.green, &mut srgb.blue] {
-            *channel = if toward_light {
-                *channel + (1.0 - *channel) * k
-            } else {
-                *channel * (1.0 - k)
-            };
-        }
-    }
     Color::srgb(srgb.red, srgb.green, srgb.blue)
+}
+
+/// span 的基础前景：span 自己的 `fg`，否则主题主文字，最后兜底浅灰
+/// （不处理任何 `Modifier`）。
+fn base_fg_color(style: &Style, theme: &Theme) -> Color {
+    let fg = style
+        .fg
+        .or(theme.fg.fg)
+        .unwrap_or(RColor::Rgb(210, 216, 228));
+    style::color(Some(fg))
 }
 
 fn color_with_alpha(c: RColor, a: f32) -> Color {
@@ -651,14 +693,33 @@ fn request_lines(request: &RenderRequest) -> Vec<Line<'static>> {
     lines
 }
 
+/// 把行级底色从 `Line` 里摘出来，返回它该落成的 [`Row::band`]。
+///
+/// `rig_markdown::wrap::wrap` 会把 `Line::style` 并进每个 span（见它的
+/// `cells`），所以折过行的 span 会带着一份"行级底色"。那份底色已经由
+/// [`Row::band`] 画了，span 上再挂 `TextBackgroundColor` 会重复画一遍，
+/// 因此和行底色相同的 span 底色要清掉；不同色的才是真正的 span 级高亮。
+///
+/// `line.style.bg` 也一并清空，否则 [`fill_row_text_themed`] 的
+/// `line.style.patch(span.style)` 又会把它并回 span。
+pub(crate) fn take_line_band(line: &mut Line<'static>) -> Option<RColor> {
+    let band = line.style.bg.take();
+    for span in &mut line.spans {
+        if span.style.bg == band {
+            span.style.bg = None;
+        }
+    }
+    band
+}
+
 /// 把未折的行按 `width` 折成 [`Row`]：用上游的折行（按 unicode 宽度、词边界、
 /// 列表续行缩进），行自己的底色（`Line::style.bg`）变成 `Row::band`。
 fn wrap_rows(lines: &[Line<'static>], width: usize) -> Vec<Row> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for line in lines {
-        for (wrapped, _) in wrap(line, width) {
-            let band = wrapped.style.bg;
+        for (mut wrapped, _) in wrap(line, width) {
+            let band = take_line_band(&mut wrapped);
             let mut row = Row::new(wrapped);
             row.band = band;
             rows.push(row);
@@ -1157,6 +1218,7 @@ mod tests {
 mod span_style_tests {
     use super::*;
     use rig_tui::ratatui::style::{Modifier, Style};
+    use rig_tui::ratatui::text::Span;
 
     fn luma(c: Color) -> f32 {
         let c = c.to_srgba();
@@ -1190,33 +1252,223 @@ mod span_style_tests {
     }
 
     #[test]
-    fn underlined_is_distinguishable() {
+    fn underlined_keeps_the_foreground_and_asks_for_the_component() {
         let theme = Theme::default();
-        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
-        let under = span_style_color(
-            &Style::default()
-                .fg(RColor::Gray)
-                .add_modifier(Modifier::UNDERLINED),
-            &theme,
+        let plain = Style::default().fg(RColor::Gray);
+        let under = plain.add_modifier(Modifier::UNDERLINED);
+        // 下划线不再折成颜色：前景和普通文字一样，线由 `Underline` 组件真画。
+        assert_eq!(
+            span_style_color(&under, &theme),
+            span_style_color(&plain, &theme)
         );
-        assert_ne!(luma(plain), luma(under), "下划线画不出来，至少要能看出区别");
+        let paint = span_paint(&under, &theme);
+        assert!(paint.underline, "UNDERLINED 要挂 Underline 组件");
+        assert!(!paint.strikethrough);
+        assert_eq!(paint.bg, None, "下划线不是底色");
     }
 
     #[test]
-    fn span_background_shifts_away_from_itself() {
+    fn span_background_keeps_the_foreground_and_is_painted_as_a_component() {
         let theme = Theme::default();
-        // 深底 → 文字提亮；浅底 → 文字压暗。
-        let dark_bg = span_style_color(
-            &Style::default().fg(RColor::Gray).bg(RColor::Black),
-            &theme,
+        let plain = Style::default().fg(RColor::Gray);
+        let tinted = plain.bg(RColor::Blue);
+        // 底色自成一个组件，不再把前景提亮/压暗。
+        assert_eq!(
+            span_style_color(&tinted, &theme),
+            span_style_color(&plain, &theme)
         );
-        let plain = span_style_color(&Style::default().fg(RColor::Gray), &theme);
-        assert!(luma(dark_bg) > luma(plain));
-        let light_bg = span_style_color(
-            &Style::default().fg(RColor::Gray).bg(RColor::White),
-            &theme,
+        let paint = span_paint(&tinted, &theme);
+        assert_eq!(paint.bg, Some(style::color(Some(RColor::Blue))));
+        assert!(!paint.underline);
+        assert!(!paint.strikethrough);
+    }
+
+    /// 生成一个只装这一行的世界（不建窗口、不跑渲染），返回行实体。
+    fn spawn_row_world(row: &Row) -> (World, Entity) {
+        let font = FontSource::default();
+        let theme = Theme::default();
+        let mut world = World::new();
+        let mut row_entity = Entity::PLACEHOLDER;
+        {
+            let mut commands = world.commands();
+            commands.spawn_empty().with_children(|parent| {
+                row_entity = spawn_row_themed(parent, row, &font, &theme);
+            });
+        }
+        world.flush();
+        (world, row_entity)
+    }
+
+    /// 一个 span 实体上真正挂着的组件（值，不是引用）。
+    #[derive(Debug, PartialEq)]
+    struct PaintedSpan {
+        fg: Color,
+        bg: Option<Color>,
+        underline: Option<Color>,
+        strikethrough: Option<Color>,
+    }
+
+    /// 世界里所有 span 的 `(文本, 组件)`。
+    fn painted_spans(world: &mut World) -> Vec<(String, PaintedSpan)> {
+        let mut query = world.query::<(
+            &TextSpan,
+            &TextColor,
+            Option<&TextBackgroundColor>,
+            Option<&Underline>,
+            Option<&UnderlineColor>,
+            Option<&Strikethrough>,
+            Option<&StrikethroughColor>,
+        )>();
+        query
+            .iter(world)
+            .map(
+                |(span, color, bg, underline, underline_color, strike, strike_color)| {
+                    (
+                        span.0.clone(),
+                        PaintedSpan {
+                            fg: color.0,
+                            bg: bg.map(|bg| bg.0),
+                            underline: underline.map(|_| {
+                                underline_color.expect("Underline 必须带线色").0
+                            }),
+                            strikethrough: strike.map(|_| {
+                                strike_color.expect("Strikethrough 必须带线色").0
+                            }),
+                        },
+                    )
+                },
+            )
+            .collect()
+    }
+
+    /// 文本为 `text` 的那个 span 的组件。
+    fn painted(world: &mut World, text: &str) -> PaintedSpan {
+        let spans = painted_spans(world);
+        spans
+            .iter()
+            .find(|(span, _)| span == text)
+            .map(|(_, paint)| PaintedSpan {
+                fg: paint.fg,
+                bg: paint.bg,
+                underline: paint.underline,
+                strikethrough: paint.strikethrough,
+            })
+            .unwrap_or_else(|| {
+                let all: Vec<&str> = spans.iter().map(|(span, _)| span.as_str()).collect();
+                panic!("没有 span {text:?}：{all:?}")
+            })
+    }
+
+    #[test]
+    fn a_span_background_is_a_component_on_the_span() {
+        let want = RColor::Rgb(1, 2, 3);
+        let row = Row::new(Line::from(Span::styled(
+            "tinted",
+            Style::default().fg(RColor::Green).bg(want),
+        )));
+        let (mut world, _) = spawn_row_world(&row);
+        let span = painted(&mut world, "tinted");
+        assert_eq!(span.bg, Some(style::color(Some(want))));
+        // 前景仍然是原来的前景色，没有被底色提亮/压暗。
+        assert_eq!(span.fg, style::color(Some(RColor::Green)));
+    }
+
+    #[test]
+    fn an_underlined_span_gets_the_underline_component() {
+        let row = Row::new(Line::from(Span::styled(
+            "under",
+            Style::default()
+                .fg(RColor::Green)
+                .add_modifier(Modifier::UNDERLINED),
+        )));
+        let (mut world, _) = spawn_row_world(&row);
+        let span = painted(&mut world, "under");
+        assert_eq!(span.underline, Some(span.fg), "下划线颜色取前景色");
+        assert_eq!(span.bg, None);
+    }
+
+    #[test]
+    fn a_crossed_out_span_gets_the_strikethrough_component() {
+        let row = Row::new(Line::from(Span::styled(
+            "gone",
+            Style::default()
+                .fg(RColor::LightRed)
+                .add_modifier(Modifier::CROSSED_OUT),
+        )));
+        let (mut world, _) = spawn_row_world(&row);
+        let span = painted(&mut world, "gone");
+        assert_eq!(span.strikethrough, Some(span.fg), "删除线颜色取前景色");
+        assert_eq!(span.underline, None);
+        assert_eq!(span.bg, None);
+    }
+
+    #[test]
+    fn a_reversed_span_swaps_the_foreground_and_the_background() {
+        let theme = Theme::default();
+        // span 自带底色：前景换底色，底色换原本的前景。
+        let row = Row::new(Line::from(Span::styled(
+            "swap",
+            Style::default()
+                .fg(RColor::Red)
+                .bg(RColor::Blue)
+                .add_modifier(Modifier::REVERSED),
+        )));
+        let (mut world, _) = spawn_row_world(&row);
+        let span = painted(&mut world, "swap");
+        assert_eq!(span.fg, style::color(Some(RColor::Blue)), "前景 = 原本的底色");
+        assert_eq!(
+            span.bg,
+            Some(style::color(Some(RColor::Red))),
+            "底色 = 原本的前景"
         );
-        assert!(luma(light_bg) < luma(plain));
+
+        // 没有 span 底色时，前景换成主题 band、底色换成原本的前景。
+        let row = Row::new(Line::from(Span::styled(
+            "theme swap",
+            Style::default()
+                .fg(RColor::Red)
+                .add_modifier(Modifier::REVERSED),
+        )));
+        let (mut world, _) = spawn_row_world(&row);
+        let span = painted(&mut world, "theme swap");
+        assert_eq!(span.fg, style::color(Some(theme.band)));
+        assert_eq!(span.bg, Some(style::color(Some(RColor::Red))));
+    }
+
+    #[test]
+    fn a_plain_span_has_no_background_component() {
+        let (mut world, _) = spawn_row_world(&Row::new(Line::from("plain text")));
+        let span = painted(&mut world, "plain text");
+        assert_eq!(
+            span.bg, None,
+            "普通 span 不能带 TextBackgroundColor（默认黑底会刷满整行）"
+        );
+        assert_eq!(span.underline, None);
+        assert_eq!(span.strikethrough, None);
+    }
+
+    #[test]
+    fn row_text_stays_plain_text_after_span_decorations() {
+        // 选择/复制读的是 RowText：加了底色/下划线/反色之后它仍必须是纯文本。
+        let row = Row::new(Line::from(vec![
+            Span::raw("hello "),
+            Span::styled(
+                "world",
+                Style::default()
+                    .bg(RColor::Blue)
+                    .add_modifier(Modifier::REVERSED | Modifier::UNDERLINED),
+            ),
+            Span::styled(
+                "!",
+                Style::default().add_modifier(Modifier::CROSSED_OUT),
+            ),
+        ]))
+        .with_right(Line::from(" PgDn"));
+        let (world, row_entity) = spawn_row_world(&row);
+        assert_eq!(
+            world.get::<RowText>(row_entity).expect("RowText").0,
+            "hello world! PgDn"
+        );
     }
 
     #[test]
