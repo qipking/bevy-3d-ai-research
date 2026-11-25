@@ -79,7 +79,8 @@ pub use workspaces::{
 /// 业务代码只需要从这里拿东西。
 pub mod prelude {
     pub use crate::batch::{
-        BatchPlugin, CompletedCalls, ReplyStream, dialogue_batch, live_additions,
+        BatchPlugin, CompletedCalls, ReplyStream, dialogue_batch, dialogue_batch_of, live_additions,
+        source_rows,
     };
     pub use crate::editor::{Editor, PromptSubmitted, SubmittedPrompts};
     pub use crate::frame::{

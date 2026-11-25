@@ -44,7 +44,9 @@ pub enum PanelId {
     /// picker 列里的 preview 面板（插件挂 `PickPreview::Text` 时才有）。
     Preview,
     /// 第二个转写窗格：拆窗（`Alt+S`，见 [`crate::frame::split_transcript`]）后
-    /// 出现，每帧显示与 [`PanelId::Transcript`] 完全相同的可见行。
+    /// 出现。它是一块**独立视口**：每帧由 [`crate::pane::window_transcript`] 按
+    /// 根上 `TranscriptPane::source` 产行（默认 `Shown`，所以拆窗后与主窗格内容
+    /// 一致；改成 `Agent`/`Value` 就各画各的，不再镜像）。
     Pane2,
     /// 占位：分裂树里只吃空间、不画任何东西（右列顶部留白，让输入框贴底）。
     Spacer,
@@ -141,26 +143,6 @@ impl PanelSpawned {
     pub fn forget(&mut self, id: PanelId) {
         self.0.remove(&id);
     }
-}
-
-/// 把主转写的可见行复制给第二个转写窗格（拆窗后才存在）。
-///
-/// 转写的窗口化/滚动只在 [`crate::pane`] 里对 [`PanelId::Transcript`] 做一次；
-/// 拆出来的 [`PanelId::Pane2`] 只是同一份内容的第二个视口，所以每帧抄一份。
-/// 这是普通的面板行同步，`sync_panels` 不需要为它写特殊情况。
-fn mirror_transcript_rows(roots: Res<PanelRoots>, mut rows: ResMut<PanelRows>) {
-    mirror_pane2_rows(&mut rows, &roots);
-}
-
-/// 一块工作区自己的 `Pane2` 镜像（非聚焦工作区没有全局系统替它做）。
-fn mirror_pane2_rows(rows: &mut PanelRows, roots: &PanelRoots) {
-    if roots.entity(PanelId::Pane2).is_none() {
-        return;
-    }
-    let Some(source) = rows.0.get(&PanelId::Transcript).cloned() else {
-        return;
-    };
-    rows.0.insert(PanelId::Pane2, source);
 }
 
 fn row_plain(row: &Row) -> String {
@@ -298,8 +280,10 @@ fn sync_panels(
                 spawned: panel_spawned,
                 ..
             } = &mut *panels;
-            // 非聚焦工作区没有全局的 `mirror_transcript_rows` 替它镜像 Pane2。
-            mirror_pane2_rows(panel_rows, panel_roots);
+            // 聚焦工作区的窗格内容由 `pane::window_transcript` 按各自的
+            // `TranscriptPane::source` 填，非聚焦工作区由应用层按自己的 agent
+            // 同步；这里只做行 -> 节点的增量同步。
+
             // 选区现在只属于聚焦工作区（`Selection` 还没有工作区字段）：
             // 非聚焦的行按原样画，别把聚焦工作区的选中区间套过去。
             let workspace_selection = (set.focused == Some(*workspace))
@@ -338,7 +322,6 @@ impl Plugin for PanelsPlugin {
             .add_systems(
                 Update,
                 (
-                    mirror_transcript_rows,
                     commit_focused_panels,
                     sync_panels,
                     // F2：可点击行（Ask 选项 / picker 条目）的按钮态与 focus ring，
@@ -389,49 +372,6 @@ mod tests {
             .get::<Children>(root)
             .map(|children| children.iter().collect())
             .unwrap_or_default()
-    }
-
-    #[test]
-    fn pane2_mirrors_the_transcript_rows() {
-        use bevy::ecs::system::RunSystemOnce;
-
-        let mut world = World::new();
-        world.init_resource::<PanelRows>();
-        world.init_resource::<PanelRoots>();
-        let pane2 = world.spawn_empty().id();
-        world
-            .resource_mut::<PanelRoots>()
-            .0
-            .insert(PanelId::Pane2, pane2);
-        world.resource_mut::<PanelRows>().set(
-            PanelId::Transcript,
-            vec![keyed(10, "one"), keyed(20, "two")],
-        );
-
-        world.run_system_once(mirror_transcript_rows).unwrap();
-        let rows = world.resource::<PanelRows>();
-        let mirrored = rows.get(PanelId::Pane2);
-        assert_eq!(mirrored.len(), 2);
-        assert_eq!(mirrored[0].key, 10);
-        assert_eq!(mirrored[1].key, 20);
-        let text: String = mirrored[1]
-            .row
-            .line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(text, "two");
-
-        // 没有 Pane2 根实体时（还没拆窗）不建行槽，也不 panic。
-        let mut world = World::new();
-        world.init_resource::<PanelRows>();
-        world.init_resource::<PanelRoots>();
-        world
-            .resource_mut::<PanelRows>()
-            .set(PanelId::Transcript, vec![keyed(10, "one")]);
-        world.run_system_once(mirror_transcript_rows).unwrap();
-        assert!(!world.resource::<PanelRows>().0.contains_key(&PanelId::Pane2));
     }
 
     /// 新加的 `Pane2` / `Complete` 和普通面板走同一条 diff 路，不需要特例。

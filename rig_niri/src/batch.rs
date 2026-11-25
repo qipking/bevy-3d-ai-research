@@ -19,6 +19,8 @@
 //! [`dialogue_batch`] 把对话历史拼成批，[`live_additions`] 补上在飞调用、流式
 //! 正文/推理和待回答的 Ask —— 后者把 Ask 当普通行画在同一块面板里（那些条带
 //! 没有自己的确认 tile 在跑），并按 agent 过滤，两个条带的实时内容不会串台。
+//! 存档/子 agent 的侧窗格用 [`source_rows`]：按 [`rig_tui::TranscriptSource`]
+//! 选对话（`dialogue_batch_of`），实时部分只在 `Shown`/`Agent` 两条来源上补。
 //!
 //! 以前这里写死过一句中文"回复"，由每两帧吐一个字的假流式驱动 —— 已经删掉：
 //! 正文现在只来自真实的 `Partial`（运行中的流）或对话里的 assistant 消息。
@@ -4720,6 +4722,137 @@ mod tests {
             live_state(None, false, None, None, None, |_| None),
             CallState::Waiting,
             "没开始、没答复：queued"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 按来源出整段：Shown / Agent / Value
+    // -----------------------------------------------------------------------
+
+    /// 行身份 + 内容；比较"同一来源内容不变时 key 稳定"。
+    fn identity(rows: &[KeyedRow]) -> Vec<(u64, u64, String)> {
+        rows.iter()
+            .map(|keyed| (keyed.key, keyed.hash, text(&keyed.row.line)))
+            .collect()
+    }
+
+    fn saved_conversation() -> talk::Conversation {
+        let mut saved = talk::Conversation::new();
+        saved.push(Message::user("saved question"));
+        saved.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("saved answer"),
+        ])));
+        saved
+    }
+
+    #[test]
+    fn a_value_source_draws_only_the_given_conversation_and_has_no_live_part() {
+        // world 里故意有一个活调用：`Value` 只读传进来的对话，不碰内核。
+        let mut world = live_world();
+        let live_agent = world.spawn(AgentId("live".into())).id();
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_live", "search_live"),
+            },
+            ForAgent(live_agent),
+        ));
+        world.flush();
+
+        let source = TranscriptSource::Value(saved_conversation());
+        let rows = source_rows(&mut world, &source, 80);
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|keyed| text(&keyed.row.line))
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["› saved question".to_owned(), "saved answer".to_owned()],
+            "只有对话里的用户/assistant 文字，没有调用卡、没有实时块、没有 Ask"
+        );
+        assert!(!rows_text(&rows).contains("search_live"));
+
+        // 同一份 `Value` 再取一次：行 key/hash 逐行相同（不会每帧整块重建）。
+        let again = source_rows(&mut world, &source, 80);
+        assert_eq!(identity(&rows), identity(&again), "Value 行 key 要稳定");
+    }
+
+    #[test]
+    fn an_agent_source_draws_only_that_agents_conversation_and_calls() {
+        let mut world = live_world();
+        let sub = world.spawn(AgentId("sub".into())).id();
+        let other = world.spawn(AgentId("other".into())).id();
+        for (agent, id, tool, said) in [
+            (sub, "call_sub", "sub_tool", "sub says hi"),
+            (other, "call_other", "other_tool", "other says hi"),
+        ] {
+            let mut conversation = talk::Conversation::new();
+            conversation.push(Message::Assistant(AssistantMessage::new(vec![
+                AssistantContent::text(said),
+            ])));
+            world.entity_mut(agent).insert(Conversation(conversation));
+            world.spawn((
+                ToolRequest {
+                    call: named_call(id, tool),
+                },
+                ForAgent(agent),
+            ));
+        }
+        world.flush();
+
+        let rows = source_rows(&mut world, &TranscriptSource::Agent(sub), 60);
+        let text = rows_text(&rows);
+        assert!(text.contains("sub says hi"), "本 agent 的对话要出现：{text:?}");
+        assert!(text.contains("sub_tool"), "本 agent 的调用要出现：{text:?}");
+        assert!(
+            !text.contains("other says hi"),
+            "别的 agent 的对话不能串台：{text:?}"
+        );
+        assert!(
+            !text.contains("other_tool"),
+            "别的 agent 的调用不能串台（ForAgent 过滤）：{text:?}"
+        );
+
+        // 反过来也一样：`Agent(other)` 只看 other 自己。
+        let rows = source_rows(&mut world, &TranscriptSource::Agent(other), 60);
+        let text = rows_text(&rows);
+        assert!(text.contains("other says hi") && text.contains("other_tool"));
+        assert!(!text.contains("sub says hi") && !text.contains("sub_tool"));
+    }
+
+    #[test]
+    fn a_shown_source_resolves_through_shown_agent() {
+        let mut world = live_world();
+        let sub = world.spawn(AgentId("sub".into())).id();
+        let other = world.spawn(AgentId("other".into())).id();
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("shown text"),
+        ])));
+        world.entity_mut(sub).insert(Conversation(conversation));
+        world.insert_resource(ShownAgent(Some(sub)));
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_shown", "shown_tool"),
+            },
+            ForAgent(sub),
+        ));
+        world.spawn((
+            ToolRequest {
+                call: named_call("call_other", "other_tool"),
+            },
+            ForAgent(other),
+        ));
+        world.flush();
+
+        let shown = source_rows(&mut world, &TranscriptSource::Shown, 60);
+        let text = rows_text(&shown);
+        assert!(text.contains("shown text") && text.contains("shown_tool"));
+        assert!(!text.contains("other_tool"));
+        // `Shown` 就是 `Agent(ShownAgent)`：两条路逐行同形。
+        assert_eq!(
+            identity(&shown),
+            identity(&source_rows(&mut world, &TranscriptSource::Agent(sub), 60))
         );
     }
 }

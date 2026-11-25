@@ -603,13 +603,14 @@ fn end_scrollbar_drag(
 ///
 /// 上游同名组件（rig-tui `pane.rs:57`）只有 `source`/`title`；我们的滚动与条目
 /// 选中原本是全局 `PaneScroll` + `Selection`，S1 把每块窗格自己的那几份收到这里。
-/// `title`/`selected` 在 S1 还没有读取方（只是先把归属搬对），行为与改动前一致。
+/// `source` 在 S2 起被 [`window_transcript`] 读；`title` 还没有读取方（留到 S3，
+/// 不占行时行为与改动前一致）。
 #[derive(Component, Clone, Debug)]
 pub struct TranscriptPane {
-    /// 这块窗格画谁。S1 里两块都是 [`TranscriptSource::Shown`]（`Pane2` 仍由
-    /// [`crate::panels`] 的镜像填行），S2 才按来源产行。
+    /// 这块窗格画谁。两块默认都是 [`TranscriptSource::Shown`]，所以拆窗后内容
+    /// 仍一致；改成 `Agent`/`Value` 就由 [`crate::batch::source_rows`] 各画各的。
     pub source: TranscriptSource,
-    /// 窗格第一行的标题。`None` = 不占行（S1 不读它，保证画面零变化）。
+    /// 窗格第一行的标题。`None` = 不占行（S2 还不读它；实现见 S3/title 行）。
     pub title: Option<String>,
     /// 这块窗格自己的滚动（窗顶 + 是否跟随末尾）。
     pub scroll: PaneScroll,
@@ -684,20 +685,32 @@ fn panel_of(root: Entity, roots: &PanelRoots) -> Option<PanelId> {
 /// 优先看 Niri 的 `Tile`（新窗口逻辑），没有再退回帧布局的 `PanelAreas`。
 /// 列数只用于宽度裁剪"下面还有"标记（上游 `pane::draw_below` 在窗格比标记
 /// 窄时整句不画）。S1 从 `pane_size` 泛化成按根查询：每块窗格用自己的区域。
+fn pane_size_from(
+    areas: &std::collections::HashMap<Entity, crate::frame::PanelArea>,
+    root: Entity,
+    tile: Option<&crate::niri::Tile>,
+    tiling: Option<&crate::niri::Tiling>,
+) -> Option<(usize, usize)> {
+    if let (Some(tile), Some(tiling)) = (tile, tiling) {
+        let (cols, rows) = tiling.tile_cells(tile.layer, tile.column, tile.tile);
+        return (rows > 0).then_some((usize::from(cols), usize::from(rows)));
+    }
+    let area = areas.get(&root)?;
+    (!area.is_empty()).then_some((usize::from(area.cols), usize::from(area.rows)))
+}
+
+/// 某一块转写根这一帧能放多少列、多少行（`(cols, rows)`）。
+///
+/// 优先看 Niri 的 `Tile`（新窗口逻辑），没有再退回帧布局的 `PanelAreas`。
+/// 列数只用于宽度裁剪"下面还有"标记（上游 `pane::draw_below` 在窗格比标记
+/// 窄时整句不画）。S1 从 `pane_size` 泛化成按根查询：每块窗格用自己的区域。
 fn pane_size_of(
     areas: &PanelAreas,
     root: Entity,
     tiles: &Query<&crate::niri::Tile>,
     tiling: Option<&crate::niri::Tiling>,
 ) -> Option<(usize, usize)> {
-    if let Ok(tile) = tiles.get(root)
-        && let Some(tiling) = tiling
-    {
-        let (cols, rows) = tiling.tile_cells(tile.layer, tile.column, tile.tile);
-        return (rows > 0).then_some((usize::from(cols), usize::from(rows)));
-    }
-    let area = areas.get(root)?;
-    (!area.is_empty()).then_some((usize::from(area.cols), usize::from(area.rows)))
+    pane_size_from(&areas.0, root, tiles.get(root).ok(), tiling)
 }
 
 /// 滚上去、下面还是旧行时占掉最后一行的标记（rig-tui `pane::draw_below` 的同一句话）。
@@ -729,13 +742,20 @@ fn below_marker(text: &'static str) -> KeyedRow {
     }
 }
 
-/// 把整段的可见窗口写进**每一块**转写窗格（`FeathersSystems::Fit`）。
+/// 把每块转写窗格的可见窗口写进 `PanelRows[这块的 PanelId]`
+/// （`FeathersSystems::Fit`）。
 ///
 /// 遍历**所有**带 [`TranscriptPane`] 的转写根（有工作区时只处理当前工作副本
-/// 里的根），每块用自己的 [`pane_size_of`] 与 [`TranscriptPane::scroll`]
-/// 窗口化，写自己的 `PanelRows[这块的 PanelId]`。S1 里 `Pane2` 随后仍会被
-/// `panels` 的镜像覆盖（拆窗语义不变）；这里先各算各的，S2 删镜像时不用再改
-/// 窗口化。
+/// 里的根），每块按自己的 [`TranscriptPane::source`] 取整段，再用自己的
+/// [`pane_size_of`] 与 [`TranscriptPane::scroll`] 窗口化：
+///
+/// * [`TranscriptSource::Shown`]：走全局管线刚刚写进 [`TranscriptRows`] 的整段
+///   （和改动前逐行一致）；
+/// * 其它来源（`Agent` / `Value`）：由 [`crate::batch::source_rows`] 现取
+///   （侧窗格不跑 look，卡片是默认画法）。
+///
+/// S2 起两块窗格各是独立视口：`Pane2` 默认也是 `Shown`，所以拆窗后内容仍与
+/// 主窗格一致；把它的来源改成别的（测试直接改组件）就各画各的，不再镜像。
 ///
 /// 滚上去、下面还有行时，最后一行留给 [`BELOW_MARKER`]（rig-tui 是把标记
 /// 画在最后一行的右端，占掉的是同一行）。标记的文案由窗格自己的
@@ -744,62 +764,137 @@ fn below_marker(text: &'static str) -> KeyedRow {
 ///
 /// 宽度裁剪和上游一致：窗格比标记窄时整句不画，但最后一行仍然留空（上游
 /// `draw_below` 里 `area.width < width` 直接 return）。
-// `legacy` 是 `editor.rs` 的兼容入口（见 [`PaneScroll`] 的文档）。
-pub fn window_transcript(
-    areas: Res<PanelAreas>,
-    roots: Res<PanelRoots>,
-    full: Res<TranscriptRows>,
-    legacy: Option<Res<PaneScroll>>,
-    set: Option<Res<crate::workspaces::WorkspaceSet>>,
-    mut panes: Query<(Entity, Option<&PanelId>, &mut TranscriptPane)>,
-    mut panels: ResMut<PanelRows>,
-    tiles: Query<&crate::niri::Tile>,
-    tiling: Option<Res<crate::niri::Tiling>>,
-    mut first_frame: Local<bool>,
-) {
-    // 兼容入口：资源被改的那一帧把请求交给**主转写**（`editor.rs` 发送时设
-    // `follow` 的语义一直是“主窗格跟末尾”；`Pane2` 在 S1 仍镜像主窗格）。
-    // 这里不反向写回资源，所以资源永远只是“最近一次请求”，不是滚动状态的
-    // 第二份副本。第一帧跳过：`PanePlugin` 刚 `init_resource` 的默认值不是
-    // 请求，别拿它覆盖窗格自己带的初始位置。
-    if !*first_frame {
-        *first_frame = true;
-    } else if let Some(legacy) = legacy.as_ref().filter(|legacy| legacy.is_changed())
-        && let Some(root) = roots.entity(PanelId::Transcript)
-        && let Ok((_, _, mut pane)) = panes.get_mut(root)
+///
+/// 这是独占系统：`Agent`/`Value` 来源的 [`crate::batch::source_rows`] 要读内核
+/// （`live_additions` 在 world 上跑查询），普通系统参数拿不到 `&mut World`。
+///
+/// TODO(S3/title)：`TranscriptPane::title = Some(..)` 时在窗口顶部插一行 dim
+/// 标题（设计用 key `u64::MAX - 2`，`item_rows` 跳过它）。S2 不做：`title`
+/// 默认 `None`，保证主窗格的行数与改动前逐行一致。
+pub fn window_transcript(world: &mut World, mut first_frame: Local<bool>) {
+    // 旧签名里这四样是系统参数：缺任何一个时系统本来就会被跳过。
+    if !world.contains_resource::<PanelRows>()
+        || !world.contains_resource::<PanelRoots>()
+        || !world.contains_resource::<PanelAreas>()
+        || !world.contains_resource::<TranscriptRows>()
     {
-        pane.scroll = **legacy;
+        return;
     }
 
-    // 先收集再写 `PanelRows`：查询借用窗格组件，面板资源是另一份容器的借用。
-    // 遍历**所有**带 `TranscriptPane` 的根；`PanelId` 优先从当前工作副本的
-    // `PanelRoots` 反查（旧的无窗口测试只登记了根），没有时用根上挂的
-    // `PanelId`（`spawn_panel` 会挂）。
-    //
-    // 有工作区时只处理当前工作副本里的根：非聚焦工作区的行在它自己的
-    // `WorkspacePanels` 里，不能拿聚焦工作区的 `TranscriptRows` 去写。
-    let workspace_mode = set
-        .as_deref()
-        .is_some_and(|set| !set.items.is_empty());
-    let mut updates: Vec<(PanelId, Vec<KeyedRow>)> = Vec::new();
-    for (entity, component_id, mut pane) in panes.iter_mut() {
-        let Some(id) = panel_of(entity, &roots).or(component_id.copied()) else {
-            continue;
-        };
-        if !matches!(id, PanelId::Transcript | PanelId::Pane2) {
-            continue;
+    // 兼容入口：资源被改的那一帧把请求交给**主转写**（`editor.rs` 发送时设
+    // `follow` 的语义一直是"主窗格跟末尾"）。这里不反向写回资源，所以资源
+    // 永远只是"最近一次请求"，不是滚动状态的第二份副本。第一帧跳过：
+    // `PanePlugin` 刚 `init_resource` 的默认值不是请求，别拿它覆盖窗格自己
+    // 带的初始位置。
+    if !*first_frame {
+        *first_frame = true;
+    } else if world.is_resource_changed::<PaneScroll>() {
+        let legacy = *world.resource::<PaneScroll>();
+        if let Some(root) = world.resource::<PanelRoots>().entity(PanelId::Transcript) {
+            if let Some(mut pane) = world.get_mut::<TranscriptPane>(root) {
+                pane.scroll = legacy;
+            }
         }
-        if workspace_mode && roots.entity(id) != Some(entity) {
-            continue;
-        }
-        let Some((width, height)) = pane_size_of(&areas, entity, &tiles, tiling.as_deref()) else {
-            continue;
-        };
-        updates.push((id, window_pane(&full.0, &mut pane, width, height)));
     }
+
+    // 先收集候选（根、面板身份、来源、自己的滚动状态）。来源在这里克隆：
+    // `Value` 只读快照，后续要用 `&mut World` 取行，不能再借组件。
+    let roots = world.resource::<PanelRoots>().clone();
+    // 有工作区时只处理当前工作副本里的根：非聚焦工作区的行在它自己的
+    // `WorkspacePanels` 里，不能拿聚焦工作区的整段去写。
+    let workspace_mode = world
+        .get_resource::<crate::workspaces::WorkspaceSet>()
+        .is_some_and(|set| !set.items.is_empty());
+    let mut panes: Vec<PaneWindow> = Vec::new();
+    {
+        let mut query = world.query::<(Entity, Option<&PanelId>, &TranscriptPane)>();
+        for (entity, component_id, pane) in query.iter(world) {
+            // `PanelId` 优先从当前工作副本的 `PanelRoots` 反查（旧的无窗口
+            // 测试只登记了根），没有时用根上挂的 `PanelId`（`spawn_panel` 会挂）。
+            let Some(id) = panel_of(entity, &roots).or(component_id.copied()) else {
+                continue;
+            };
+            if !matches!(id, PanelId::Transcript | PanelId::Pane2) {
+                continue;
+            }
+            if workspace_mode && roots.entity(id) != Some(entity) {
+                continue;
+            }
+            panes.push(PaneWindow {
+                entity,
+                id,
+                pane: pane.clone(),
+                size: None,
+            });
+        }
+    }
+
+    // 每块窗格自己的区域（先克隆区域表：接下来要建 tile 查询，借不动它）。
+    {
+        let areas = world.resource::<PanelAreas>().0.clone();
+        let tiling = world.get_resource::<crate::niri::Tiling>().cloned();
+        let mut tiles = world.query::<&crate::niri::Tile>();
+        for pane in &mut panes {
+            let tile = tiles.get(world, pane.entity).ok();
+            pane.size = pane_size_from(&areas, pane.entity, tile, tiling.as_ref());
+        }
+    }
+
+    let mut updates: Vec<(PanelId, Vec<KeyedRow>)> = Vec::new();
+    // 窗口化会改窗格自己的 `scroll`/`below`；先算在局部的克隆上，最后写回，
+    // 这样取整段时可以放心地借 world 的资源。
+    let mut states: Vec<(Entity, PaneScroll, BelowSeen)> = Vec::new();
+
+    // 1) 非 `Shown` 的来源：各自现取整段（独占 world，必须在借 `TranscriptRows`
+    //    之前做完）。
+    for pane in panes
+        .iter_mut()
+        .filter(|pane| !matches!(pane.pane.source, TranscriptSource::Shown))
+    {
+        let Some((width, height)) = pane.size else {
+            continue;
+        };
+        let all = crate::batch::source_rows(world, &pane.pane.source, width as u16);
+        let visible = window_pane(&all, &mut pane.pane, width, height);
+        updates.push((pane.id, visible));
+        states.push((pane.entity, pane.pane.scroll, pane.pane.below));
+    }
+
+    // 2) `Shown`：全局管线已经写好的整段（窗口化行为与 S1 逐行一致）。
+    {
+        let full = world.resource::<TranscriptRows>();
+        for pane in panes
+            .iter_mut()
+            .filter(|pane| matches!(pane.pane.source, TranscriptSource::Shown))
+        {
+            let Some((width, height)) = pane.size else {
+                continue;
+            };
+            let visible = window_pane(&full.0, &mut pane.pane, width, height);
+            updates.push((pane.id, visible));
+            states.push((pane.entity, pane.pane.scroll, pane.pane.below));
+        }
+    }
+
+    for (entity, scroll, below) in states {
+        if let Some(mut pane) = world.get_mut::<TranscriptPane>(entity) {
+            pane.scroll = scroll;
+            pane.below = below;
+        }
+    }
+    let mut panels = world.resource_mut::<PanelRows>();
     for (id, rows) in updates {
         panels.set(id, rows);
     }
+}
+
+/// [`window_transcript`] 的一块候选：转写根、它写哪块面板、来源/滚动/标题
+/// 的克隆，以及这一帧算出来的区域。
+struct PaneWindow {
+    entity: Entity,
+    id: PanelId,
+    pane: TranscriptPane,
+    size: Option<(usize, usize)>,
 }
 
 /// 一块窗格的窗口化（[`window_transcript`] 的主体；每块窗格各用自己的滚动）。
@@ -2621,10 +2716,13 @@ mod tests {
         );
     }
 
-    // ---- S1：逐窗格状态 + 活动窗格（`Pane2` 仍镜像） ----
+    // ---- S1/S2：逐窗格状态、活动窗格、按来源独立窗口化 ----
 
     use bevy::ecs::system::RunSystemOnce;
     use bevy::text::FontSource;
+
+    use rig_core::conversation::Conversation as SavedConversation;
+    use rig_core::message::{AssistantContent, AssistantMessage, Message};
 
     use crate::panels::PanelsPlugin;
     use crate::transcript::TranscriptFont;
@@ -2666,12 +2764,11 @@ mod tests {
         pane2: Entity,
     }
 
-    /// 两块转写 + 真的 `window_transcript`（Fit）与 `mirror_transcript_rows`
-    /// （Render）；不建窗口。
+    /// 两块转写 + 真的 `window_transcript`（Fit）；不建窗口。
     fn split_app() -> SplitFixture {
         let mut app = App::new();
         // 生产里由 `FeathersViewPlugin::build` 排好的阶段顺序（键在 Prepare、
-        // 窗口化在 Fit、镜像在 Render）。
+        // 窗口化在 Fit、行同步在 Render）。
         app.configure_sets(
             Update,
             (
@@ -2705,7 +2802,7 @@ mod tests {
         app.world().resource::<PanelRows>().get(panel).to_vec()
     }
 
-    /// 行的身份 + 内容（逐行比较镜像语义）。
+    /// 行的身份 + 内容（逐行比较两列）。
     fn signatures(rows: &[KeyedRow]) -> Vec<(u64, u64, String)> {
         rows.iter()
             .map(|keyed| {
@@ -2763,48 +2860,97 @@ mod tests {
         assert_eq!(rows[0].key, 15, "默认跟随末尾：20 - 5");
     }
 
-    /// 拆窗后两列逐行相等：`Pane2` 仍由 `mirror_transcript_rows` 填。
+    /// 拆窗后两列逐行相等：两块都是 `Shown`，但各自窗口化（不再镜像）。
     #[test]
     fn split_panes_show_the_same_rows_line_by_line() {
         let fixture = split_app();
         let main = rows_of(&fixture.app, PanelId::Transcript);
-        let mirrored = rows_of(&fixture.app, PanelId::Pane2);
+        let pane2 = rows_of(&fixture.app, PanelId::Pane2);
         assert_eq!(main.len(), SPLIT_HEIGHT as usize);
         assert_eq!(
             signatures(&main),
-            signatures(&mirrored),
+            signatures(&pane2),
             "拆窗后两列逐行相等（key/hash/文本）"
         );
     }
 
-    /// 主窗格 PgDn：主列变，`Pane2` 跟着变（镜像仍然生效）。
+    /// 主窗格 PgDn：主列变，`Pane2` 停在自己的末尾（独立视口，不再跟着镜像）。
     #[test]
-    fn paging_the_main_pane_moves_the_mirrored_pane_too() {
+    fn paging_the_main_pane_leaves_pane2_at_its_own_bottom() {
         let mut fixture = split_app();
         // 拆窗后活动窗格是 Pane2；这条测的是主窗格，先切回去。
         set_active(&mut fixture.app, fixture.transcript);
 
         let before_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
         let before_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
-        assert_eq!(before_main, before_pane2);
+        assert_eq!(before_main, before_pane2, "初始都在末尾");
 
         // 跟随末尾时 PgDn 不动；先 PgUp 离开末尾，再 PgDn 回来，两次都应变化。
         tap(&mut fixture.app, &[], KeyCode::PageUp);
         let after_up_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
-        let after_up_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
         assert_ne!(before_main, after_up_main, "PgUp 后主窗格换了窗口");
         assert_eq!(
-            after_up_main, after_up_pane2,
-            "Pane2 镜像主窗格（同一份可见行）"
+            before_pane2,
+            signatures(&rows_of(&fixture.app, PanelId::Pane2)),
+            "Pane2 是独立视口：主窗格滚动不改变它"
         );
 
         tap(&mut fixture.app, &[], KeyCode::PageDown);
         let after_down_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
-        let after_down_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
         assert_ne!(after_up_main, after_down_main, "PgDn 后主窗格又变了");
         assert_eq!(
-            after_down_main, after_down_pane2,
-            "主窗格 PgDn 后 Pane2 跟着变"
+            before_main, after_down_main,
+            "PgDn 回到底部，主窗格回到初始窗口"
+        );
+        assert_eq!(
+            before_pane2,
+            signatures(&rows_of(&fixture.app, PanelId::Pane2)),
+            "Pane2 一直停在自己的末尾"
+        );
+    }
+
+    /// 把 `Pane2.source` 改成 `Value(存档对话)`：两列各画各的，且同一份来源
+    /// 内容不变时行 key/hash 逐帧稳定（面板增量 diff 不会整块重建）。
+    #[test]
+    fn pane2_with_an_independent_value_source_draws_that_conversation() {
+        let mut fixture = split_app();
+        let before_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
+
+        let mut saved = SavedConversation::new();
+        saved.push(Message::user("saved question"));
+        saved.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::text("saved answer"),
+        ])));
+        fixture
+            .app
+            .world_mut()
+            .get_mut::<TranscriptPane>(fixture.pane2)
+            .expect("Pane2 根")
+            .source = TranscriptSource::Value(saved);
+        fixture.app.update();
+
+        let main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
+        let pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
+        assert_eq!(before_main, main, "主窗格还是全局 Shown 管线，不受 Pane2 影响");
+        assert_ne!(main, pane2, "两块来源不同，内容必须不同");
+        let pane2_text = pane2
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(pane2_text.contains("saved question"), "{pane2_text:?}");
+        assert!(pane2_text.contains("saved answer"), "{pane2_text:?}");
+        assert!(
+            !pane2_text.contains("row 99"),
+            "Pane2 不再镜像主窗格：{pane2_text:?}"
+        );
+
+        // 同一份 Value 再窗口化一次：逐行 key/hash/文本相同（临时引擎也稳定）。
+        fixture.app.update();
+        assert_eq!(
+            pane2,
+            signatures(&rows_of(&fixture.app, PanelId::Pane2)),
+            "来源内容不变时行 key 必须稳定"
         );
     }
 
@@ -2928,7 +3074,7 @@ mod tests {
             let pane = pane_of(&fixture.app, root);
             assert!(
                 matches!(pane.source, TranscriptSource::Shown),
-                "S1 两块都还是 Shown（Pane2 靠镜像填行）"
+                "默认两块都是 Shown：拆窗后内容一致由独立窗口化保证"
             );
             assert!(pane.title.is_none(), "默认没有标题行");
             assert_eq!(pane.selected, None);
