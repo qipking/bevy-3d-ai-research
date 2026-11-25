@@ -38,7 +38,9 @@
 //! }
 //! ```
 //!
-//! Ctrl+V 时：`clipboard::paste_from_clipboard(&mut clipboard, &mut editor)`。
+//! Ctrl+V 时：`editor::keys` 把 `InputAction::PasteImage` 交到
+//! [`paste_from`]（优先内存替身、其次系统剪贴板），文本插到光标处；失败写
+//! [`PASTE_FAILED`] 状态行。**只粘文本**：图片分支没有入口，原因见上。
 
 use std::path::{Path, PathBuf};
 
@@ -102,6 +104,22 @@ pub fn show_copy_failed(status: &mut AppStatus, why: &str) {
 /// 复制成功后清掉上一次的失败提示。
 pub fn clear_copy_failed(status: &mut AppStatus) {
     status.0.hide(COPY_FAILED.name);
+}
+
+/// 粘贴失败时状态行的条目。
+///
+/// 和 [`COPY_FAILED`] 同形但名字分开：复制失败和粘贴失败各自清各自的，
+/// 一次成功的粘贴不会顺手清掉复制错误的提示。
+pub const PASTE_FAILED: StatusItem = StatusItem::new("paste", Side::Left, 94, 10);
+
+/// 把粘贴失败的原因写进状态行（红色），与 [`Copied`] 的成功提示同一套机制。
+pub fn show_paste_failed(status: &mut AppStatus, why: &str) {
+    status.0.show(PASTE_FAILED.says(why, Tone::Red));
+}
+
+/// 粘贴成功后清掉上一次的失败提示。
+pub fn clear_paste_failed(status: &mut AppStatus) {
+    status.0.hide(PASTE_FAILED.name);
 }
 
 /// 把 `Selection::copied` 变成状态行的 `Copied N lines`。
@@ -236,6 +254,10 @@ pub enum Paste {
 }
 
 /// 读剪贴板：只读文本，空剪贴板算错误。
+///
+/// 剪贴板里**只有图片**时 `bevy_clipboard` 的文本读取给
+/// `ContentNotAvailable`，这里落成 [`NO_CLIPBOARD_TEXT`]（图片粘贴没接，
+/// 原因见 [`Paste::Image`] 与模块文档）。
 pub fn read_paste(clipboard: &mut impl ClipboardText) -> Result<Paste, String> {
     let text = clipboard.read_text()?;
     if text.is_empty() {
@@ -284,6 +306,24 @@ pub fn paste_from_clipboard(
     let paste = read_paste(clipboard)?;
     apply_paste(editor, paste);
     Ok(())
+}
+
+/// Ctrl+V 的可注入入口：优先内存替身，其次系统剪贴板，都没有就报错。
+///
+/// 和 `selection::copy_released` 同一套优先级，所以单测/没有系统剪贴板的
+/// 环境插入 [`MemoryClipboard`] 就能验证整条 Ctrl+V 链路。返回的错误已经
+/// 是给人看的句子（[`NO_CLIPBOARD`] / [`NO_CLIPBOARD_TEXT`] / 读取失败），
+/// 调用方直接写状态行即可。图片粘贴仍然不做：原因见 [`Paste::Image`]。
+pub fn paste_from(
+    editor: &mut Editor,
+    system: Option<&mut Clipboard>,
+    memory: Option<&mut MemoryClipboard>,
+) -> Result<(), String> {
+    match (memory, system) {
+        (Some(memory), _) => paste_from_clipboard(memory, editor),
+        (None, Some(system)) => paste_from_clipboard(system, editor),
+        (None, None) => Err(NO_CLIPBOARD.to_owned()),
+    }
 }
 
 /// `path` 写成 `@path`；含空白、引号、行号范围或以标点结尾时加引号。

@@ -26,11 +26,13 @@
 //! | 双击 | [`Selection::press_kind`]（或用 [`Selection::press`] 自动数） | 选中当前词 |
 //! | 三击 | 同上 | 选中整行 |
 //! | 点空白 | 行越界，或 [`Selection::clear`] | 清除选区 |
+//! | Alt+↑/↓（`pane.rs`） | [`Selection::select_item`] | 选中一整块条目（复用下面的高亮/复制） |
 //! | 滚轮 | [`crate::pane::pane_wheel`] | 滚走的内容收起选区（滚动本身在 `pane.rs`） |
 //! | 窗口/面板尺寸变化 | [`clear_selection_on_resize`] | 清除选区（上游 `Event::Resize`） |
 //!
 //! 上游 0.47 本身只有拖选，没有双击/三击；这里按任务要求补齐终端惯例。
-//! 键盘 Shift+方向不在本模块范围内。
+//! 键盘条目选择存的是**块序号**（[`Selection::item`]，行 key 的高 32 位），
+//! 不与鼠标拖选混用：鼠标一按下就清掉它；按键本身由 `pane.rs` 读。
 
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -126,6 +128,12 @@ pub struct Selection {
     copied: Option<usize>,
     /// 连击计数（双击/三击）。
     clicked: Option<ClickRecord>,
+    /// 键盘选中的转写条目：块序号（行 key 的高 32 位）。
+    ///
+    /// `None` 表示这是鼠标拖选，或者没有选区。鼠标按下会清掉它
+    /// （见 [`Selection::apply`]），所以“键盘选中了一整块”和“拖了一段文字”
+    /// 不会同时存在；两类选区共用下面的高亮与复制接口。
+    item: Option<u32>,
 }
 
 impl Default for Selection {
@@ -144,6 +152,7 @@ impl Selection {
             dragging: false,
             copied: None,
             clicked: None,
+            item: None,
         }
     }
 
@@ -180,6 +189,44 @@ impl Selection {
     /// [`Selection::is_active`] 的别名，语义更直白。
     pub fn has_selection(&self) -> bool {
         self.is_active()
+    }
+
+    /// 键盘选中的条目（块序号，行 key 的高 32 位）；鼠标选区是 `None`。
+    pub fn item(&self) -> Option<u32> {
+        self.item
+    }
+
+    /// 选中一整块条目：`from..to` 是它在**当前行数组**里的行区间（左闭右开）。
+    ///
+    /// `item` 是块序号（`row_key` 的高 32 位，见 [`crate::transcript`]），
+    /// 由 [`crate::pane`] 从 `key >> 32` 分组得到。终点用“区间后一行的行首”，
+    /// 所以条目最后一行整行都算选中；`to` 可以等于 `rows.len()`，取值处会像
+    /// 鼠标选区一样夹紧。
+    ///
+    /// 高亮（[`Selection::ranges_in`]）和复制（[`Selection::selected_text`]）
+    /// 与鼠标拖选共用同一份数据，不需要另一套绘制。
+    pub fn select_item(&mut self, panel: PanelId, from: usize, to: usize, item: u32) {
+        self.panel = Some(panel);
+        self.anchor = Point::new(from, 0);
+        self.focus = Point::new(to, 0);
+        self.dragging = false;
+        self.copied = None;
+        self.clicked = None;
+        self.item = Some(item);
+    }
+
+    /// 选中的条目暂时滚出窗口：保留 [`Selection::item`] 身份，但收起高亮
+    /// （锚点和焦点收成一点）。滚回来时再 [`Selection::select_item`]。
+    ///
+    /// 上游 `TranscriptView::selected` 是条目身份，滚动不会把它清掉；这里
+    /// 高亮必须落在可见行上，所以滚出窗口的这段时间只是“不画”。
+    pub fn suspend_item(&mut self) {
+        if self.item.is_some() {
+            self.anchor = Point::ZERO;
+            self.focus = Point::ZERO;
+            self.dragging = false;
+            self.copied = None;
+        }
     }
 
     /// 左键是否还按着（拖选进行中）。
@@ -408,6 +455,9 @@ impl Selection {
         self.panel = Some(panel);
         self.copied = None;
         self.dragging = false;
+        // 鼠标按下换成了拖选：键盘选中的条目身份作废（否则 `pane` 的每帧重算
+        // 会把这一块重新盖到刚拖出来的选区上）。
+        self.item = None;
         match kind {
             ClickKind::Single => {
                 self.anchor = at;
@@ -1505,6 +1555,66 @@ mod tests {
         selection.clear();
         assert_eq!(selection.copied(), None);
     }
+
+    // ---- 键盘条目选择（pane.rs 的 Alt+↑/↓） ----
+
+    #[test]
+    fn a_keyboard_item_selects_every_row_of_its_block() {
+        let rows = transcript(&["above", "one", "two", "below"]);
+        let mut selection = Selection::new();
+        selection.select_item(PanelId::Transcript, 1, 3, 7);
+
+        assert!(selection.is_active());
+        assert_eq!(selection.item(), Some(7));
+        assert_eq!(selection.start(), Point::new(1, 0));
+        assert_eq!(selection.end(), Point::new(3, 0), "终点是区间后一行的行首");
+        assert_eq!(
+            selection.all_ranges(&rows),
+            vec![(1, vec![(0, 3)]), (2, vec![(0, 3)])]
+        );
+        assert_eq!(selection.ranges_in(0, &rows), Vec::<(usize, usize)>::new());
+        assert_eq!(selection.ranges_in(3, &rows), Vec::<(usize, usize)>::new());
+        assert_eq!(selection.selected_text(&rows).as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
+    fn an_item_scrolled_out_of_view_keeps_its_identity_but_hides() {
+        let rows = transcript(&["one", "two"]);
+        let mut selection = Selection::new();
+        selection.select_item(PanelId::Transcript, 0, 2, 3);
+        selection.mark_copied(2);
+
+        selection.suspend_item();
+        assert_eq!(selection.item(), Some(3), "滚出窗口不丢条目身份");
+        assert!(!selection.is_active());
+        assert!(!selection.has_selection());
+        assert!(selection.all_ranges(&rows).is_empty());
+        assert_eq!(selection.copied(), None);
+
+        // 滚回来：同一个条目重新盖住它的行。
+        selection.select_item(PanelId::Transcript, 1, 2, 3);
+        assert_eq!(selection.selected_text(&rows).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn a_mouse_press_replaces_the_keyboard_item_selection() {
+        let rows = transcript(&["hello world"]);
+        let mut selection = Selection::new();
+        selection.select_item(PanelId::Transcript, 0, 1, 9);
+        assert!(selection.is_active());
+
+        selection.press_kind(
+            PanelId::Transcript,
+            &rows,
+            0,
+            0,
+            ClickKind::Single,
+        );
+        assert_eq!(selection.item(), None, "鼠标按下清掉条目身份");
+        assert!(selection.is_dragging(), "点击路径照旧从按下处开始拖选");
+        selection.drag(PanelId::Transcript, &rows, 0, 5);
+        assert_eq!(selection.selected_text(&rows).as_deref(), Some("hello"));
+    }
 }
 
 #[cfg(test)]
@@ -1890,6 +2000,31 @@ mod wiring_tests {
         fixture.app.update();
         assert_eq!(printed(&fixture).as_deref(), Some("world"));
         assert_eq!(copied(&fixture), vec![Copied { lines: 1 }]);
+    }
+
+    #[test]
+    fn a_mouse_click_after_a_keyboard_item_selection_uses_the_pointer_path() {
+        let mut fixture = fixture(&["hello world", "next"]);
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Transcript, 0, 2, 3);
+        assert_eq!(selection(&fixture).item(), Some(3));
+
+        // 双击 "world"：走的还是原来的 PointerPress -> press_kind 路径。
+        press(&mut fixture, 0, 8, 2);
+        fixture.app.update();
+        let rows = fixture
+            .app
+            .world()
+            .resource::<PanelRows>()
+            .row_values(PanelId::Transcript);
+        assert_eq!(selection(&fixture).item(), None, "鼠标点击接管选区");
+        assert_eq!(
+            selection(&fixture).selected_text(&rows).as_deref(),
+            Some("world")
+        );
     }
 
     #[test]

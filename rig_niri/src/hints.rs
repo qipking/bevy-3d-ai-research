@@ -30,7 +30,7 @@ pub fn keys(turn_running: bool) -> &'static [Key] {
             ("Tab sends after the turn", 7),
             ("Esc stops", 10),
             ("Shift+Enter or Ctrl+J new line", 5),
-            ("Ctrl+V image", 1),
+            ("Ctrl+V paste", 1),
             ("/ commands", 4),
             ("@ files", 2),
             ("Ctrl+D quits", 3),
@@ -38,7 +38,7 @@ pub fn keys(turn_running: bool) -> &'static [Key] {
         false => &[
             ("Enter sends", 9),
             ("Shift+Enter or Ctrl+J new line", 7),
-            ("Ctrl+V image", 4),
+            ("Ctrl+V paste", 4),
             ("/ commands", 8),
             ("@ files", 5),
             ("Ctrl+D quits", 6),
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "提示行永远是一行，不折行");
         assert_eq!(
             row_text(&rows[0]),
-            "Enter sends · Shift+Enter or Ctrl+J new line · Ctrl+V image · \
+            "Enter sends · Shift+Enter or Ctrl+J new line · Ctrl+V paste · \
              / commands · @ files · Ctrl+D quits"
         );
         // 和输入面板原来用的函数同一个结果（拆行不改文案）。

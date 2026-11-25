@@ -27,19 +27,32 @@
 //! 额外送一条普通消息（上游靠内核的 `Incoming::command` 分流；本 crate 没有
 //! refused 概念，所以也不做 `Deliver::literal` 重发）。
 //!
-//! 未接的行为：粘贴图片（Ctrl+V）、转写区滚动/选择（由 `pane.rs` 现有系统负责）；
-//! 这些动作在表里已经能解析，`act` 里是空实现，等对应模块移植时再连。
+//! 显示：`editor_rows` 把文本按输入面板列宽折行（和转写同一个
+//! `rig_tui::wrap::wrap`），每行一个 [`KeyedRow`]；光标画在真实行列上
+//! （反色 + 下划线的 `▏`），超过 [`MOST_LINES`] 行时按光标滚动。
+//! [`sync_editor_tile`] 让输入 tile 的高度跟着行数走（最少 [`LEAST_ROWS`]
+//! 行、最多 [`MOST_LINES`] 行 + 面板上下 chrome），右列的总高仍由 Spacer
+//! 这个比例子吸收，精确不变。
+//!
+//! 未接的行为：粘贴图片（Ctrl+V 现在只粘文本；图片见 [`crate::clipboard`]
+//! 模块文档）、转写区滚动/选择（由 `pane.rs` 现有系统负责）。
 
 use bevy::ecs::entity_disabling::Disabled;
 use bevy::ecs::query::Allow;
+use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
 use bevy::prelude::*;
 use rig_ecs::prelude::{ActiveTurn, Deliver, DeliveryMode, StopTurn};
 use rig_harness::main_agent::ShownAgent;
-use rig_tui::ratatui::style::{Color as RColor, Style};
+use rig_tui::AppStatus;
+use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
+use rig_tui::ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
+use crate::clipboard::{self, MemoryClipboard};
+use crate::frame::{FrameTree, PanelAreas, PanelRoots};
 use crate::keys::{
     self, BindingRef, Found, InputAction, KeyBinding, KeyFocus, KeyPressed, KeyScope, Modifiers,
     PendingInput,
@@ -47,7 +60,7 @@ use crate::keys::{
 use crate::pane::PaneScroll;
 use crate::panels::{KeyedRow, PanelId, PanelRows};
 use crate::theme::Theme;
-use crate::transcript::Row;
+use crate::transcript::{ROW_HEIGHT, Row, row_hash};
 
 /// 编辑器状态。
 ///
@@ -68,6 +81,154 @@ pub struct Editor {
     pub history_pos: Option<usize>,
     /// 开始浏览历史前正在写的草稿；Down 翻过最新一条时带回来。
     draft: String,
+}
+
+/// 输入框最多显示几行；再多就滚动（上游 `rig-tui editor.rs:28` 的
+/// `MOST_LINES`）。
+pub const MOST_LINES: usize = 10;
+
+/// 输入框最低的**视觉**高度：3 行。
+///
+/// 空输入按公式只有 `1 行 + chrome` = 38px，比现在固定的 72px 矮近一半：
+/// 点击目标太小，而且输入框下面紧贴着 hints / 状态行，输入框一缩这些 tile
+/// 会跟着往下跳。3 行（54px）留出 1.9 行左右的文字可见区，点击目标接近
+/// 原来 4 行的观感，又不会比现在更占高度。
+pub const LEAST_ROWS: f32 = 3.0;
+
+/// 输入面板上下装饰（pad + border）占的像素。
+///
+/// 从 [`crate::frame::PanelInset::DEFAULT`] 算出来，**不要**写死 20：
+/// 输入面板由 `frame::default_screen_panels` 以 `FramePanel::tree()` spawn，
+/// 用的就是 `PanelInset::DEFAULT`；改 inset 时这里跟着变。
+pub const INPUT_CHROME: f32 = 2.0
+    * (crate::frame::PanelInset::DEFAULT.pad as f32
+        + crate::frame::PanelInset::DEFAULT.border as f32);
+
+/// 输入 tile 的高度（UI 像素）。
+///
+/// `max(LEAST_ROWS * ROW_HEIGHT, clamp(行数, 1, MOST_LINES) * ROW_HEIGHT + INPUT_CHROME)`。
+/// 超过 [`MOST_LINES`] 后 tile 不再长高，
+/// 多出来的行由 [`EditorLayout`] 滚动露出（上游 `fit_rows` 的
+/// `clamp(1, MOST_LINES) + 2`，我们的 `+2` 是面板 chrome 而不是两行边框）。
+pub fn input_tile_height(lines: usize) -> f32 {
+    let wanted = lines.clamp(1, MOST_LINES) as f32 * ROW_HEIGHT + INPUT_CHROME;
+    wanted.max(LEAST_ROWS * ROW_HEIGHT)
+}
+
+/// 输入框这一帧的折行结果 + 光标/滚动位置（上游 `editor::Layout`）。
+///
+/// `rows` 是**不带**行首提示符的正文行；第一行前面的 `› ` 和续行的两个
+/// 空格由 [`Self::visible_rows`] 加，所以光标列也不含提示符（调用方加 2）。
+#[derive(Resource, Clone, Debug, Default, PartialEq)]
+pub struct EditorLayout {
+    /// 按面板列宽折好的行（空输入也有一行空行）。
+    pub rows: Vec<Line<'static>>,
+    /// 光标在第几行（0 起，坐标相对 `rows`）。
+    pub cursor_row: usize,
+    /// 光标在行内第几列（unicode 显示宽，0 起，不含提示符）。
+    pub cursor_column: usize,
+    /// 可见段从 `rows` 的第几行开始（滚动）。
+    pub top: usize,
+    /// 可见几行（`clamp(rows.len(), 1, MOST_LINES)`）。
+    pub visible: usize,
+}
+
+impl EditorLayout {
+    /// 光标在可见段里的下标；光标不在可见段时 `None`。
+    pub fn cursor_in_view(&self) -> Option<usize> {
+        (self.cursor_row >= self.top && self.cursor_row < self.top.saturating_add(self.visible))
+            .then(|| self.cursor_row - self.top)
+    }
+
+    /// 这一帧要显示的行：`top..top+visible`，第一行带 `› `、续行带两个空格，
+    /// 光标所在行在真实列上插入 [`CURSOR`]。
+    pub fn visible_rows(&self, theme: &Theme) -> Vec<Line<'static>> {
+        if self.rows.is_empty() {
+            // 布局还没跑过（例如系统被跳过）时也至少画出提示符和光标。
+            return vec![Line::from(vec![prompt_span(true, theme), cursor_span()])];
+        }
+        let start = self.top.min(self.rows.len().saturating_sub(1));
+        let end = start
+            .saturating_add(self.visible.max(1))
+            .min(self.rows.len());
+        (start..end)
+            .map(|index| {
+                let mut row = self.rows[index].clone();
+                if index == self.cursor_row {
+                    row = with_cursor(row, self.cursor_column);
+                }
+                let mut spans = vec![prompt_span(index == 0, theme)];
+                spans.extend(row.spans);
+                Line {
+                    spans,
+                    style: row.style,
+                    alignment: row.alignment,
+                }
+            })
+            .collect()
+    }
+}
+
+/// 光标画成的字符（沿用旧实现的 `▏`，但位置是真的）。
+pub const CURSOR: &str = "▏";
+
+/// 光标的样式：反色 + 下划线，前景仍是旧的浅青色。
+pub fn cursor_style() -> Style {
+    Style::default()
+        .fg(RColor::LightCyan)
+        .add_modifier(Modifier::REVERSED | Modifier::UNDERLINED)
+}
+
+fn cursor_span() -> Span<'static> {
+    Span::styled(CURSOR, cursor_style())
+}
+
+/// 行首提示符：第一行 `› `（绿色粗体），续行两个空格（dim，和上游一致）。
+fn prompt_span(first: bool, theme: &Theme) -> Span<'static> {
+    match first {
+        true => ratatui_span("› ", theme.prompt),
+        false => ratatui_span("  ", theme.dim),
+    }
+}
+
+/// 在行内第 `column` 个显示列处插入光标。
+///
+/// 光标是额外的一列而不是盖在字上：中文字/emoji 的宽度由
+/// [`UnicodeWidthStr`] 算，和折行用的是同一套列宽。行比 `column` 短时先补
+/// 空格——光标可能停在折行时被丢掉的空白里（上游终端光标也停在那里）。
+fn with_cursor(line: Line<'static>, column: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut seen = 0usize;
+    let mut placed = false;
+    for span in line.spans {
+        let mut text = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let width = UnicodeWidthStr::width(grapheme);
+            if !placed && seen.saturating_add(width) > column {
+                if !text.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut text), span.style));
+                }
+                spans.push(cursor_span());
+                placed = true;
+            }
+            text.push_str(grapheme);
+            seen = seen.saturating_add(width);
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+    }
+    if !placed {
+        if seen < column {
+            spans.push(Span::styled(" ".repeat(column - seen), Style::default()));
+        }
+        spans.push(cursor_span());
+    }
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
 }
 
 impl Editor {
@@ -349,6 +510,83 @@ impl Editor {
                 .map_or(line.len(), |(index, _)| index);
     }
 
+    /// 按输入面板的 `width` 个文字列折行，并算出光标落在第几行第几列。
+    ///
+    /// 折行用 [`rig_tui::wrap::wrap`]——和转写 `transcript::wrap_rows` 是同一个
+    /// 折行器（按 unicode 列宽、词边界、列表续行缩进）。第一行前面的 `› `
+    /// 也占两列，所以正文宽度是 `width - 2`，与上游 `layout(width)` 一致。
+    /// 控制字符按上游换成同样字节数的空格（tab 因此显示成一个空格）；换行
+    /// 按 `\n` 拆成逻辑行。光标是 grapheme 边界上的字节偏移，折行时被丢掉
+    /// 的换行处空格（[`rig_tui::wrap::RowWrap::gap`]）也按上游的规则映射。
+    ///
+    /// 返回的 [`EditorLayout`] 不含提示符：`cursor_column` 是行内显示列，
+    /// 提示符两列由 [`EditorLayout::visible_rows`] 加。
+    pub fn layout(&self, width: usize) -> EditorLayout {
+        // `width` 是面板文字列数，去掉提示符的两列；至少留 1 列。
+        let width = width.max(3) - 2;
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut cursor = (0usize, 0usize);
+        let mut start = 0;
+        for line in self.text.split('\n') {
+            let shown: String = line
+                .chars()
+                .map(|character| match character.is_control() {
+                    // 保持字节数不变，光标偏移仍然能对回原文。
+                    true => " ".repeat(character.len_utf8()),
+                    false => character.to_string(),
+                })
+                .collect();
+            let at = self
+                .cursor
+                .checked_sub(start)
+                .filter(|at| *at <= line.len());
+            let mut end = 0;
+            for (row, joint) in rig_tui::wrap::wrap(&Line::from(shown.as_str()), width) {
+                let (gap, indent) = joint
+                    .as_ref()
+                    .map_or(("", 0), |joint| (joint.gap.as_str(), joint.indent));
+                let from = end + gap.len();
+                // 光标落在折行丢掉的那段空格里：列不够就放到上一行末尾，
+                // 否则从下一行的缩进处开始（上游同一条规则）。
+                if let Some(at) = at
+                    && (end..from).contains(&at)
+                {
+                    let dropped = gap.get(..at - end).map_or(0, UnicodeWidthStr::width);
+                    let column = rows.last().map_or(0, Line::width) + dropped;
+                    cursor = match column < width {
+                        true => (rows.len().saturating_sub(1), column),
+                        false => (rows.len(), indent),
+                    };
+                }
+                let bytes: usize = row.spans.iter().map(|span| span.content.len()).sum();
+                end = from + bytes.saturating_sub(indent);
+                if let Some(at) = at
+                    && (from..=end).contains(&at)
+                {
+                    let before = shown.get(from..at).map_or(0, UnicodeWidthStr::width);
+                    cursor = (rows.len(), indent + before);
+                }
+                rows.push(row);
+            }
+            // 光标正好在一行写满之后：上游开一个空行放光标，避免它落在
+            // 下一行开头却被画到上一行末尾。
+            if at == Some(line.len()) && cursor.1 >= width {
+                cursor = (rows.len(), 0);
+                rows.push(Line::default());
+            }
+            start += line.len() + 1;
+        }
+        let visible = rows.len().clamp(1, MOST_LINES);
+        let top = (cursor.0 + 1).saturating_sub(visible);
+        EditorLayout {
+            rows,
+            cursor_row: cursor.0,
+            cursor_column: cursor.1,
+            top,
+            visible,
+        }
+    }
+
     /// Up/Down 是否正在历史里走：原样显示一条历史提示词，光标在它的
     /// 开头或末尾。
     fn walking(&self) -> bool {
@@ -478,8 +716,8 @@ struct Sending {
 
 /// [`act`] 做完编辑器该做的事之后，调用方还要执行的副作用。
 ///
-/// 动作本身（清空、移动、删除……）在 `act` 里就地做完；发送/停止/退出需要
-/// agent 与 `Commands`，由 [`keys`] 统一接线。
+/// 动作本身（清空、移动、删除……）在 `act` 里就地做完；发送/停止/退出/粘贴
+/// 需要 agent、`Commands` 或剪贴板，由 [`keys`] 统一接线。
 #[derive(Debug)]
 enum Act {
     /// 把文本送给 agent。
@@ -488,6 +726,8 @@ enum Act {
     Stop,
     /// 输入为空时按了 Ctrl+D：退出程序。
     Exit,
+    /// Ctrl+V：读剪贴板文本，插到光标处（图片分支见 [`act`] 的注释）。
+    Paste,
 }
 
 /// 执行一个内置动作；需要 agent 或 `Commands` 的留给调用方。
@@ -529,8 +769,13 @@ fn act(action: InputAction, editor: &mut Editor, busy: bool) -> Option<Act> {
         | Do::SelectDown
         | Do::Deselect
         | Do::AnswerInline(_)
-        | Do::DismissInline
-        | Do::PasteImage => {}
+        | Do::DismissInline => {}
+        // Ctrl+V 的绑定是上游同名动作 `PasteImage`：上游同时读文本和图片，
+        // 本 crate **只接文本**。图片分支没做的原因不是漏了，而是
+        // `bevy_clipboard` 没有开 `image` feature、也没有"剪贴板图片落盘到
+        // 会话目录"的约定（见 `clipboard.rs` 模块文档）；剪贴板里只有图片
+        // 时读文本会失败，由 [`Act::Paste`] 把可显示的错误交给状态行。
+        Do::PasteImage => return Some(Act::Paste),
         // 一轮正在跑：Tab 是排队（上游 `send(.., queue = true)`）。补全列表开着
         // 时走不到这里——[`completion_act`] 先把它吃掉了。空输入不排队，也不
         // 停止浏览历史（上游 `send` 先返回，`stop_browsing` 不会被执行）。
@@ -626,15 +871,30 @@ fn completion_act(
     }
 }
 
+/// 一次按键里要用的剪贴板/状态资源，三个都可能是 `None`。
+///
+/// 和 `selection::pointer_selection` 同一套优先级：有内存替身（单测/没有
+/// 系统剪贴板的后备）就用它，否则用 `bevy_clipboard::Clipboard`；都没有时
+/// 粘贴报 [`clipboard::NO_CLIPBOARD`]。状态行可缺省，缺省时错误只返回给
+/// 调用方（无窗口测试 App），不会 panic。
+#[derive(SystemParam)]
+pub struct Clipboards<'w> {
+    system: Option<ResMut<'w, bevy_clipboard::Clipboard>>,
+    memory: Option<ResMut<'w, MemoryClipboard>>,
+    status: Option<ResMut<'w, AppStatus>>,
+}
+
 /// 输入系统的键处理：走 [`crate::keys`] 的绑定表；编辑动作在这里执行，
 /// 插件绑定（没有 [`InputAction`] 的）触发 [`KeyPressed`]。
 ///
-/// 发送/排队/停止/退出在这里落到内核与 bevy 上：
+/// 发送/排队/停止/退出/粘贴在这里落到内核与 bevy 上：
 /// * [`Deliver`] 给 [`ShownAgent`]（应用层在切工作区时更新它，见
 ///   `rig_harness_in_3d::workspaces_demo`），斜杠命令让给应用层的
 ///   `RunCommand` 桥，不重复送；
 /// * [`StopTurn`] 给同一个 agent；
-/// * [`AppExit`] 是空输入 Ctrl+D。
+/// * [`AppExit`] 是空输入 Ctrl+D；
+/// * Ctrl+V 读剪贴板文本，插到光标处；空剪贴板/读失败写状态行的
+///   [`clipboard::PASTE_FAILED`]（和 `Copied` 同一套状态反馈）。
 #[allow(clippy::too_many_arguments)]
 pub fn keys(
     mut input: MessageReader<KeyboardInput>,
@@ -650,6 +910,7 @@ pub fn keys(
     shown: Option<Res<ShownAgent>>,
     entering: Query<(), With<ActiveTurn>>,
     mut scroll: Option<ResMut<PaneScroll>>,
+    mut clipboards: Clipboards,
 ) {
     let rows: Vec<BindingRef> = bindings
         .iter()
@@ -740,6 +1001,29 @@ pub fn keys(
                             Some(Act::Exit) => {
                                 commands.write_message(AppExit::Success);
                             }
+                            Some(Act::Paste) => {
+                                // 文本粘贴：有就插到光标处（多行文本由
+                                // `Editor::insert` 归一成 `\n` 后原样插入），
+                                // 没有就写一条和 `Copied` 同款的红色状态。
+                                // 图片分支不做，原因见 [`Act::Paste`] 和
+                                // `clipboard.rs` 模块文档。
+                                match clipboard::paste_from(
+                                    &mut editor,
+                                    clipboards.system.as_deref_mut(),
+                                    clipboards.memory.as_deref_mut(),
+                                ) {
+                                    Ok(()) => {
+                                        if let Some(status) = clipboards.status.as_deref_mut() {
+                                            clipboard::clear_paste_failed(status);
+                                        }
+                                    }
+                                    Err(why) => {
+                                        if let Some(status) = clipboards.status.as_deref_mut() {
+                                            clipboard::show_paste_failed(status, &why);
+                                        }
+                                    }
+                                }
+                            }
                             None => {}
                         }
                     }
@@ -800,30 +1084,73 @@ fn modifier_of(code: KeyCode) -> Modifiers {
     }
 }
 
-/// 输入面板的一行：提示符 + 光标。
+/// 输入框这一帧能折成多少列：树给 [`PanelId::Input`] 叶子的文字列数。
 ///
-/// 键位提示行已经从输入面板里拆出去，成为独立的 [`PanelId::Hints`] tile
-/// （`hints::hint_panel_rows` 负责写它）——条带里所有东西都是 tile。
-pub fn editor_rows(mut panels: ResMut<PanelRows>, editor: Res<Editor>, theme: Res<Theme>) {
-    // 光标是字节偏移；外部直接写 pub 字段时也保证切片落在字符边界上。
-    let mut cursor = editor.cursor.min(editor.text.len());
-    while cursor > 0 && !editor.text.is_char_boundary(cursor) {
-        cursor -= 1;
+/// 根/区域还没建好（只装 `EditorPlugin` 的最小 App、第一帧）时用 97 兜底，
+/// 和 `hints::hint_panel_rows` / `batch::confirm_panel_rows` 一致；行照写，
+/// 只是没有根可画。
+pub fn input_width(roots: Option<&PanelRoots>, areas: Option<&PanelAreas>) -> usize {
+    roots
+        .and_then(|roots| roots.entity(PanelId::Input))
+        .and_then(|root| areas.and_then(|areas| areas.get(root)))
+        .map_or(97, |area| usize::from(area.cols.max(1)))
+}
+
+/// 按输入面板的列宽算这一帧的 [`EditorLayout`]（折行、光标行列、滚动 top）。
+///
+/// 排在 [`keys`] 之后：同一帧敲进去的字、Shift+Enter 的新行立刻参与布局。
+/// 宽度取**上一帧** `lay_out_frame` 写下的 `PanelAreas`：右列的宽度不随
+/// 输入框高度变（高度只由 Spacer 吸收），所以这个宽度和这一帧布局后一致，
+/// 且 `sync_editor_tile` 能在 `lay_out_frame` 之前用同一份行数改树。
+pub fn layout_editor(
+    editor: Res<Editor>,
+    roots: Option<Res<PanelRoots>>,
+    areas: Option<Res<PanelAreas>>,
+    mut layout: ResMut<EditorLayout>,
+) {
+    let next = editor.layout(input_width(roots.as_deref(), areas.as_deref()));
+    if *layout != next {
+        *layout = next;
     }
-    let before = editor.text.get(..cursor).unwrap_or_default().to_owned();
-    let after = editor.text.get(cursor..).unwrap_or_default().to_owned();
-    let rows = vec![
-        KeyedRow {
-            key: 1,
-            hash: 1,
-            row: Row::new(rig_tui::ratatui::text::Line::from(vec![
-                ratatui_span("› ", theme.prompt),
-                ratatui_span(before, theme.fg),
-                ratatui_span("▏", Style::default().fg(RColor::LightCyan)),
-                ratatui_span(after, theme.fg),
-            ])),
-        },
-    ];
+}
+
+/// 输入 tile 的高度跟着 [`EditorLayout`] 的行数走（[`input_tile_height`]）。
+///
+/// 和 `complete::sync_completion_tile` 一样只改 `FrameTree` 里 Input 叶子的
+/// **固定高度**；右列顶部 Spacer 是比例子，多/少出来的高度全由它吸收，
+/// 所以右列总高仍然精确等于区域高度。Input 保持固定子（不要改成比例子），
+/// 否则 Spacer 不再吸收差额，整屏高度会失衡。
+pub fn sync_editor_tile(layout: Res<EditorLayout>, tree: Option<ResMut<FrameTree>>) {
+    let Some(mut tree) = tree else {
+        // 只装了 `EditorPlugin` 的测试 App 没有帧树：没有 tile 可改。
+        return;
+    };
+    let want = crate::layout::Size::Fixed(input_tile_height(layout.rows.len()));
+    if tree.0.leaf_size(PanelId::Input) == Some(want) {
+        return;
+    }
+    tree.0.set_leaf_size(PanelId::Input, want);
+}
+
+/// 输入面板这一帧的行：折好的可见行，每行一个 [`KeyedRow`]。
+///
+/// 行来自 [`EditorLayout`]（宽度/折行/滚动已在 [`layout_editor`] 里算好）；
+/// 光标画在真实行列上，是行内的一个反色 + 下划线 span。超过
+/// [`MOST_LINES`] 行时只写 `top..top+visible`，光标行一定在可见段里。
+pub fn editor_rows(mut panels: ResMut<PanelRows>, layout: Res<EditorLayout>, theme: Res<Theme>) {
+    let rows: Vec<KeyedRow> = layout
+        .visible_rows(&theme)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let row = Row::new(line);
+            KeyedRow {
+                key: (layout.top + index + 1) as u64,
+                hash: row_hash(&row),
+                row,
+            }
+        })
+        .collect();
     panels.set(PanelId::Input, rows);
 }
 
@@ -836,6 +1163,7 @@ pub struct EditorPlugin;
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Editor>()
+            .init_resource::<EditorLayout>()
             .init_resource::<SubmittedPrompts>()
             .init_resource::<KeyFocus>()
             .init_resource::<PendingInput>()
@@ -844,8 +1172,13 @@ impl Plugin for EditorPlugin {
         crate::keys::add_built_in(app);
         app.add_systems(
             Update,
-            keys.in_set(crate::FeathersSystems::Prepare)
-                .run_if(crate::picker::no_picker),
+            (
+                keys.run_if(crate::picker::no_picker),
+                layout_editor,
+                sync_editor_tile,
+            )
+                .chain()
+                .in_set(crate::FeathersSystems::Prepare),
         )
         .add_systems(
             Update,
@@ -885,6 +1218,7 @@ fn place(index: usize, shown: &str, history: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::ClipboardText;
     use crate::complete::{Candidate, Completion, CompletionKind, CompletionState};
     use crate::keys::{AppKeyBindingsExt, KeyPress};
     use bevy::ecs::event::EntityEvent;
@@ -900,6 +1234,62 @@ mod tests {
         let mut editor = ed(draft);
         editor.history = history.iter().map(|entry| (*entry).to_owned()).collect();
         editor
+    }
+
+    /// 一行里所有 span 的纯文本（光标是其中一个 span，测试直接找它）。
+    fn plain(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// 只装布局/产行系统的最小 App：`width` 是输入面板的文字列数。
+    fn layout_app(width: u16) -> App {
+        let mut app = App::new();
+        app.init_resource::<Editor>()
+            .init_resource::<EditorLayout>()
+            .init_resource::<PanelRows>()
+            .init_resource::<Theme>();
+        let root = app.world_mut().spawn_empty().id();
+        let mut roots = PanelRoots::default();
+        roots.0.insert(PanelId::Input, root);
+        let mut areas = PanelAreas::default();
+        areas.0.insert(
+            root,
+            crate::frame::PanelArea {
+                cols: width,
+                rows: 3,
+                ..Default::default()
+            },
+        );
+        app.insert_resource(roots)
+            .insert_resource(areas)
+            .add_systems(Update, (layout_editor, editor_rows).chain());
+        app
+    }
+
+    /// 只装布局 + tile 同步的最小 App（带一棵默认帧树）。
+    fn tile_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<Editor>()
+            .init_resource::<EditorLayout>()
+            .insert_resource(FrameTree(crate::layout::default_tree()))
+            .add_systems(Update, (layout_editor, sync_editor_tile).chain());
+        app
+    }
+
+    /// 帧树里 Input 叶子的固定高度（UI 像素）。
+    fn input_tile_in(app: &App) -> f32 {
+        match app
+            .world()
+            .resource::<FrameTree>()
+            .0
+            .leaf_size(PanelId::Input)
+        {
+            Some(crate::layout::Size::Fixed(px)) => px,
+            other => panic!("Input 应是 Fixed 尺寸：{other:?}"),
+        }
     }
 
     // ---- grapheme：中文 / emoji / 组合字符 ----
@@ -1624,6 +2014,473 @@ mod tests {
         assert_eq!(text(&app), "one", "补全关着时 ↑ 进历史");
         send(&mut app, Key::ArrowDown, KeyCode::ArrowDown, None);
         assert_eq!(text(&app), "draft", "Down 回到草稿");
+    }
+
+    // ---- 多行显示：折行 / 光标行列 / 滚动 ----
+
+    #[test]
+    fn long_text_wraps_to_the_input_width() {
+        let mut editor = ed("one two three four five");
+        // width=12：提示符占 2 列，正文 10 列。
+        let layout = editor.layout(12);
+        assert_eq!(layout.rows.len(), 3, "10 列宽折成 3 行");
+        assert_eq!(layout.visible, 3);
+        assert_eq!(layout.top, 0, "行数没超上限，不滚动");
+        let raw: Vec<String> = layout.rows.iter().map(plain).collect();
+        assert_eq!(raw, ["one two", "three", "four five"]);
+        editor.set_cursor(0);
+        let layout = editor.layout(12);
+        let shown: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(shown, ["› ▏one two", "  three", "  four five"]);
+
+        // 更窄：同样的文本要折更多行，每行正文不超过正文宽度。
+        let narrow = editor.layout(8);
+        assert!(
+            narrow.rows.len() > layout.rows.len(),
+            "8 列宽应折出更多行：{} → {}",
+            layout.rows.len(),
+            narrow.rows.len()
+        );
+        assert!(
+            narrow.rows.iter().all(|row| row.width() <= 6),
+            "每行正文宽度不超过 6 列"
+        );
+    }
+
+    #[test]
+    fn cursor_is_drawn_at_its_real_row_and_column() {
+        let mut editor = ed("one two three four five");
+        // "one two " 之后是 "three" 的 8..13；11 在 "thr|ee" 中间。
+        editor.set_cursor(11);
+        let layout = editor.layout(12);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 3));
+        assert_eq!(layout.cursor_in_view(), Some(1));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[0], "› one two");
+        assert_eq!(rows[1], "  thr▏ee", "光标画在第二行第 3 个显示列");
+        assert_eq!(rows[2], "  four five");
+        assert!(!rows[0].contains(CURSOR), "光标不能留在第一行");
+        let line = &layout.visible_rows(&Theme::default())[1];
+        let marker = line
+            .spans
+            .iter()
+            .find(|span| span.content == CURSOR)
+            .expect("光标是行里的一个 span");
+        assert!(
+            marker.style.add_modifier.contains(Modifier::REVERSED),
+            "光标要反色"
+        );
+        assert!(
+            marker.style.add_modifier.contains(Modifier::UNDERLINED),
+            "光标要下划线"
+        );
+
+        // 行首：光标在最前面。
+        editor.set_cursor(8);
+        let layout = editor.layout(12);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[1], "  ▏three");
+    }
+
+    #[test]
+    fn cursor_columns_count_double_width_characters() {
+        let mut editor = ed("你好世界");
+        editor.set_cursor(6); // 世界 前
+        let layout = editor.layout(6); // 正文 4 列：你好 / 世界
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[1], "  ▏世界");
+
+        editor.set_cursor(9); // 世 与 界 之间
+        let layout = editor.layout(6);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 2));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[1], "  世▏界", "汉字算 2 个显示列");
+    }
+
+    #[test]
+    fn a_cursor_in_whitespace_dropped_by_wrapping_stays_at_its_column() {
+        let mut editor = ed("ab   cd");
+        editor.set_cursor(3); // 三个空格里的第一个：折行时可能被丢掉
+        let layout = editor.layout(6); // 正文 4 列
+        let in_view = layout.cursor_in_view().expect("光标行要在可见段里");
+        let row = &layout.visible_rows(&Theme::default())[in_view];
+        let text = plain(row);
+        let at = text.find(CURSOR).expect("光标标记");
+        assert_eq!(
+            UnicodeWidthStr::width(&text[..at]),
+            2 + layout.cursor_column,
+            "光标前的显示宽 = 提示符 2 列 + 算出的列：{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_after_a_full_row_starts_a_new_row() {
+        let editor = ed("0123456789"); // 正好 10 列 = 正文宽度
+        let layout = editor.layout(12);
+        assert_eq!(layout.rows.len(), 2, "写满一行后光标另起一行");
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[1], "  ▏", "新行只有光标");
+    }
+
+    #[test]
+    fn scrolling_keeps_the_cursor_row_visible() {
+        let text = (0..15)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = ed(&text);
+        let layout = editor.layout(97);
+        assert_eq!(layout.rows.len(), 15, "15 行文本");
+        assert_eq!(layout.visible, MOST_LINES, "最多显示 10 行");
+        assert_eq!(layout.top, 5, "光标在最后一行：可见段是 5..15");
+        assert_eq!(layout.cursor_in_view(), Some(MOST_LINES - 1));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows.len(), MOST_LINES);
+        assert_eq!(rows[0], "  line 5", "滚到光标所在的那一段");
+        assert!(rows[9].contains("line 14"));
+        assert!(rows[9].contains(CURSOR), "光标行在可见段里");
+
+        // 光标回到第一行：滚回顶部。
+        editor.set_cursor(0);
+        let layout = editor.layout(97);
+        assert_eq!(layout.top, 0);
+        assert_eq!(layout.cursor_in_view(), Some(0));
+        let rows: Vec<String> = layout
+            .visible_rows(&Theme::default())
+            .iter()
+            .map(plain)
+            .collect();
+        assert_eq!(rows[0], "› ▏line 0");
+    }
+
+    #[test]
+    fn editor_rows_writes_every_visible_line_with_the_cursor_in_place() {
+        let mut app = layout_app(12);
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("one two three four five");
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<PanelRows>()
+                .get(PanelId::Input)
+                .len(),
+            3,
+            "3 个可见行 = 3 个 KeyedRow"
+        );
+
+        app.world_mut().resource_mut::<Editor>().set_cursor(11);
+        app.update();
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
+        let shown: Vec<String> = rows.iter().map(|keyed| plain(&keyed.row.line)).collect();
+        assert_eq!(shown[0], "› one two");
+        assert_eq!(shown[1], "  thr▏ee", "系统产出的行里光标在真实列上");
+        assert_eq!(shown[2], "  four five");
+    }
+
+    #[test]
+    fn editor_rows_scrolls_to_keep_the_cursor_line_visible() {
+        let mut app = layout_app(97);
+        let text = (0..20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.world_mut().resource_mut::<Editor>().set(text);
+        app.update();
+
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Input);
+        assert_eq!(rows.len(), MOST_LINES, "只写可见的 10 行");
+        let shown: Vec<String> = rows.iter().map(|keyed| plain(&keyed.row.line)).collect();
+        assert_eq!(shown[0], "  line 10", "滚到光标所在段的第一行");
+        assert!(shown[9].contains("line 19"), "最后一行是光标行");
+        assert!(shown[9].contains(CURSOR), "光标标记在最后一行");
+    }
+
+    // ---- 输入 tile 高度 ----
+
+    #[test]
+    fn input_tile_height_grows_with_lines_and_has_a_floor() {
+        assert_eq!(INPUT_CHROME, 20.0, "pad 8 + border 2 的上下共 20px");
+        assert_eq!(input_tile_height(0), 3.0 * ROW_HEIGHT, "空输入也保底 3 行");
+        assert_eq!(input_tile_height(1), 3.0 * ROW_HEIGHT, "1 行 + chrome 低于下限");
+        assert_eq!(input_tile_height(1), 54.0);
+        assert_eq!(input_tile_height(2), 2.0 * ROW_HEIGHT + INPUT_CHROME);
+        assert_eq!(input_tile_height(2), 56.0);
+        assert_eq!(input_tile_height(4), 4.0 * ROW_HEIGHT + INPUT_CHROME);
+        assert_eq!(input_tile_height(4), 92.0);
+        assert_eq!(input_tile_height(10), 10.0 * ROW_HEIGHT + INPUT_CHROME);
+        assert_eq!(input_tile_height(10), 200.0);
+        assert_eq!(
+            input_tile_height(99),
+            input_tile_height(10),
+            "超过 10 行封顶，由滚动露出"
+        );
+    }
+
+    #[test]
+    fn the_input_tile_grows_and_shrinks_with_the_text() {
+        let mut app = tile_app();
+        // 初始树保留旧的 4 行，布局系统跑过之后才按内容改。
+        assert_eq!(input_tile_in(&app), 4.0 * ROW_HEIGHT);
+        app.update();
+        assert_eq!(input_tile_in(&app), input_tile_height(1));
+
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("one\ntwo\nthree");
+        app.update();
+        assert_eq!(input_tile_in(&app), input_tile_height(3));
+
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("one\ntwo\nthree\nfour\nfive");
+        app.update();
+        assert_eq!(input_tile_in(&app), input_tile_height(5));
+        assert!(
+            input_tile_in(&app) > input_tile_height(3),
+            "换行后 tile 变高"
+        );
+
+        app.world_mut().resource_mut::<Editor>().set("one");
+        app.update();
+        assert_eq!(input_tile_in(&app), input_tile_height(1));
+        assert!(
+            input_tile_in(&app) < input_tile_height(5),
+            "删回去 tile 变矮"
+        );
+
+        let many = (0..20).map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+        app.world_mut().resource_mut::<Editor>().set(many);
+        app.update();
+        assert_eq!(input_tile_in(&app), input_tile_height(10), "20 行封顶 10 行");
+    }
+
+    #[test]
+    fn growing_the_input_tile_keeps_the_right_column_exact() {
+        use crate::layout::{PX_TO_METERS, Size, default_tree};
+        use crate::niri::TileRect;
+
+        let area = TileRect {
+            center: Vec2::ZERO,
+            size: Vec2::new(1.2, 0.8),
+        };
+        let bottom = |rect: &TileRect| rect.center.y - rect.size.y * 0.5;
+        let top = |rect: &TileRect| rect.center.y + rect.size.y * 0.5;
+        let mut tree = default_tree();
+        let mut spacer_heights = Vec::new();
+        for lines in [0usize, 1, 2, 4, 10, 99] {
+            // 1 行和 0 行、10 行和 99 行的目标高度相同，`set_leaf_size`
+            // 在尺寸没变时返回 false（和补全 tile 一样），这里不关心返回值。
+            tree.set_leaf_size(PanelId::Input, Size::Fixed(input_tile_height(lines)));
+            let rects = tree.rects(area);
+            let input = rects
+                .iter()
+                .find(|(panel, _)| *panel == PanelId::Input)
+                .expect("输入叶子")
+                .1;
+            let spacer = rects
+                .iter()
+                .find(|(panel, _)| *panel == PanelId::Spacer)
+                .expect("顶部留白")
+                .1;
+            let hints = rects
+                .iter()
+                .find(|(panel, _)| *panel == PanelId::Hints)
+                .expect("提示行")
+                .1;
+            let status = rects
+                .iter()
+                .find(|(panel, _)| *panel == PanelId::Status)
+                .expect("状态行")
+                .1;
+            assert!(
+                (input.size.y - input_tile_height(lines) * PX_TO_METERS).abs() < 1e-5,
+                "{lines} 行时输入 tile 高度精确"
+            );
+            assert!((bottom(&input) - top(&hints)).abs() < 1e-5, "输入贴着提示行");
+            assert!((bottom(&hints) - top(&status)).abs() < 1e-5, "提示行贴着状态行");
+            assert!((bottom(&status) - bottom(&area)).abs() < 1e-5, "状态行贴底");
+            let leaves: f32 = rects
+                .iter()
+                .map(|(_, rect)| rect.size.x * rect.size.y)
+                .sum();
+            assert!(
+                (leaves - area.size.x * area.size.y).abs() < 1e-4,
+                "叶子面积仍然精确铺满：{leaves}"
+            );
+            spacer_heights.push(spacer.size.y);
+        }
+        assert!(
+            spacer_heights[3] < spacer_heights[0],
+            "输入变高时由 Spacer 吸收差额：{:?}",
+            spacer_heights
+        );
+        assert_eq!(
+            spacer_heights[4], spacer_heights[5],
+            "超过 10 行封顶后 Spacer 不再变"
+        );
+
+        // 补全 tile 打开（6 行）且输入 10 行：两个固定子一起长高，仍然铺满。
+        tree.set_leaf_size(PanelId::Complete, Size::Fixed(6.0 * ROW_HEIGHT));
+        tree.set_leaf_size(PanelId::Input, Size::Fixed(input_tile_height(10)));
+        let leaves: f32 = tree
+            .rects(area)
+            .iter()
+            .map(|(_, rect)| rect.size.x * rect.size.y)
+            .sum();
+        assert!(
+            (leaves - area.size.x * area.size.y).abs() < 1e-4,
+            "补全打开 + 10 行输入时叶子面积仍然铺满：{leaves}"
+        );
+    }
+
+    // ---- Ctrl+V 粘贴 ----
+
+    #[test]
+    fn ctrl_v_pastes_text_at_the_cursor() {
+        let mut app = test_app();
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("say: ");
+        let mut memory = MemoryClipboard::default();
+        memory.write_text("hello\nworld").expect("memory");
+        app.insert_resource(memory);
+
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("v".into()),
+            KeyCode::KeyV,
+        );
+
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.text(), "say: hello\nworld", "多行文本原样插在光标处");
+        assert_eq!(editor.cursor(), editor.text().len());
+    }
+
+    #[test]
+    fn ctrl_v_with_an_empty_clipboard_shows_a_visible_error() {
+        let mut app = test_app();
+        app.init_resource::<AppStatus>();
+        app.insert_resource(MemoryClipboard::default());
+        app.world_mut().resource_mut::<Editor>().set("keep");
+
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("v".into()),
+            KeyCode::KeyV,
+        );
+
+        assert_eq!(text(&app), "keep", "空剪贴板不动输入");
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == clipboard::PASTE_FAILED.name)
+            .expect("空剪贴板要在状态行留一条错误");
+        assert_eq!(item.text, clipboard::NO_CLIPBOARD_TEXT);
+    }
+
+    #[test]
+    fn ctrl_v_without_any_clipboard_resource_still_reports() {
+        let mut app = test_app();
+        app.init_resource::<AppStatus>();
+        app.world_mut().resource_mut::<Editor>().set("keep");
+
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("v".into()),
+            KeyCode::KeyV,
+        );
+
+        assert_eq!(text(&app), "keep");
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == clipboard::PASTE_FAILED.name)
+            .expect("没有剪贴板后端也要有可见错误");
+        assert_eq!(item.text, clipboard::NO_CLIPBOARD);
+    }
+
+    #[test]
+    fn a_successful_paste_clears_the_previous_error() {
+        let mut app = test_app();
+        app.init_resource::<AppStatus>();
+        app.insert_resource(MemoryClipboard::default());
+        let item = clipboard::PASTE_FAILED.name;
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("v".into()),
+            KeyCode::KeyV,
+        );
+        assert!(app.world().resource::<AppStatus>().0.iter().any(|found| found.name == item));
+
+        app.world_mut()
+            .resource_mut::<MemoryClipboard>()
+            .write_text("now")
+            .expect("memory");
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("v".into()),
+            KeyCode::KeyV,
+        );
+        assert_eq!(text(&app), "now");
+        assert!(
+            !app.world().resource::<AppStatus>().0.iter().any(|found| found.name == item),
+            "成功粘贴清掉上一次的红色错误"
+        );
+    }
+
+    #[test]
+    fn enter_sends_a_multiline_prompt_with_its_newlines() {
+        let (mut app, agent) = sending_app();
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .set("first\nsecond");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "first\nsecond".to_owned(), DeliveryMode::Steer)],
+            "换行只是文本的一部分，Enter 照样整段发送"
+        );
+        assert_eq!(app.world().resource::<Editor>().text(), "");
     }
 }
 

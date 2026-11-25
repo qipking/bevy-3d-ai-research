@@ -27,7 +27,7 @@ use bevy::window::{PrimaryWindow, WindowRef};
 use crate::kernel::KernelPlugin;
 use rig_niri::batch::{BatchPlugin, CompletedCalls};
 use rig_niri::camera_rig::RigCamera;
-use rig_niri::frame::{PanelAreas, PanelRoots};
+use rig_niri::frame::{CELL, FrameSize, PanelAreas, PanelRoots, UNITS_TO_WORLD};
 use rig_niri::pane::{PaneScroll, TranscriptRows};
 use rig_harness::pick::{PickItem, PickPreview};
 use rig_harness::prelude::{Highlighted, Picker};
@@ -427,7 +427,34 @@ fn press_key(keys: &mut MessageWriter<KeyboardInput>, window: Entity, code: KeyC
     });
 }
 
-fn set_cam(camera: &mut Query<&mut Transform, With<ShotCamera>>, pos: Vec3, look: Vec3) {
+/// 让整帧刚好装进画面的相机距离（"正视图"的机位）。
+///
+/// 面板的世界尺寸 = 格子数 × `CELL` × `UNITS_TO_WORLD`，窗口一变帧就变大；机位固定
+/// 在 1.45 m 时 164×44 的帧左右各被裁掉约 16%，所以正视图按帧尺寸算距离。
+///
+/// 系数 1.32 的来历：旧的固定机位 1.45 m 在 96×28 帧（1280×800 窗口）下的
+/// 装填率正好是 1.32，取它可以让默认尺寸的构图和以前逐像素一致，更大的帧也不会裁。
+fn home_z(size: &FrameSize, aspect: f32) -> f32 {
+    let frame = Vec2::new(
+        f32::from(size.cols) * CELL.x,
+        f32::from(size.rows) * CELL.y,
+    ) * UNITS_TO_WORLD;
+    let half_fov = 45_f32.to_radians() * 0.5;
+    let tan = half_fov.tan();
+    let fit = (frame.y / (2.0 * tan)).max(frame.x / (2.0 * tan * aspect.max(0.1)));
+    fit * 1.32
+}
+
+/// 巡游机位。`zoom` 把整套机位按帧尺寸等比放大：帧变大时同样的构图不会裁掉
+/// 面板，帧还是 96×28 时 `zoom == 1.0`，机位与以前的截图逐像素一致。
+fn set_cam(
+    camera: &mut Query<&mut Transform, With<ShotCamera>>,
+    pos: Vec3,
+    look: Vec3,
+    zoom: f32,
+) {
+    let pos = pos * zoom;
+    let look = look * zoom;
     // RF_RIG=1 时相机交给操作架（手柄/键盘），巡游不再抢机位
     if std::env::var("RF_RIG").is_ok() {
         return;
@@ -457,8 +484,18 @@ fn run_tour(
     mut clipboard: ResMut<bevy_clipboard::Clipboard>,
     mut scrolls: Query<&mut PaneScroll>,
     mut keyboard: MessageWriter<KeyboardInput>,
+    size: Res<FrameSize>,
 ) {
     let window_entity = *window;
+    // 正视图机位按帧尺寸算：窗口缩放导致帧变大时不会把面板裁掉（见 `home_z`）。
+    let aspect = camera_info
+        .0
+        .logical_viewport_size()
+        .map_or(16.0 / 10.0, |size| size.x / size.y.max(1.0));
+    let home = home_z(&size, aspect);
+    // 96×28（旧默认帧）时机位原样；帧变大则整套机位等比后退。
+    let reference = home_z(&FrameSize { cols: 96, rows: 28 }, aspect);
+    let zoom = home / reference;
     runner.frame += 1;
     let step = runner.frame / STEP_FRAMES;
     let sub = runner.frame % STEP_FRAMES;
@@ -469,21 +506,21 @@ fn run_tour(
     };
 
     match step {
-        0..=5 => set_cam(&mut camera, Vec3::new(0.0, 0.03, 1.45), Vec3::ZERO),
+        0..=5 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom),
         6 if sub == 0 => shoot(&mut runner, &mut commands, "01_overview"),
-        7 => set_cam(&mut camera, Vec3::new(0.0, 0.02, 1.08), Vec3::ZERO),
+        7 => set_cam(&mut camera, Vec3::new(0.0, 0.02, 1.08), Vec3::ZERO, zoom),
         8 if sub == 0 => shoot(&mut runner, &mut commands, "02_near"),
-        9 => set_cam(&mut camera, Vec3::new(0.22, 0.10, 1.35), Vec3::ZERO),
+        9 => set_cam(&mut camera, Vec3::new(0.22, 0.10, 1.35), Vec3::ZERO, zoom),
         10 if sub == 0 => shoot(&mut runner, &mut commands, "03a_mild_oblique"),
-        11 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO),
+        11 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO, zoom),
         12 if sub == 0 => shoot(&mut runner, &mut commands, "03b_oblique45"),
         13 => {
             let target = Vec3::new(-0.42, 0.33, 0.0);
-            set_cam(&mut camera, target + Vec3::new(0.0, 0.0, 0.55), target);
+            set_cam(&mut camera, target + Vec3::new(0.0, 0.0, 0.55), target, zoom);
         }
         14 if sub == 0 => shoot(&mut runner, &mut commands, "04_text_zoom"),
         15 => {
-            set_cam(&mut camera, Vec3::new(0.0, 0.03, 1.45), Vec3::ZERO);
+            set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom);
             if let Ok(mut scroll) = scrolls.single_mut() {
                 scroll.follow = false;
                 scroll.top = scroll.top.saturating_sub(4);
@@ -588,9 +625,9 @@ fn run_tour(
         }
         34 if sub == 0 => shoot(&mut runner, &mut commands, "10_picker_selected"),
         // 斜着看：浮层在 3D 里也是盖在转写上面的（层排序，不靠距离）
-        35 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO),
+        35 => set_cam(&mut camera, Vec3::new(0.62, 0.42, 0.86), Vec3::ZERO, zoom),
         36 if sub == 0 => shoot(&mut runner, &mut commands, "10b_picker_oblique"),
-        37 => set_cam(&mut camera, Vec3::new(0.0, 0.03, 1.45), Vec3::ZERO),
+        37 => set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, zoom),
         // 打字过滤：四个字符后列表只剩 deepseek
         38 if sub == 0 => {
             for (code, char) in [

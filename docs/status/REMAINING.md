@@ -31,20 +31,28 @@
 
 ---
 
-## 2. 输入框只画一行：换行、光标所在行、长文本都看不见
+## 2. 输入框只画一行：换行、光标所在行、长文本都看不见 —— ✅ 已完成（2026-11-25）
 
-- **用户会看到什么**：用 Shift+Enter/Ctrl+J 换行后，输入框还是一条细线：换行被挤在同一个
-  `Line` 里（多行文本高度溢出、被面板裁掉），光标永远是行尾那个 `▏`，不会跟着光标跳行；
-  输入框也不会随内容变高，看不到"我正在第几行写"。
-- **上游 API / 我们的落点**：上游 `editor::draw_editors`（`editor.rs:686`）用 `Layout`
-  （`editor.rs:37`：`rows`/`cursor_row`/`cursor_column`）+ `Paragraph::scroll((top,0))`，高度
-  `clamp(1, MOST_LINES=10)+2`（`:28`、`:572`–`:575`），`layout()` 逐行折行（`:584`）。
-  我们的 `editor_rows`（`rig_niri/src/editor.rs:685`）只产 **1 个** `KeyedRow`：整段 `text` 塞进
-  一个 `Line`，光标是字面量 `▏`。输入 tile 的固定高度在 `layout::default_tree`
-  （`layout.rs:767`，`4 * ROW_HEIGHT`）。
-- **工作量**：**M**（行拆分/折行用现成的 `wrap_lines`；主要是光标行列、滚动 top、tile 高度
-  随内容变、以及"多行时 hint 行让位"）。
-- **依赖**：无。
+- **现在的行为**：`editor::layout`（`rig_niri/src/editor.rs:524`）按输入面板列宽折行，
+  用的是转写同一个 `rig_tui::wrap::wrap`（`transcript::wrap_rows` 也用它）；
+  `editor_rows`（`editor.rs:1140`）每行产一个 `KeyedRow`，第一行 `› `、续行两个空格。
+  光标不再是字面量，而是插在**真实行列**上的反色 + 下划线 `▏`
+  （`CURSOR`/`with_cursor`，`editor.rs:173`/`:199`），中文/emoji 按 unicode 显示列算。
+  行数超过 `MOST_LINES=10` 时 `EditorLayout.top`（`editor.rs:123`）跟着光标滚动，
+  光标行一定在 `top..top+visible` 里。
+- **输入 tile 高度**：`sync_editor_tile`（`editor.rs:1123`）把 `FrameTree` 的 Input
+  叶子改成 `input_tile_height`（`editor.rs:113`）=
+  `max(3 行, clamp(行数, 1, 10) 行 + chrome)`，chrome 由 `PanelInset::DEFAULT` 算出
+  （pad 8 + border 2，上下共 20px）：空输入 54px、4 行 92px、10 行 200px。Input 仍是
+  **固定子**，多/少出来的高度由顶部 Spacer（比例子）吸收，右列总高精确不变；
+  `layout::default_tree` 的初始 72px 保留，layout 既有测试不破。
+- **测试**：`long_text_wraps_to_the_input_width`、`cursor_is_drawn_at_its_real_row_and_column`、
+  `cursor_columns_count_double_width_characters`、`scrolling_keeps_the_cursor_row_visible`、
+  `editor_rows_writes_every_visible_line_with_the_cursor_in_place`、
+  `the_input_tile_grows_and_shrinks_with_the_text`、
+  `growing_the_input_tile_keeps_the_right_column_exact` 等。
+- **还差（不阻塞）**：输入框内的跨行选择/鼠标选字还没接（选区仍只服务转写/pane 行）；
+  输入非空时 hints tile 仍然常显，没有上游的按状态换文案/让位（见 PARITY #9）。
 
 ---
 
@@ -64,20 +72,25 @@
 
 ---
 
-## 4. Ctrl+V 粘不进文本（图片粘贴、拖入也没有）
+## 4. Ctrl+V 粘不进文本（图片粘贴、拖入也没有） —— 🟡 部分完成（文本粘贴已完成）
 
-- **用户会看到什么**：复制一段文字按 Ctrl+V 什么也不发生；从截图工具复制图片、把图片文件
-  拖进窗口，也不会变成 `@path` 附件。提示行还写着 "Ctrl+V image"（`hints.rs:33`），与实际不符。
-- **上游 API / 我们的落点**：上游 `clipboard::paste`（`clipboard.rs:44`）读系统剪贴板（文本/图片，
-  外部程序兜底），`type_pasted` 观察者写进编辑器；图片走 `Scratch::images` + `Processes::launcher`
-  （`input.rs:863`–`:877`）；拖入/粘贴出来的路径由 `dropped_images`/`image_file`/`local_url_path`/
-  `percent_decoded`（`clipboard.rs:227`/`:296`/`:307`/`:316`）解析。我们：`paste_from_clipboard`
-  写好了（`rig_niri/src/clipboard.rs:280`）但**没有调用者**；Ctrl+V 绑的是 `PasteImage`
-  （`keys.rs:616`）而 `act` 空实现（`editor.rs:481`）；`bevy_clipboard` 没开 image feature
-  （`clipboard.rs:11`–`14` 自述）。
-- **工作量**：**S**（文本粘贴：一个系统 + 一个动作分支）／**M**（图片：开 feature + `Scratch`
-  目录 + 落盘 + `@path`）。
-- **依赖**：无；图片部分依赖会话目录（`SessionPaths`，应用层已有）。
+- **文本粘贴（已完成）**：Ctrl+V 绑的还是 `InputAction::PasteImage`（`keys.rs:616`），
+  但 `editor::act` 现在把它变成 `Act::Paste`（`editor.rs:778`、`:1004`），走
+  `clipboard::paste_from`（`rig_niri/src/clipboard.rs:317`）：优先内存替身、其次
+  `bevy_clipboard::Clipboard`，有文本就 `Editor::insert` 到光标处（多行文本里的
+  `\n` 原样保留，`\r\n`/`\r` 归一）；空剪贴板、没有后端、读取失败写状态行的
+  `PASTE_FAILED`（`clipboard.rs:113`，和 `Copied` 同一套状态反馈），成功粘贴会清掉
+  上一次的红色错误。没有图片粘贴入口，原因写在代码里：`bevy_clipboard` 没开
+  `image` feature，也没有剪贴板图片落盘到会话目录的约定。
+- **测试**：`ctrl_v_pastes_text_at_the_cursor`、
+  `ctrl_v_with_an_empty_clipboard_shows_a_visible_error`、
+  `ctrl_v_without_any_clipboard_resource_still_reports`、
+  `a_successful_paste_clears_the_previous_error`。
+- **还差**：图片粘贴（`bevy_clipboard` 的 `image` feature + `Scratch` 目录 + 落盘 +
+  `@path`）；剪贴板里只有图片时仍只会报 "The clipboard holds no text."。把图片文件
+  拖进窗口变 `@path` 也没接。提示行仍写 "Ctrl+V image"（`hints.rs:33`，本轮按文件
+  边界不改 hints），与实际（只粘文本）不符。
+- **依赖**：图片部分依赖会话目录（`SessionPaths`，应用层已有）。
 
 ---
 

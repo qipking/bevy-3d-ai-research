@@ -4,6 +4,13 @@
 //! **不照搬**：窗口是分裂树上的叶子，位置和大小都由 [`LayoutNode::rects`] 递归推导。
 //! 一块面板能拿到的矩形只取决于树，跟"离底边几行"无关。
 //!
+//! [`FrameSize`] 默认 96×28，但在装了 [`FramePlugin`] 的 App 里由主窗口的
+//! **逻辑**像素尺寸驱动：[`sync_frame_size_to_window`] 每帧只读窗口、换算成
+//! 格子数（[`FrameSize::from_window_size`]），值变了才写资源——窗口拖大/拖小
+//! 就多/少几行几列，[`lay_out_frame`]、行窗口化、工作区条带间距都跟着走。
+//! 截图与测试要确定性时用 `RF_FRAME=96x28`：只要它能解析，尺寸在启动时就被
+//! [`FrameSizePinned`] 钉住，窗口再变也不覆盖。
+//!
 //! ```text
 //! FrameSize(96×28 格) ──> TileRect（米，整屏）
 //!                          │
@@ -24,6 +31,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
+use bevy::window::{PrimaryWindow, Window};
 use bevy_ui::{BorderRadius, Node, UiRect, px};
 use feathers_in_3d::{MirrorRoot, WorldLayer, WorldPanel};
 
@@ -82,6 +90,14 @@ impl CellRect {
 }
 
 /// 一帧有多大，单位格子（对应 rig-tui 的 `TerminalSize`）。
+///
+/// 默认 96×28；装了 [`FramePlugin`] 后由主窗口的逻辑像素尺寸驱动，窗口
+/// resize / 换显示器 / DPI 缩放都会让格子数跟着变（见
+/// [`sync_frame_size_to_window`]）。
+///
+/// **确定性覆盖**：`RF_FRAME=96x28` 能解析时，[`FramePlugin`] 在启动时就把
+/// 尺寸钉住（[`FrameSizePinned`]），窗口怎么拖都不再覆盖它——截图与测试依赖
+/// 这一条。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSize {
     pub cols: u16,
@@ -104,17 +120,72 @@ impl FrameSize {
         })
     }
 
+    /// 启动时的确定性尺寸：`RF_FRAME` 可解析就用它，否则 [`Default`]。
+    ///
+    /// 优先级（[`FramePlugin`]）：
+    /// 1. `RF_FRAME` 可解析 → 固定这个值，**窗口尺寸不覆盖**；
+    /// 2. 否则 → 由主窗口逻辑像素驱动（[`FrameSize::from_window_size`]）。
     pub fn from_env() -> Self {
-        std::env::var("RF_FRAME")
-            .ok()
-            .and_then(|text| Self::parse(&text))
-            .unwrap_or_default()
+        Self::env_override().unwrap_or_default()
+    }
+
+    /// `RF_FRAME` 存在且可解析时的覆盖值；没设 / 坏值返回 `None`。
+    ///
+    /// `None` 才允许窗口接管。命令行的截图/测试脚本靠这里保确定性。
+    pub fn env_override() -> Option<Self> {
+        Self::from_env_text(std::env::var("RF_FRAME").ok().as_deref())
+    }
+
+    /// 解析一个可选的 `RF_FRAME` 文本值（读环境变量与解析分开，方便测试）。
+    ///
+    /// `None` 或 `"nope"` 这类坏值都返回 `None`，与"没设环境变量"同义。
+    pub fn from_env_text(value: Option<&str>) -> Option<Self> {
+        value.and_then(Self::parse)
+    }
+
+    /// 主窗口的**逻辑**像素尺寸 → 格子数。
+    ///
+    /// `cols = floor(width / CELL.x)`、`rows = floor(height / CELL.y)`，各至少 1。
+    /// 用 floor 而不是 round：一列格子必须**完整**放得下，帧不会因为半格像素
+    /// 反过来超出窗口。窗口比一个格子还小（含 0 / 负数 / 非有限值）时钳到
+    /// 1×1——布局对 0 列/行本来就有 [`PanelArea::is_empty`] 兜底，所以极小窗口
+    /// 不会 panic。
+    ///
+    /// 为什么用 **logical**：布局写进 `Node` 的 `Val::Px`、[`CELL`]、字号都是
+    /// 逻辑像素，`Window::size()` 也是逻辑像素（`physical_size() /
+    /// scale_factor()`）；格子数 = 逻辑窗口 / 单元格逻辑尺寸，2× DPI 下才会
+    /// 保持"字号与列数的比例"不变。若改用 physical，格子数会按缩放因子翻倍，
+    /// 而 `Node` 的 `Val::Px` 仍是逻辑单位，面板会撑出窗口。
+    ///
+    /// 注意 `feathers_in_3d` 镜像读的是 `ComputedNode.size`（bevy 报的是**物理**
+    /// 像素，1× 缩放下与逻辑值相同）。这里只定布局格子数；镜像在非 1× DPI 下
+    /// 的物理/逻辑换算与相机取景是另一件事，别把它混进格子换算里。
+    pub fn from_window_size(size: Vec2) -> Self {
+        fn cells(pixels: f32, cell: f32) -> u16 {
+            if !pixels.is_finite() || pixels <= 0.0 {
+                return 1;
+            }
+            // `as u16` 对超大的 float 是饱和转换（到 u16::MAX），不会回绕。
+            ((pixels / cell).floor() as u16).max(1)
+        }
+        Self {
+            cols: cells(size.x, CELL.x),
+            rows: cells(size.y, CELL.y),
+        }
     }
 
     pub fn screen(&self) -> CellRect {
         CellRect::new(0, 0, self.cols, self.rows)
     }
 }
+
+/// `FrameSize` 被钉住：窗口尺寸不再覆盖它（`RF_FRAME` 生效时由 [`FramePlugin`]
+/// 插入，见 [`FrameSize::from_env`]）。
+///
+/// 只影响 [`sync_frame_size_to_window`]；布局系统照常读 [`FrameSize`]。
+/// 截图/测试要的是"窗口怎么拖都是同一套格子"，这个资源就是那条确定性路径。
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameSizePinned(pub bool);
 
 /// 文字区能从面板里拿到的大小：面板尺寸减掉装饰。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +428,48 @@ impl Default for FrameGeometry {
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct DefaultScreen {
     pub transcript: Option<Entity>,
+}
+
+/// 把主窗口的逻辑像素尺寸换算成 [`FrameSize`]；值没变就**不写资源**。
+///
+/// 每帧只做一次只读查询再比较：winit 在发 `WindowResized` 之前已经更新了
+/// `Window`，所以窗口拖动、DPI/缩放变化、启动时的初始尺寸都走同一条路径，
+/// 不需要另外订阅 resize 消息（`selection.rs` 仍按消息清选区）。
+///
+/// 三种情况跳过：
+/// - [`FrameSizePinned`] 为真（`RF_FRAME` 生效）：截图/测试的确定性优先，
+///   窗口怎么拖都不改格子数；
+/// - 没有 `PrimaryWindow`（headless 测试、只装布局的 App）；
+/// - 窗口尺寸 ≤ 0（最小化）：保留上一次的格子数，恢复时再算，避免布局在
+///   1×1 和正常尺寸之间来回重建。
+///
+/// 只有换算结果真的变了才写 [`FrameSize`]（比较后再写），并打一行 `info!`；
+/// 没变化时连资源变更标记都不碰，下游不会无谓重建。
+pub fn sync_frame_size_to_window(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    pinned: Option<Res<FrameSizePinned>>,
+    mut size: ResMut<FrameSize>,
+) {
+    if pinned.is_some_and(|pinned| pinned.0) {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let logical = window.size();
+    if logical.x <= 0.0 || logical.y <= 0.0 {
+        return;
+    }
+    let next = FrameSize::from_window_size(logical);
+    if *size == next {
+        return;
+    }
+    let previous = *size;
+    *size = next;
+    info!(
+        "[frame] window {:.0}x{:.0} logical px -> {}x{} cells (was {}x{})",
+        logical.x, logical.y, next.cols, next.rows, previous.cols, previous.rows
+    );
 }
 
 /// 算每块面板这一帧的区域：分裂树叶子 + 浮层。
@@ -834,7 +947,10 @@ pub struct FramePlugin;
 
 impl Plugin for FramePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(FrameSize::from_env())
+        // `RF_FRAME` 生效 = 确定性覆盖：启动时钉住，窗口 resize 不再改它。
+        let env_size = FrameSize::env_override();
+        app.insert_resource(env_size.unwrap_or_default())
+            .insert_resource(FrameSizePinned(env_size.is_some()))
             .init_resource::<PanelAreas>()
             .init_resource::<FrameGeometry>()
             .init_resource::<DefaultScreen>()
@@ -842,7 +958,12 @@ impl Plugin for FramePlugin {
             .add_systems(Startup, spawn_default_screen)
             .add_systems(
                 Update,
-                (sync_confirm_tile, lay_out_frame, place_panels)
+                (
+                    sync_frame_size_to_window,
+                    sync_confirm_tile,
+                    lay_out_frame,
+                    place_panels,
+                )
                     .chain()
                     .in_set(crate::FeathersSystems::Layout),
             );
@@ -854,11 +975,59 @@ impl Plugin for FramePlugin {
 mod tests {
     use super::*;
     use bevy::ecs::entity::Entity;
+    use bevy::window::WindowResolution;
 
     use crate::layout::{Child, Size};
 
     fn entity(index: u32) -> Entity {
         Entity::from_raw_u32(index).expect("entity")
+    }
+
+    /// 主窗口实体（bevy_ui 与镜像都用逻辑像素；这里是 1× 缩放）。
+    fn primary_window(app: &mut App, width: u32, height: u32) -> Entity {
+        app.world_mut()
+            .spawn((
+                Window {
+                    resolution: WindowResolution::new(width, height),
+                    ..default()
+                },
+                PrimaryWindow,
+            ))
+            .id()
+    }
+
+    /// 改窗口尺寸并像 winit 一样补一条 `WindowResized`（逻辑像素）。
+    fn resize_window(app: &mut App, window: Entity, width: u32, height: u32) {
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .expect("主窗口")
+            .resolution = WindowResolution::new(width, height);
+        app.world_mut().write_message(bevy::window::WindowResized {
+            window,
+            width: width as f32,
+            height: height as f32,
+        });
+    }
+
+    /// 只装帧布局四件套 + 主窗口的最小 App（不建 UI 插件、不渲染）。
+    fn windowed_frame_app(width: u32, height: u32) -> (App, Entity) {
+        let mut app = App::new();
+        app.init_resource::<PanelAreas>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>()
+            .init_resource::<DefaultScreen>()
+            .init_resource::<FrameGeometry>()
+            .init_resource::<FrameTree>()
+            .insert_resource(FrameSize::default())
+            .insert_resource(FrameSizePinned(false))
+            .add_message::<bevy::window::WindowResized>()
+            .add_systems(Startup, spawn_default_screen)
+            .add_systems(
+                Update,
+                (sync_frame_size_to_window, lay_out_frame, place_panels).chain(),
+            );
+        let window = primary_window(&mut app, width, height);
+        (app, window)
     }
 
     fn tree_panel(entity: Entity, inset: PanelInset) -> ToLayOut {
@@ -1311,5 +1480,313 @@ mod tests {
         assert_eq!(size.screen(), CellRect::new(0, 0, 96, 28));
         assert_eq!(FrameSize::parse("120x40"), Some(FrameSize { cols: 120, rows: 40 }));
         assert_eq!(FrameSize::parse("nope"), None);
+    }
+
+    // ---- 窗口尺寸 -> 格子数（REMAINING #3） ----
+
+    /// 窗口逻辑像素 / `CELL`，只算完整格子；不足一格钳到 1。
+    #[test]
+    fn window_pixels_map_to_cells_by_cell_size() {
+        assert_eq!(CELL, Vec2::new(7.8, 18.0));
+        // 1280 / 7.8 = 164.1…，800 / 18 = 44.4…
+        assert_eq!(
+            FrameSize::from_window_size(Vec2::new(1280.0, 800.0)),
+            FrameSize { cols: 164, rows: 44 }
+        );
+        // 800 / 7.8 = 102.5…，600 / 18 = 33.3…
+        assert_eq!(
+            FrameSize::from_window_size(Vec2::new(800.0, 600.0)),
+            FrameSize { cols: 102, rows: 33 }
+        );
+        assert_eq!(
+            FrameSize::from_window_size(Vec2::new(7.7, 17.9)),
+            FrameSize { cols: 1, rows: 1 },
+            "不足一格也算 1，不然布局拿到 0 列/行"
+        );
+        assert_eq!(
+            FrameSize::from_window_size(Vec2::ZERO),
+            FrameSize { cols: 1, rows: 1 }
+        );
+        assert_eq!(
+            FrameSize::from_window_size(Vec2::new(-10.0, f32::NAN)),
+            FrameSize { cols: 1, rows: 1 }
+        );
+    }
+
+    /// `RF_FRAME` 生效时窗口尺寸不覆盖 `FrameSize`（截图/测试确定性）。
+    #[test]
+    fn an_rf_frame_override_is_not_overwritten_by_the_window() {
+        // `FramePlugin` 用 `env_override().is_some()` 决定 `FrameSizePinned`；
+        // 这里不改进程环境变量（并行测试共享环境），直接走同一条分支。
+        let pinned_size = FrameSize::from_env_text(Some("96x28")).expect("RF_FRAME 可解析");
+        assert_eq!(pinned_size, FrameSize { cols: 96, rows: 28 });
+        assert_eq!(FrameSize::from_env_text(Some("nope")), None, "坏值 = 不覆盖");
+        assert_eq!(FrameSize::from_env_text(None), None, "没设 = 不覆盖");
+
+        let mut app = App::new();
+        app.insert_resource(pinned_size)
+            .insert_resource(FrameSizePinned(true))
+            .add_systems(Update, sync_frame_size_to_window);
+        let window = primary_window(&mut app, 1280, 800);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            pinned_size,
+            "窗口初值不能覆盖 RF_FRAME"
+        );
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .expect("主窗口")
+            .resolution = WindowResolution::new(800, 600);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            pinned_size,
+            "拖窗口也不能覆盖 RF_FRAME"
+        );
+    }
+
+    /// 只装同步系统的 App：启动时按窗口算，resize 后跟着变小。
+    #[test]
+    fn the_frame_size_follows_the_primary_window() {
+        let mut app = App::new();
+        app.insert_resource(FrameSize::default())
+            .insert_resource(FrameSizePinned(false))
+            .add_systems(Update, sync_frame_size_to_window);
+        let window = primary_window(&mut app, 1280, 800);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 164, rows: 44 }
+        );
+
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .expect("主窗口")
+            .resolution = WindowResolution::new(800, 600);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 102, rows: 33 }
+        );
+    }
+
+    /// 格子数来自**逻辑**尺寸：2× DPI 的 2560×1600 物理窗口还是 164×44。
+    #[test]
+    fn cells_come_from_the_logical_size_not_the_physical_size() {
+        let mut app = App::new();
+        app.insert_resource(FrameSize::default())
+            .insert_resource(FrameSizePinned(false))
+            .add_systems(Update, sync_frame_size_to_window);
+        let mut resolution = WindowResolution::new(2560, 1600);
+        resolution.set_scale_factor(2.0);
+        app.world_mut().spawn((
+            Window {
+                resolution,
+                ..default()
+            },
+            PrimaryWindow,
+        ));
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 164, rows: 44 },
+            "逻辑尺寸 1280×800；不能用 physical 把格子数翻倍"
+        );
+    }
+
+    /// 插件接线：`FramePlugin` 自己就把窗口同步系统挂在布局链最前面。
+    #[test]
+    fn frame_plugin_follows_the_primary_window() {
+        if crate::niri::niri_layout() {
+            return;
+        }
+        if FrameSize::env_override().is_some() {
+            return; // RF_FRAME 生效时窗口不接管（上面有专门的覆盖测试）。
+        }
+        let mut app = App::new();
+        // `FramePlugin` 只负责布局；面板的行槽/根表平时由 `PanelsPlugin` 建。
+        app.init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>()
+            .add_plugins(FramePlugin);
+        primary_window(&mut app, 1280, 800);
+        app.update();
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 164, rows: 44 },
+            "FramePlugin 的 Update 链要先同步窗口尺寸，再铺布局"
+        );
+    }
+
+    /// 窗口拖小：`FrameSize`、`lay_out_frame` 的面板 rect、`place_panels` 的
+    /// `Node` 尺寸都跟着变（不是只把整块 3D 画面缩放）。
+    #[test]
+    fn resizing_the_window_relayouts_the_panels() {
+        if crate::niri::niri_layout() {
+            return; // Niri 模式下默认屏幕不 spawn（见 `spawn_default_screen`）。
+        }
+        let (mut app, window) = windowed_frame_app(1280, 800);
+        app.update();
+
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 164, rows: 44 },
+            "启动时 1280×800 / CELL"
+        );
+        let transcript = app
+            .world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Transcript)
+            .expect("转写面板");
+        let before = app
+            .world()
+            .resource::<PanelAreas>()
+            .get(transcript)
+            .expect("转写区域");
+        assert_eq!(before.rect, CellRect::new(0, 0, 109, 41));
+        assert!(
+            (node_width(&app, transcript) - 2.0 / 3.0 * 164.0 * CELL.x).abs() < 1e-3,
+            "Node 宽度 = 树的精确像素"
+        );
+
+        resize_window(&mut app, window, 800, 600);
+        app.update();
+
+        assert_eq!(
+            *app.world().resource::<FrameSize>(),
+            FrameSize { cols: 102, rows: 33 },
+            "窗口变小后格子数跟着变小"
+        );
+        let after = app
+            .world()
+            .resource::<PanelAreas>()
+            .get(transcript)
+            .expect("转写区域");
+        assert_eq!(after.rect, CellRect::new(0, 0, 68, 30));
+        assert!(
+            after.rect.w < before.rect.w && after.rect.h < before.rect.h,
+            "面板 rect 必须跟着变小：{before:?} -> {after:?}"
+        );
+        assert!(
+            (node_width(&app, transcript) - 68.0 * CELL.x).abs() < 1e-3,
+            "Node 宽度跟着树重算"
+        );
+    }
+
+    /// 尺寸没变时同步系统不写资源（`Changed<FrameSize>` 不触发）；变了只写一次。
+    #[test]
+    fn an_unchanged_window_does_not_rewrite_the_frame_size() {
+        #[derive(Resource, Default)]
+        struct FrameSizeWrites(u32);
+
+        fn count_writes(size: Res<FrameSize>, mut writes: ResMut<FrameSizeWrites>) {
+            if size.is_changed() {
+                writes.0 += 1;
+            }
+        }
+
+        let mut app = App::new();
+        app.insert_resource(FrameSize { cols: 164, rows: 44 })
+            .insert_resource(FrameSizePinned(false))
+            .init_resource::<FrameSizeWrites>()
+            .add_systems(Update, (sync_frame_size_to_window, count_writes).chain());
+        let window = primary_window(&mut app, 1280, 800);
+        app.update(); // 基线：第一次看到资源不算"重复写"
+        app.world_mut().resource_mut::<FrameSizeWrites>().0 = 0;
+
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<FrameSizeWrites>().0,
+            0,
+            "尺寸没变时不能写资源（否则每帧触发重排）"
+        );
+
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .expect("主窗口")
+            .resolution = WindowResolution::new(800, 600);
+        app.update();
+        assert_eq!(
+            app.world().resource::<FrameSizeWrites>().0,
+            1,
+            "尺寸变了才写一次"
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<FrameSizeWrites>().0,
+            1,
+            "之后尺寸没再变，不重复写"
+        );
+    }
+
+    /// 极小窗口：不 panic，cols/rows ≥ 1，面板 rect 不超过帧。
+    #[test]
+    fn a_tiny_window_lays_out_without_panicking() {
+        if crate::niri::niri_layout() {
+            return;
+        }
+        let (mut app, window) = windowed_frame_app(100, 80);
+        app.update();
+
+        let size = *app.world().resource::<FrameSize>();
+        assert_eq!(size, FrameSize { cols: 12, rows: 4 });
+        assert!(size.cols >= 1 && size.rows >= 1);
+        let areas = app.world().resource::<PanelAreas>();
+        assert!(!areas.0.is_empty(), "极小窗口也要有面板区域");
+        for area in areas.0.values() {
+            assert!(area.size.x.is_finite() && area.size.y.is_finite());
+            assert!(
+                area.rect.right() <= size.cols && area.rect.bottom() <= size.rows,
+                "rect 出界：{area:?}（帧 {size:?}）"
+            );
+        }
+
+        // 1×1 是最坏情况：固定行（提示/状态/输入）要整体缩水，不能 panic。
+        resize_window(&mut app, window, 1, 1);
+        app.update();
+        let size = *app.world().resource::<FrameSize>();
+        assert_eq!(size, FrameSize { cols: 1, rows: 1 });
+        for area in app.world().resource::<PanelAreas>().0.values() {
+            assert!(
+                area.rect.right() <= 1 && area.rect.bottom() <= 1,
+                "1×1 帧里 rect 出界：{area:?}"
+            );
+        }
+    }
+
+    /// 工作区条带间距读的是同一个 `FrameSize::rows`，改尺寸后比例一致
+    /// （只读核对，不改 workspaces.rs）。
+    #[test]
+    fn workspace_strip_spacing_uses_the_same_frame_size() {
+        use crate::workspaces::{WORKSPACE_GAP, workspace_step, workspace_strip_height};
+
+        for size in [
+            FrameSize::default(),
+            FrameSize { cols: 164, rows: 44 },
+            FrameSize { cols: 12, rows: 4 },
+        ] {
+            let strip = f32::from(size.rows) * CELL.y * UNITS_TO_WORLD;
+            assert!(
+                (workspace_strip_height(size) - strip).abs() < 1e-6,
+                "条带高度 = rows × CELL.y × UNITS_TO_WORLD"
+            );
+            assert!(
+                (workspace_step(size) - strip - WORKSPACE_GAP).abs() < 1e-6,
+                "步长 = 条带高度 + 固定间距"
+            );
+        }
+        assert!(
+            workspace_step(FrameSize { cols: 164, rows: 44 })
+                > workspace_step(FrameSize::default()),
+            "窗口变高后工作区间距跟着变大（同一个 FrameSize）"
+        );
+    }
+
+    fn node_width(app: &App, entity: Entity) -> f32 {
+        match app.world().get::<Node>(entity).expect("面板 Node").width {
+            bevy_ui::Val::Px(width) => width,
+            other => panic!("Node 宽度应当是像素：{other:?}"),
+        }
     }
 }

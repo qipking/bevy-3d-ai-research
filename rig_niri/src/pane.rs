@@ -15,11 +15,20 @@
 //! 面板大小由 [`crate::frame`] 决定，所以窗口化放在 `FeathersSystems::Fit`：
 //! 面板拿到区域之后、行被生成之前。
 //!
-//! 滚动有两个入口，语义一致：
+//! 滚动有三个入口，语义一致：
 //!
-//! - 键盘 PgUp/PgDn（[`pane_keys`]）：一次一页；
+//! - 键盘 PgUp/PgDn 与 Shift+↑/↓（[`pane_keys`]）：一次一页 / 一行；
+//! - 键盘 Alt+↑/↓：选上一条 / 下一条目，并把条目滚进可见区域
+//!   （上游 `PaneKeys` 的 `SelectUp`/`SelectDown`，对应 `ScrollTo` 的
+//!   `ItemRow::Reveal`）；Esc 清掉条目选区，把键交回输入框；
 //! - 滚轮（[`pane_wheel`]）：一次 [`WHEEL_ROWS`] 行（上游 `input.rs::moused`
 //!   的 `pane.scroll.up(3)`），指针在别的面板上时不动转写。
+//!
+//! 转写的行是扁平的，但 key 的高 32 位是块序号（`transcript.rs` 的
+//! `row_key`），所以一块的行在流里相邻；[`item_rows`] 按它分组，Alt+↑/↓ 选中的
+//! 就是“一整块”。选中态存在 [`Selection`]（复用鼠标选区的高亮/复制），条目
+//! 身份是 [`Selection::item`]；`sync_item_selection` 每帧把身份换算回当前
+//! 可见行。
 //!
 //! 往上滚是用户主动往回看，取消 [`PaneScroll::follow`]；滚到末尾恢复跟随。
 //! 窗口/面板尺寸变化不在本模块缓存：窗口化每帧从 [`PanelAreas`]（或 Niri 的
@@ -32,8 +41,9 @@ use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
 use crate::frame::{PanelAreas, PanelRoots};
+use crate::keys::KeyFocus;
 use crate::panels::{KeyedRow, PanelId, PanelRows, RowLayout};
-use crate::selection::Selection;
+use crate::selection::{Point, Selection};
 use crate::transcript::Row;
 use crate::FeathersSystems;
 
@@ -51,6 +61,54 @@ impl TranscriptRows {
     pub fn get(&self, index: usize) -> Option<&KeyedRow> {
         self.0.get(index)
     }
+}
+
+/// 转写里的一个**条目**：一整块（一条消息、一次调用、一条 notice……）在行流里
+/// 占的行区间。
+///
+/// 上游的 `TranscriptItem` 是块的身份；这里没有消息 id，块序号就是身份。
+/// `row_key` 是 `ordinal << 32 | index`，所以同一块的行在流里相邻，
+/// `key >> 32` 就是块序号（见 [`crate::transcript`] 末尾）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemRows {
+    /// 块序号：行 key 的高 32 位。
+    pub ordinal: u32,
+    /// 这一块的第一行在整段里的下标。
+    pub start: usize,
+    /// 最后一行的下一行（左闭右开）。
+    pub end: usize,
+}
+
+impl ItemRows {
+    /// 这一块的行区间（左闭右开）。
+    pub fn rows(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+}
+
+/// 把一段扁平的行流按 `key >> 32` 分组，得到每个条目占的行区间（上游
+/// `view::ItemRow` 里“行 -> 条目”的换算）。
+///
+/// “下面还有”标记行的 key 是 `u64::MAX`、不属于任何块，跳过它。
+/// 可见窗口可能从一块的中间开始（滚动后），这时第一组也从窗口的第 0 行算起；
+/// 组是相对**传入切片**的下标。
+pub fn item_rows(rows: &[KeyedRow]) -> Vec<ItemRows> {
+    let mut items: Vec<ItemRows> = Vec::new();
+    for (index, keyed) in rows.iter().enumerate() {
+        if keyed.key == BELOW_MARKER_KEY {
+            continue;
+        }
+        let ordinal = (keyed.key >> 32) as u32;
+        match items.last_mut() {
+            Some(last) if last.ordinal == ordinal => last.end = index + 1,
+            _ => items.push(ItemRows {
+                ordinal,
+                start: index,
+                end: index + 1,
+            }),
+        }
+    }
+    items
 }
 
 /// 主转写窗格的滚动：窗顶是第几行，是否跟着末尾（rig-tui 的 `Scroll`）。
@@ -164,9 +222,12 @@ fn pane_rows(
 /// 以前这里另写了一份同样的字符串，两处改一处就会漂。
 pub const BELOW_MARKER: &str = crate::transcript::MORE_BELOW;
 
+/// “下面还有”标记行的 key：`u64::MAX`，不属于任何块（[`item_rows`] 跳过它）。
+const BELOW_MARKER_KEY: u64 = u64::MAX;
+
 fn below_marker() -> KeyedRow {
     KeyedRow {
-        key: u64::MAX,
+        key: BELOW_MARKER_KEY,
         hash: 1,
         row: Row::new(Line::from("")).with_right(Line::from(Span::styled(
             BELOW_MARKER,
@@ -215,27 +276,240 @@ pub fn window_transcript(
     panels.set(PanelId::Transcript, rows);
 }
 
-/// PageUp / PageDown 滚动转写（rig-tui 在面板键位域里绑定它们）。
+/// 窗口这一帧能放几行**正文**：滚上去时最后一行留给 [`BELOW_MARKER`]。
+fn text_rows(follow: bool, top: usize, height: usize, max_top: usize) -> usize {
+    if !follow && top < max_top && height > 1 {
+        height - 1
+    } else {
+        height
+    }
+}
+
+/// Alt+↑/↓：把选中移到上一条 / 下一条，并把它滚进可见区域。
+///
+/// 对应上游 `input::select` + `ScrollTo { row: ItemRow::Reveal }`：条目第一行
+/// 不在窗口里时把它顶到窗顶；还在窗口里就不动滚动位置。上游在两端会取消
+/// 选中（“下一条”越过最新一条选中空），这里按任务要求**夹住**在第一条/最后
+/// 一条，不越界也不丢选中。还没选中时 ↓ 从第一条开始，↑ 从最新一条开始。
+#[allow(clippy::too_many_arguments)]
+fn select_pane_item(
+    down: bool,
+    full: &[KeyedRow],
+    roots: &PanelRoots,
+    scroll: &mut PaneScroll,
+    selection: &mut Selection,
+    focus: Option<&mut KeyFocus>,
+    height: usize,
+    max_top: usize,
+) {
+    let items = item_rows(full);
+    if items.is_empty() {
+        return;
+    }
+    let at = selection
+        .item()
+        .and_then(|item| items.iter().position(|candidate| candidate.ordinal == item));
+    let index = match (at, down) {
+        (Some(at), true) => (at + 1).min(items.len() - 1),
+        (Some(at), false) => at.saturating_sub(1),
+        (None, true) => 0,
+        (None, false) => items.len() - 1,
+    };
+    let item = items[index];
+    let top = scroll.top.min(max_top);
+    let shown = text_rows(scroll.follow, top, height, max_top);
+    if item.start < top || item.start >= top + shown {
+        // `PaneScroll::to` 的 `follow = top >= max_top` 与上游 `Scroll::place`
+        // 一致：条目顶到末尾时恢复跟随。
+        scroll.to(Some(item.start), max_top);
+    }
+    // 选区落在**当前可见行**上（和鼠标拖选同一套下标）：整段里的行号减窗口
+    // 顶。条目比窗口高时只亮露出来的部分；`to` 用下一行的行首（左闭右开）。
+    let top = scroll.top.min(max_top);
+    let shown = text_rows(scroll.follow, top, height, max_top);
+    let from = item.start.saturating_sub(top);
+    let to = item
+        .end
+        .min(top.saturating_add(shown))
+        .saturating_sub(top);
+    selection.select_item(PanelId::Transcript, from, to, item.ordinal);
+    if let Some(focus) = focus
+        && let Some(root) = roots.entity(PanelId::Transcript)
+    {
+        // 拿住键：这样 `editor.rs` 的 Esc 走的是“面板没绑 Esc -> 交还输入框”
+        // 分支，而不是输入框作用域里的 Stop（停 agent）。
+        focus.0 = Some(root);
+    }
+}
+
+/// 转写区的键（PgUp/PgDn、Shift+↑/↓、Alt+↑/↓、Esc）。
+///
+/// 为什么直接读 [`ButtonInput<KeyCode>`] 而不是走 `keys.rs` 的绑定表：
+/// 内置绑定只有输入框作用域（[`crate::keys::KeyScope::Input`]）里的
+/// `ScrollUp`/`ScrollDown`/`SelectUp`/`SelectDown`，它们经 `editor.rs` 分派后
+/// 在本 crate 里是空实现；`KeyScope::Transcript` 也还没有系统会切进去。这里和
+/// 原来的 PgUp/PgDn 一样，按键在窗格这一侧处理，动作名与上游一致。
+///
+/// Esc 只处理“转写里选着条目”的情况；没有选中时什么也不做，留给
+/// `editor.rs` 的 Esc（停 agent）。
+#[allow(clippy::too_many_arguments)]
 pub fn pane_keys(
     keys: Res<ButtonInput<KeyCode>>,
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     full: Res<TranscriptRows>,
     mut scroll: ResMut<PaneScroll>,
+    mut selection: Option<ResMut<Selection>>,
+    mut focus: Option<ResMut<KeyFocus>>,
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
+    // Esc：清掉条目选区。**不在这里清 KeyFocus**：`editor::keys` 也读同一个
+    // Esc，只有看到焦点还在转写根上，它才会走面板作用域的“Esc 交还输入框”
+    // 分支；在 Prepare 里先清焦点会把它送回输入作用域，Esc 就被当成 Stop
+    // （停 agent）。焦点由 `release_transcript_focus` 在窗口化之后交还。
+    if keys.just_pressed(KeyCode::Escape)
+        && let Some(selection) = selection.as_deref_mut()
+        && selection.item().is_some()
+    {
+        selection.clear();
+    }
+
     let height = pane_rows(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or(0);
     if height == 0 {
         return;
     }
     let max_top = full.len().saturating_sub(height);
+    let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let (up, down) = (
+        keys.just_pressed(KeyCode::ArrowUp),
+        keys.just_pressed(KeyCode::ArrowDown),
+    );
+
+    // Alt+↑/↓：选条目（上游 PaneKeys 的 SelectUp/SelectDown）。
+    if alt && (up || down) {
+        if let Some(selection) = selection.as_deref_mut() {
+            select_pane_item(
+                down,
+                &full.0,
+                &roots,
+                &mut scroll,
+                selection,
+                focus.as_deref_mut(),
+                height,
+                max_top,
+            );
+        }
+    // Shift+↑/↓：逐行滚（上游 ScrollUp/ScrollDown），一次一行、夹在
+    // `[0, max_top]`；不抢 PgUp/PgDn 的一页。
+    } else if shift {
+        if up {
+            scroll.up(1);
+        }
+        if down {
+            scroll.down(1, max_top);
+        }
+    }
+
+    // PgUp/PgDn 的原行为不变：一次一页。
     let page = scroll.page(height);
     if keys.just_pressed(KeyCode::PageUp) {
         scroll.up(page);
     }
     if keys.just_pressed(KeyCode::PageDown) {
         scroll.down(page, max_top);
+    }
+}
+
+/// 让键盘选中的条目跟着窗口走：窗口化之后，把条目身份换算回当前可见行。
+///
+/// [`Selection`] 里的行下标是**可见窗口**的，滚动、折行、resize 后同一块会
+/// 换位置；[`Selection::item`] 的块序号不变。所以每帧在 [`window_transcript`]
+/// 之后重算一次高亮区间：
+///
+/// - 条目在窗口里：按它现在占的行重新落选区（鼠标拖选不受影响：`item` 为
+///   `None` 时这里直接返回）；
+/// - 条目滚出窗口：保留身份、收起高亮（滚回来再亮）；
+/// - 块整个消失了（压缩/重排）：清掉选中。
+fn sync_item_selection(
+    full: Res<TranscriptRows>,
+    panels: Res<PanelRows>,
+    roots: Res<PanelRoots>,
+    mut selection: Option<ResMut<Selection>>,
+    mut focus: Option<ResMut<KeyFocus>>,
+) {
+    // 先只读：鼠标选区（`item == None`）每帧原样返回，不把 `Selection` 标记成
+    // 改过，也不去扫整段行。
+    let Some(item) = selection.as_deref().and_then(Selection::item) else {
+        return;
+    };
+    if !item_rows(&full.0)
+        .iter()
+        .any(|candidate| candidate.ordinal == item)
+    {
+        // 整块没了：键盘选中一起清掉，别指着一个不存在的块。
+        if let Some(selection) = selection.as_deref_mut() {
+            selection.clear();
+        }
+        return;
+    }
+    let visible = item_rows(panels.get(PanelId::Transcript));
+    let Some(shown) = visible
+        .iter()
+        .find(|candidate| candidate.ordinal == item)
+        .copied()
+    else {
+        // 条目滚出窗口：保留身份、收起高亮。已经收起就不重复写。
+        let suspended = selection.as_deref().is_some_and(|selection| !selection.is_active());
+        if !suspended
+            && let Some(selection) = selection.as_deref_mut()
+        {
+            selection.suspend_item();
+        }
+        return;
+    };
+    let needs_reselect = selection.as_deref().is_some_and(|selection| {
+        selection.panel() != Some(PanelId::Transcript)
+            || selection.anchor() != Point::new(shown.start, 0)
+            || selection.focus() != Point::new(shown.end, 0)
+    });
+    if needs_reselect
+        && let Some(selection) = selection.as_deref_mut()
+    {
+        selection.select_item(PanelId::Transcript, shown.start, shown.end, item);
+    }
+    if let Some(focus) = focus.as_deref_mut()
+        && let Some(root) = roots.entity(PanelId::Transcript)
+    {
+        focus.0 = Some(root);
+    }
+}
+
+/// 条目选中没了就把 [`KeyFocus`] 还给输入框（`None`）。
+///
+/// 放在 `Fit`、[`pane_keys`] 之后而不是按键处理里：见 [`pane_keys`] 的注释
+/// —— Esc 的“交还输入框”必须让 `editor::keys` 先看到焦点还在转写根上。这里
+/// 同时兜住鼠标点击、滚轮、resize 清掉选中之后把键还给输入框。
+fn release_transcript_focus(
+    roots: Option<Res<PanelRoots>>,
+    selection: Option<Res<Selection>>,
+    mut focus: Option<ResMut<KeyFocus>>,
+) {
+    let Some(root) = roots
+        .as_deref()
+        .and_then(|roots| roots.entity(PanelId::Transcript))
+    else {
+        return;
+    };
+    let Some(focus) = focus.as_deref_mut() else {
+        return;
+    };
+    if focus.0 != Some(root) {
+        return;
+    }
+    if selection.as_deref().and_then(Selection::item).is_none() {
+        focus.0 = None;
     }
 }
 
@@ -327,7 +601,13 @@ impl Plugin for PanePlugin {
             )
             .add_systems(
                 Update,
-                window_transcript.in_set(FeathersSystems::Fit),
+                (
+                    window_transcript,
+                    sync_item_selection,
+                    release_transcript_focus,
+                )
+                    .chain()
+                    .in_set(FeathersSystems::Fit),
             );
     }
 }
@@ -669,6 +949,408 @@ mod tests {
         // 上游 moused：滚轮先 `view.selection = None`。
         assert_eq!(fixture.app.world().resource::<Selection>().panel(), None);
         assert!(!fixture.app.world().resource::<Selection>().has_selection());
+    }
+
+    // ---- 条目身份 / Alt+↑↓ 选条目 / Shift+↑↓ 行滚 / Esc ----
+
+    /// 一个块的行：key 的高 32 位 = 块序号，低 32 位 = 块内行号。
+    fn block_rows(ordinal: u32, lines: &[&str]) -> Vec<KeyedRow> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, text)| KeyedRow {
+                key: (u64::from(ordinal) << 32) | index as u64,
+                hash: u64::from(ordinal) * 100 + index as u64,
+                row: Row::new(Line::from((*text).to_owned())),
+            })
+            .collect()
+    }
+
+    /// `count` 个只有一行的块。
+    fn single_row_blocks(count: usize) -> Vec<KeyedRow> {
+        (0..count)
+            .map(|ordinal| KeyedRow {
+                key: (ordinal as u64) << 32,
+                hash: ordinal as u64 + 1,
+                row: Row::new(Line::from(format!("row {ordinal}"))),
+            })
+            .collect()
+    }
+
+    struct KeysFixture {
+        app: App,
+        root: Entity,
+    }
+
+    fn keys_app_rows(rows: Vec<KeyedRow>, height: u16) -> KeysFixture {
+        let mut app = App::new();
+        app.init_resource::<TranscriptRows>()
+            .init_resource::<PaneScroll>()
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelAreas>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<Selection>()
+            .init_resource::<KeyFocus>()
+            .init_resource::<ButtonInput<KeyCode>>();
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Transcript, root);
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .insert(root, pane_area(height));
+        app.world_mut().resource_mut::<TranscriptRows>().0 = rows;
+        // 与 `PanePlugin` 的 Fit 顺序一致：先窗口化，再按可见行重算条目高亮，
+        // 最后在选中没了时交还焦点。
+        app.add_systems(
+            Update,
+            (
+                pane_keys,
+                window_transcript,
+                sync_item_selection,
+                release_transcript_focus,
+            )
+                .chain(),
+        );
+        // 先跑一帧把窗口/跟随位置摆好。
+        app.update();
+        KeysFixture { app, root }
+    }
+
+    fn keys_app(blocks: &[&[&str]], height: u16) -> KeysFixture {
+        let rows = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(ordinal, lines)| block_rows(ordinal as u32, lines))
+            .collect();
+        keys_app_rows(rows, height)
+    }
+
+    /// 按一次键：`modifiers` 按住，`key` 这一帧按下。
+    fn tap(app: &mut App, modifiers: &[KeyCode], key: KeyCode) {
+        {
+            // 松开上一帧按下的键：`press` 只有从“没按”变“按下”才进
+            // `just_pressed`。
+            let mut held = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            held.reset_all();
+            for modifier in modifiers {
+                held.press(*modifier);
+            }
+            held.press(key);
+        }
+        app.update();
+        // 真实 App 的 `InputPlugin` 每帧开头会清 `just_pressed`；测试 App 没有，
+        // 手动清掉，免得下一次 `app.update()` 又把同一个按键当成“刚按下”。
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+    }
+
+    fn alt_tap(app: &mut App, key: KeyCode) {
+        tap(app, &[KeyCode::AltLeft], key);
+    }
+
+    fn shift_tap(app: &mut App, key: KeyCode) {
+        tap(app, &[KeyCode::ShiftLeft], key);
+    }
+
+    fn visible_values(app: &App) -> Vec<Row> {
+        app.world()
+            .resource::<PanelRows>()
+            .row_values(PanelId::Transcript)
+    }
+
+    fn selection(app: &App) -> &Selection {
+        app.world().resource::<Selection>()
+    }
+
+    fn scroll(app: &App) -> PaneScroll {
+        *app.world().resource::<PaneScroll>()
+    }
+
+    fn focus(app: &App) -> KeyFocus {
+        *app.world().resource::<KeyFocus>()
+    }
+
+    #[test]
+    fn item_rows_group_by_the_high_key_bits_and_skip_the_below_marker() {
+        let mut rows = block_rows(0, &["a", "b"]);
+        rows.extend(block_rows(1, &["c", "d", "e"]));
+        let mut with_marker = rows.clone();
+        with_marker.push(below_marker());
+        assert_eq!(
+            item_rows(&with_marker),
+            vec![
+                ItemRows {
+                    ordinal: 0,
+                    start: 0,
+                    end: 2
+                },
+                ItemRows {
+                    ordinal: 1,
+                    start: 2,
+                    end: 5
+                },
+            ],
+            "块序号 = key >> 32；下面还有标记不是条目"
+        );
+
+        // 窗口从一块的中间开始：行号是相对传入切片的。
+        let window = rows[1..4].to_vec();
+        assert_eq!(
+            item_rows(&window),
+            vec![
+                ItemRows {
+                    ordinal: 0,
+                    start: 0,
+                    end: 1
+                },
+                ItemRows {
+                    ordinal: 1,
+                    start: 1,
+                    end: 3
+                },
+            ]
+        );
+        assert_eq!(item_rows(&window)[1].rows(), 1..3);
+    }
+
+    #[test]
+    fn alt_down_selects_items_in_order_and_alt_up_walks_back_without_overshooting() {
+        let mut fixture = keys_app(&[&["one"][..], &["two"][..], &["three"][..]], 10);
+
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(selection(&fixture.app).anchor(), Point::new(0, 0));
+        assert_eq!(selection(&fixture.app).focus(), Point::new(1, 0));
+        assert_eq!(
+            selection(&fixture.app)
+                .selected_text(&visible_values(&fixture.app))
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            focus(&fixture.app).0,
+            Some(fixture.root),
+            "选条目时把键拿在转写根上（Esc 才能交还输入框）"
+        );
+
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(1));
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(2));
+
+        // 到底不越界、不丢选中（上游在两端会取消选中，任务要求夹住）。
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(2));
+
+        alt_tap(&mut fixture.app, KeyCode::ArrowUp);
+        assert_eq!(selection(&fixture.app).item(), Some(1));
+        alt_tap(&mut fixture.app, KeyCode::ArrowUp);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        alt_tap(&mut fixture.app, KeyCode::ArrowUp);
+        assert_eq!(selection(&fixture.app).item(), Some(0), "到顶也不越界");
+    }
+
+    #[test]
+    fn a_selected_item_puts_all_of_its_rows_in_the_selection_and_no_others() {
+        let mut fixture = keys_app(
+            &[
+                &["user 1", "user 2"][..],
+                &["answer a", "answer b", "answer c"][..],
+                &["notice"][..],
+            ],
+            10,
+        );
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+
+        let rows = visible_values(&fixture.app);
+        let selection = selection(&fixture.app);
+        assert_eq!(selection.item(), Some(1));
+        assert_eq!(selection.anchor(), Point::new(2, 0));
+        assert_eq!(selection.focus(), Point::new(5, 0), "左闭右开，最后一行整行");
+        assert_eq!(
+            selection.selected_text(&rows).as_deref(),
+            Some("answer a\nanswer b\nanswer c")
+        );
+        assert_eq!(
+            selection.all_ranges(&rows),
+            vec![(2, vec![(0, 8)]), (3, vec![(0, 8)]), (4, vec![(0, 8)])],
+            "只有这一块的三行"
+        );
+        for other in [0, 1, 5] {
+            assert_eq!(
+                selection.ranges_in(other, &rows),
+                Vec::<(usize, usize)>::new(),
+                "别的块 / 窗口外不进选区"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_an_item_scrolls_it_into_view() {
+        // 20 个一行块、视口 5 行：初始跟随末尾 top = 15。
+        let mut fixture = keys_app_rows(single_row_blocks(20), 5);
+        assert_eq!(scroll(&fixture.app).top, 15);
+        assert!(scroll(&fixture.app).follow);
+
+        // Alt+↓ 从第一条开始：它在窗口上面，要滚到窗顶。
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(scroll(&fixture.app).top, 0, "条目 0 被顶到窗顶");
+        assert!(!scroll(&fixture.app).follow, "往回看 = 不再跟随末尾");
+        assert_eq!(
+            crate::selection::row_text(&visible_values(&fixture.app)[0]),
+            "row 0"
+        );
+
+        // 一路 ↓ 到第 6 条：第 4 条不在窗口里时窗口才下移，之后条目 5 可见。
+        for _ in 0..5 {
+            alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        }
+        assert_eq!(selection(&fixture.app).item(), Some(5));
+        let top = scroll(&fixture.app).top;
+        assert_eq!(top, 4);
+        assert!(top <= 5 && 5 < top + 5, "选中的条目在可见窗口里");
+    }
+
+    #[test]
+    fn alt_up_with_no_selection_starts_at_the_newest_item() {
+        let mut fixture = keys_app_rows(single_row_blocks(20), 5);
+        alt_tap(&mut fixture.app, KeyCode::ArrowUp);
+        assert_eq!(selection(&fixture.app).item(), Some(19), "没选中时 ↑ = 最新一条");
+        assert_eq!(scroll(&fixture.app).top, 15);
+        assert!(selection(&fixture.app).has_selection());
+    }
+
+    #[test]
+    fn escape_clears_the_item_selection_and_gives_the_keys_back_to_the_input() {
+        let mut fixture = keys_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert!(selection(&fixture.app).has_selection());
+        assert_eq!(focus(&fixture.app).0, Some(fixture.root));
+
+        tap(&mut fixture.app, &[], KeyCode::Escape);
+        assert_eq!(selection(&fixture.app).item(), None);
+        assert!(!selection(&fixture.app).has_selection());
+        assert_eq!(
+            focus(&fixture.app).0,
+            None,
+            "Esc 把 KeyFocus 还给输入框（None）"
+        );
+
+        // 没有选中时 Esc 不动转写：停 agent 的语义在 editor.rs。
+        tap(&mut fixture.app, &[], KeyCode::Escape);
+        assert_eq!(focus(&fixture.app).0, None);
+        assert_eq!(selection(&fixture.app).item(), None);
+    }
+
+    #[test]
+    fn a_mouse_click_takes_the_keys_back_from_the_transcript() {
+        let mut fixture = keys_app(&[&["hello world"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(focus(&fixture.app).0, Some(fixture.root));
+
+        // 鼠标点击走的是 selection.rs 的 press_kind：条目身份没了，焦点也要
+        // 跟着还回输入框，否则点完之后打不了字。
+        let rows = visible_values(&fixture.app);
+        fixture
+            .app
+            .world_mut()
+            .resource_mut::<Selection>()
+            .press_kind(PanelId::Transcript, &rows, 0, 2, ClickKind::Single);
+        fixture.app.update();
+        assert_eq!(selection(&fixture.app).item(), None);
+        assert_eq!(focus(&fixture.app).0, None);
+    }
+
+    #[test]
+    fn a_vanished_block_clears_the_item_selection() {
+        let mut fixture = keys_app(&[&["one"][..], &["two"][..]], 10);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+
+        // 块 0 被压缩/重排掉：身份不存在了，选中和焦点都要收掉。
+        fixture.app.world_mut().resource_mut::<TranscriptRows>().0 =
+            block_rows(1, &["two"]);
+        fixture.app.update();
+        assert_eq!(selection(&fixture.app).item(), None);
+        assert!(!selection(&fixture.app).has_selection());
+        assert_eq!(focus(&fixture.app).0, None);
+    }
+
+    #[test]
+    fn shift_arrows_scroll_one_row_and_clamp_to_the_viewport() {
+        // 10 行、视口 3 行：max_top = 7。
+        let mut fixture = keys_app_rows(single_row_blocks(10), 3);
+        assert_eq!(scroll(&fixture.app).top, 7);
+        assert!(scroll(&fixture.app).follow);
+
+        shift_tap(&mut fixture.app, KeyCode::ArrowUp);
+        assert_eq!(scroll(&fixture.app).top, 6, "一次一行，不是一页（3-1=2 行）");
+        assert!(!scroll(&fixture.app).follow);
+        shift_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(scroll(&fixture.app).top, 7);
+        assert!(scroll(&fixture.app).follow, "滚回末尾恢复跟随");
+
+        for _ in 0..20 {
+            shift_tap(&mut fixture.app, KeyCode::ArrowUp);
+        }
+        assert_eq!(scroll(&fixture.app).top, 0, "顶部夹在 0");
+        assert!(!scroll(&fixture.app).follow);
+
+        for _ in 0..20 {
+            shift_tap(&mut fixture.app, KeyCode::ArrowDown);
+        }
+        assert_eq!(scroll(&fixture.app).top, 7, "底部夹在 max_top");
+        assert!(scroll(&fixture.app).follow);
+    }
+
+    #[test]
+    fn page_up_and_page_down_still_move_a_page() {
+        // 100 行、视口 10 行：一页 = 9 行，max_top = 90。
+        let mut fixture = keys_app_rows(single_row_blocks(100), 10);
+        assert_eq!(scroll(&fixture.app).top, 90);
+
+        tap(&mut fixture.app, &[], KeyCode::PageUp);
+        assert_eq!(scroll(&fixture.app).top, 81);
+        assert!(!scroll(&fixture.app).follow);
+
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        assert_eq!(scroll(&fixture.app).top, 90);
+        assert!(scroll(&fixture.app).follow);
+
+        for _ in 0..20 {
+            tap(&mut fixture.app, &[], KeyCode::PageUp);
+        }
+        assert_eq!(scroll(&fixture.app).top, 0, "PgUp 到顶夹住");
+    }
+
+    #[test]
+    fn a_keyboard_item_follows_the_rows_after_paging_and_scrolling_back() {
+        let mut fixture = keys_app_rows(single_row_blocks(20), 5);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert_eq!(scroll(&fixture.app).top, 0);
+
+        // PgDn 把条目 0 滚出窗口：保留身份、收起高亮，但不丢选中。
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert!(!selection(&fixture.app).has_selection(), "滚出窗口时不画高亮");
+        assert_eq!(
+            focus(&fixture.app).0,
+            Some(fixture.root),
+            "条目还选着，键还在转写上"
+        );
+
+        // PgUp 滚回来：同一个条目重新亮起来。
+        tap(&mut fixture.app, &[], KeyCode::PageUp);
+        assert_eq!(selection(&fixture.app).item(), Some(0));
+        assert!(selection(&fixture.app).has_selection());
+        assert_eq!(selection(&fixture.app).anchor(), Point::new(0, 0));
     }
 }
 

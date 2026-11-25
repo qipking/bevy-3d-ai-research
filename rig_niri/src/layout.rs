@@ -763,7 +763,10 @@ fn main_row() -> Node {
                         Child::fixed(0.0, Node::leaf(PanelId::Confirm)),
                         // 补全：关着时 0 高度（`sync_completion_tile` 调）。
                         Child::fixed(0.0, Node::leaf(PanelId::Complete)),
-                        // 输入框固定 4 行。
+                        // 输入框初始 4 行；运行时由 `editor::sync_editor_tile`
+                        // 按内容改成 `input_tile_height`（空输入保底 3 行、
+                        // 最多 10 行 + 面板 chrome）。这里保留 Fixed：差额由
+                        // 上面的 Spacer（比例子）吸收，右列总高精确不变。
                         Child::fixed(4.0 * ROW_HEIGHT, Node::leaf(PanelId::Input)),
                     ],
                 ),
