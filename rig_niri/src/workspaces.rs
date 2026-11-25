@@ -3090,7 +3090,8 @@ mod tests {
         assert!(target <= clamp_scroll(1400.0, 748.8));
     }
 
-    // 29. 给工作区设 scroll=200px：转写列左移 200px，Hints/Status（chrome）不动，
+    // 29. 给工作区设 scroll=200px：只滚转写列，右列（Input/Confirm/Complete）
+    //     与 Hints/Status 是固定 chrome、一个像素都不动（`NIRI_SCROLL.md` §2.1）；
     //     面板尺寸不变；另一个工作区一个像素都不动。
     #[test]
     fn scrolling_a_workspace_moves_the_strip_but_not_the_chrome_rows() {
@@ -3114,14 +3115,25 @@ mod tests {
         app.update();
 
         let after_a = area_centers(&app, a);
-        for id in [PanelId::Transcript, PanelId::Input, PanelId::Complete] {
+        let transcript = PanelId::Transcript;
+        assert!(
+            (after_a[&transcript].x - (before_a[&transcript].x - SCROLL)).abs() < 1e-3,
+            "{transcript:?} 在条带里，应该左移 {SCROLL}px：{} -> {}",
+            before_a[&transcript].x,
+            after_a[&transcript].x
+        );
+        assert_eq!(
+            after_a[&transcript].y, before_a[&transcript].y,
+            "{transcript:?} 不上下动"
+        );
+        // niri：条带里的**所有**列一起滚，右列的输入/确认/补全也是列。
+        for id in [PanelId::Confirm, PanelId::Complete, PanelId::Input] {
             assert!(
                 (after_a[&id].x - (before_a[&id].x - SCROLL)).abs() < 1e-3,
-                "{id:?} 在条带里，应该左移 {SCROLL}px：{} -> {}",
+                "{id:?} 在条带里，应该跟着左移 {SCROLL}px：{} -> {}",
                 before_a[&id].x,
                 after_a[&id].x
             );
-            assert_eq!(after_a[&id].y, before_a[&id].y, "{id:?} 不上下动");
         }
         for id in [PanelId::Hints, PanelId::Status] {
             assert_eq!(

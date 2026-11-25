@@ -1697,9 +1697,10 @@ fn push_ask_block(
     }
     // free-text 的问题可以点选项（如果有）也可以打字：本前端没有弹层输入框，
     // 作答入口就是主输入框，所以在这块最后一行给一条 dim 指路。多选的
-    // free-text（`multiple`，选项 + 文本备注）还没做，Enter 不会作答，因此
-    // 不给会误导的提示。
-    if question.free_text && !question.multiple {
+    // free-text（`multiple`，选项 + 文本备注）和 `inline` 都还没做/不该抢
+    // 输入框：前者的 Enter 不会作答，后者的下一行是消息不是答案（上游
+    // `ask.rs:78-82`），给指路行只会误导。
+    if question.free_text && !question.multiple && !question.inline {
         let hint = match question.multiline {
             true => "类型作答：在输入框写，Enter 提交（Shift+Enter 换行）",
             false => "类型作答：在输入框写，Enter 提交",
@@ -3449,6 +3450,31 @@ mod tests {
         // 只有一个 Ask 时不加序号（不给唯一的问题添噪音）。
         let single = confirm_texts(&confirm_rows(&[pending(&first, first_entity, 10)], 80));
         assert_eq!(single[0], "? first");
+    }
+
+    #[test]
+    fn the_free_text_input_hint_skips_inline_and_multiple_asks() {
+        let entity = Entity::from_raw_u32(9).expect("合法实体");
+        let plain = question("说说想法", "", &[]).free_text();
+        let inline = question("旁边的问题", "", &[]).free_text().inline();
+        let multiple = question("多个选项", "", &[]).free_text().multiple();
+
+        let plain_rows = confirm_texts(&confirm_rows(&[pending(&plain, entity, 1)], 80));
+        assert!(
+            plain_rows.iter().any(|row| row.contains("类型作答")),
+            "普通 free-text 问题要指路到输入框：{plain_rows:?}"
+        );
+
+        for (ask, effect, why) in [
+            (&inline, 2, "inline 的下一行是消息，不是答案"),
+            (&multiple, 3, "多选 free-text 的 Enter 不作答"),
+        ] {
+            let rows = confirm_texts(&confirm_rows(&[pending(ask, entity, effect)], 80));
+            assert!(
+                rows.iter().all(|row| !row.contains("类型作答")),
+                "{why}，不能再提示去输入框作答：{rows:?}"
+            );
+        }
     }
 
     #[test]

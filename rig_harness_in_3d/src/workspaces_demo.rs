@@ -543,15 +543,17 @@ fn arrange_once(mut done: Local<bool>, set: Res<WorkspaceSet>, mut commands: Com
     }
 }
 
-/// 帧高变化后，把**仍是自动排列**的工作区按新帧高重新堆叠。
+/// 帧高变化后，把**仍处于自动排列位置**的工作区按新帧高重新堆叠。
 ///
 /// 为什么需要它：`FrameSize` 启动时先按默认值插入，窗口尺寸同步后才变成真实格子数；
 /// `arrange_once` 可能跑在同步之前，于是条带间距按旧帧高算，窗口更大时相邻条带会
 /// 竖直重叠（下面条带的底部行露进上面条带的可见范围）。这里在每次 `FrameSize` 变化
 /// 时重排一次。
 ///
-/// 只重排**没有被用户放动**的工作区：把当前 pose 和"按旧帧高自动堆叠"的期望值比较，
-/// 有一个不等就说明用户拖过（或别人安排过），这时不动——niri 里只有用户的动作能移动窗口。
+/// **逐个工作区判断**，不是全有或全无：把每个工作区当前 pose 和"按旧帧高自动堆叠"
+/// 的期望值比较，只重排仍然相等的那些；被用户拖过/手放过的那个留在原地（niri 里
+/// 只有用户的动作能移动窗口）。0 号工作区的自动位姿本来就是 `(0,0)`，不需要豁免——
+/// 豁免会让"拖过 1 号"后的缩放大小时 0 号也留在旧高度，条带重叠又回来。
 fn restack_on_resize(world: &mut World, mut last: Local<Option<FrameSize>>) {
     let Some(size) = world.get_resource::<FrameSize>().copied() else {
         return;
@@ -561,29 +563,47 @@ fn restack_on_resize(world: &mut World, mut last: Local<Option<FrameSize>>) {
     }
     let previous = last.replace(size);
 
+    // 和 `arrange_workspaces` 同一排序口径：`order` 相同时按创建顺序。
     // 工作区的世界位姿来自 `Workspace::pose`；实体上没有 `Transform`（别把查询写成
     // `(&Workspace, &Transform)`，那样会一个都查不到、重排静默失效）。
-    let mut workspaces: Vec<(usize, Vec3)> = world
-        .query::<&Workspace>()
-        .iter(world)
-        .map(|workspace| (workspace.order, workspace.pose.translation))
-        .collect();
+    let mut workspaces: Vec<(usize, usize, Entity, Transform)> = {
+        let mut query = world.query::<(Entity, &Workspace)>();
+        query
+            .iter(world)
+            .enumerate()
+            .map(|(created, (entity, workspace))| {
+                (workspace.order, created, entity, workspace.pose)
+            })
+            .collect()
+    };
     if workspaces.len() < 2 {
         return;
     }
-    workspaces.sort_by_key(|(order, _)| *order);
+    workspaces.sort_by_key(|(order, created, _, _)| (*order, *created));
 
     // 首次（还没有旧帧高）：直接按当前帧高整理。
-    if let Some(previous) = previous {
-        let step = workspace_step(previous);
-        let auto = workspaces.iter().enumerate().all(|(index, (_, position))| {
-            index == 0 || (position.x.abs() < 1e-4 && (position.y + index as f32 * step).abs() < 1e-3)
-        });
+    let Some(previous) = previous else {
+        arrange_workspaces(world);
+        return;
+    };
+
+    let old_step = workspace_step(previous);
+    let new_step = workspace_step(size);
+    for (index, (_, _, entity, pose)) in workspaces.iter().enumerate() {
+        // 自动位姿：x = z = 0、朝向单位阵、y = -index × 旧帧高步长。
+        let expected_y = -(index as f32) * old_step;
+        let auto = pose.translation.x.abs() < 1e-4
+            && pose.translation.z.abs() < 1e-4
+            && (pose.translation.y - expected_y).abs() < 1e-3
+            && pose.rotation.dot(Quat::IDENTITY).abs() > 1.0 - 1e-6;
         if !auto {
-            return;
+            continue;
+        }
+        if let Some(mut workspace) = world.get_mut::<Workspace>(*entity) {
+            workspace.pose.translation = Vec3::new(0.0, -(index as f32) * new_step, 0.0);
+            workspace.pose.rotation = Quat::IDENTITY;
         }
     }
-    arrange_workspaces(world);
 }
 
 /// `RF_SHOW_ALL=1`：启动后取消聚焦，一次看到所有条带。
@@ -702,6 +722,64 @@ mod tests {
             .map(|workspace| workspace.pose.translation)
             .expect("2 号工作区");
         assert!((position.x - 0.4).abs() < 1e-4, "手放的位置要保住：{position:?}");
+    }
+
+    /// 拖过 1 号之后缩放窗口：1 号留在手放的位置，0/2 仍按**新帧高**重排，
+    /// 不会再因为"有一个手放的就全都不排"而让 0 号留在旧高度、条带重叠。
+    #[test]
+    fn resizing_restacks_only_the_untouched_workspaces() {
+        let mut app = headless(3);
+        app.update();
+
+        let old_size = FrameSize { cols: 96, rows: 28 };
+        let old_step = workspace_step(old_size);
+        let hand_placed = Vec3::new(3.0, -old_step, 0.0);
+        app.world_mut()
+            .query::<&mut Workspace>()
+            .iter_mut(app.world_mut())
+            .for_each(|mut workspace| {
+                if workspace.order == 1 {
+                    workspace.pose.translation = hand_placed;
+                }
+            });
+
+        let new_size = FrameSize { cols: 164, rows: 44 };
+        let new_step = workspace_step(new_size);
+        let strip = rig_niri::workspaces::workspace_strip_height(new_size);
+        assert!(new_step > old_step + 0.1, "新帧高必须让步长明显变大");
+        app.insert_resource(new_size);
+        app.update();
+
+        let mut poses: Vec<(usize, Vec3)> = app
+            .world_mut()
+            .query::<&Workspace>()
+            .iter(app.world())
+            .map(|workspace| (workspace.order, workspace.pose.translation))
+            .collect();
+        poses.sort_by_key(|(order, _)| *order);
+        let position = |order: usize| {
+            poses
+                .iter()
+                .find(|(candidate, _)| *candidate == order)
+                .map(|(_, position)| *position)
+                .expect("工作区存在")
+        };
+
+        assert_eq!(position(1), hand_placed, "手放的 1 号留在原地");
+        assert_eq!(position(0), Vec3::ZERO, "0 号本来就是自动位姿，照旧在原点");
+        assert_eq!(
+            position(2),
+            Vec3::new(0.0, -2.0 * new_step, 0.0),
+            "2 号按新帧高重排（不是旧帧高）"
+        );
+        // 0 号和 2 号之间隔了两个步长：条带高度 < 步长，所以互不重叠。
+        assert!(2.0 * new_step > strip, "两个步长必须大于条带高度");
+        let bottom0 = position(0).y;
+        let top2 = position(2).y + strip;
+        assert!(
+            top2 < bottom0 - 1e-3,
+            "重排后的 0/2 仍重叠：top2={top2}, bottom0={bottom0}"
+        );
     }
 
     /// 一个永不返回的工具：调它一次就一直是"在飞"的，测试要断言的就是这个状态。

@@ -965,11 +965,12 @@ fn first_pending_ask(
 
 /// 输入框里的 Enter 该回答的那个 `Ask`：**最老的、能靠打字作答的问题**。
 ///
-/// 范围比 [`first_pending_ask`] 窄：只算 `free_text` 且不是多选
-/// （`!multiple`）的问题——多选的 free-text 是"选项 + 备注"，本前端还没做
-/// （见 `docs/status/REMAINING.md` §5 的"还没做"）。可见性、FIFO（内核效应
-/// id 从老到新，没登记 id 的排最后）与确认 tile / Alt+1..9 完全同一口径，
-/// 所以自由文本问题也按先来先答。
+/// 范围比 [`first_pending_ask`] 窄：只算 `free_text`、不是多选（`!multiple`）
+/// 且不是内联（`!inline`）的问题——多选的 free-text 是"选项 + 备注"，本前端
+/// 还没做（见 `docs/status/REMAINING.md` §5 的"还没做"）；`Ask::inline`
+/// 明确"用户下一行是消息、不是它的答案"（上游 `ask.rs:78-82`），所以不能抢
+/// Enter。可见性、FIFO（内核效应 id 从老到新，没登记 id 的排最后）与确认
+/// tile / Alt+1..9 完全同一口径，所以自由文本问题也按先来先答。
 ///
 /// 上游 rig-tui 用 `PickerInput.draft`/`in_input()` 表示"这个问题拿输入框
 /// 作答"；本前端没有 picker 队列，改成"当前最老的 free-text 问题"直接拿
@@ -985,6 +986,7 @@ fn first_free_text_ask(
         .filter(|(_, ask, _, owner, _)| {
             ask.free_text
                 && !ask.multiple
+                && !ask.inline
                 && crate::keys::ask_is_visible(shown, owner.map(|ForAgent(owner)| *owner))
         })
         .min_by_key(|(_, _, effect, _, _)| {
@@ -1264,9 +1266,10 @@ pub struct Clipboards<'w> {
 /// * 确认面板里有未回答的 `Ask` 时，Esc 先拒绝它、Alt+1..9 用第一个问题的
 ///   第 n 个选项回答、Alt+0 拒绝——都走 [`answer_ask`] / [`refuse_ask`]，
 ///   和点击确认行同一条落点；没有问题时的 Esc 行为不变；
-/// * 有能靠打字作答的 free-text 问题（`free_text && !multiple`）时，Enter
-///   改成回答最老的那个（`first_free_text_ask` → `answer_with_text`），
-///   不再发送消息；输入为空时 Enter 什么也不做。它第一次成为最老的
+/// * 有能靠打字作答的 free-text 问题（`free_text && !multiple && !inline`）
+///   时，Enter 改成回答最老的那个（`first_free_text_ask` →
+///   `answer_with_text`），不再发送消息；`Ask::inline` 的下一行仍是消息；
+///   输入为空时 Enter 什么也不做。它第一次成为最老的
 ///   可作答问题时，`seed_initial_answer` 把 `initial` 填进空输入框
 ///   （只填一次）。
 #[allow(clippy::too_many_arguments)]
@@ -1368,12 +1371,12 @@ pub fn keys(
                             }
                         }
                         // 输入框作答（上游 `pick.rs` 的 `in_input`/`draft`）：
-                        // 有 free-text 问题且不是多选时，Enter 归它，不再发送
-                        // 消息；有多个就答最老的（和确认 tile / Alt+1..9 同一
-                        // FIFO）。输入为空时 Enter 不作答、也不发送——什么也
-                        // 不做。选项型问题（`free_text == false`）不进这个
-                        // 分支，Enter 照旧发送（上游："the user's next line is
-                        // a message, not its answer"）。
+                        // 有 free-text 问题、不是多选、也不是 inline 时，Enter
+                        // 归它，不再发送消息；有多个就答最老的（和确认 tile /
+                        // Alt+1..9 同一 FIFO）。输入为空时 Enter 不作答、也不
+                        // 发送——什么也不做。选项型（`free_text == false`）和
+                        // `Ask::inline` 不进这个分支，Enter 照旧发送（上游：
+                        // "the user's next line is a message, not its answer"）。
                         if matches!(action, InputAction::Send)
                             && let Some((ask, _, _)) = first_free_text_ask(&asks, agent)
                         {
@@ -2757,6 +2760,39 @@ mod tests {
                 .is_decided(),
             "选项型问题不能被输入框里的文字答掉"
         );
+    }
+
+    #[test]
+    fn an_inline_free_text_ask_leaves_enter_as_a_message() {
+        let (mut app, agent) = answering_app();
+        // `Ask::inline`：问题摆在旁边，用户下一行是给 agent 的消息而不是答案
+        // （上游 `ask.rs:78-82`）。
+        let ask = app
+            .world_mut()
+            .spawn(Ask::new("旁边的问题").free_text().inline())
+            .id();
+        app.update();
+        assert!(
+            app.world().get::<Decision>(ask).is_some(),
+            "Ask 的 Effect 要带上内核的 Decision"
+        );
+
+        type_text(&mut app, "这是给 agent 的消息");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "这是给 agent 的消息".to_owned(), DeliveryMode::Steer)],
+            "inline 的 free-text 问题不能抢 Enter，输入仍然是消息"
+        );
+        assert!(
+            !app.world()
+                .get::<Decision>(ask)
+                .expect("Ask 要有 Decision")
+                .is_decided(),
+            "inline 问题不能被这一行误答"
+        );
+        assert_eq!(text(&app), "", "消息发送后输入框照常清空");
     }
 
     #[test]

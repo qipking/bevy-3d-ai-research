@@ -10,9 +10,10 @@
 //!   可显示的错误，不 panic。
 //! - 粘贴附件：上游是“把剪贴板图片存成文件，再在输入里打 `@path`”，
 //!   再把“粘贴/拖入的文本里的图片文件路径”也变成 `@path`。这里做后一半：
-//!   [`image_paths`] 识别文本里的图片路径，[`attach_image_paths`] 把它们原地
-//!   换成 `@path`，[`paste_text`] 插入替换后的文本；窗口拖入由应用层调
-//!   [`dropped_file_text`]。
+//!   [`image_paths`] 识别文本里的图片路径；**整段都是图片路径**时
+//!   [`attach_image_paths`] 把它们换成 `@path` 列表（混有普通文字就原样
+//!   保留，和上游一致），[`paste_text`] 插入替换后的文本；窗口拖入由应用层
+//!   调 [`type_path`]（先经 [`dropped_file_text`] 判断是不是图片）。
 //! - 剪贴板图片：`bevy_clipboard` 的 `image` feature 没有开，也没有临时文件
 //!   存放约定，所以这里保留 [`Paste::Image`] 与 `@path` 的**应用语义**（
 //!   [`apply_paste`] / [`type_path`]），但没有从剪贴板取图片的入口。
@@ -289,37 +290,40 @@ pub fn image_paths(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// 把 `text` 里识别到的图片路径原地换成 `@path`，其余文本原样保留。
+/// 把**整段都是图片路径**的 `text` 换成对应的 `@path` 列表。
 ///
-/// 每个附件都在它原来的位置替换（多行文本里的换行、路径之间的分隔文字都
-/// 不动）；一个图片路径都没有时返回 `None`。含空白的路径按 [`reference`] 加
-/// 引号。
+/// 与上游一致：只有每个词（空白分隔）都是图片文件时才算"粘贴了附件"；
+/// 只要混进一个普通词（`convert a.png b.png out.pdf`、`look at /tmp/a.png`）
+/// 就返回 `None`，由调用方原样插入——不能把命令/句子里顺带提到的路径改掉。
+/// 路径之间的空白（含换行）原样保留，含空白的路径按 [`reference`] 加引号。
 pub fn attach_image_paths(text: &str) -> Option<String> {
+    let words = scan_words(text);
+    if words.is_empty() {
+        return None;
+    }
+    // 先全部识别：有一个词不是图片路径就不算纯附件粘贴。
+    let paths: Vec<PathBuf> = words
+        .iter()
+        .map(|word| image_path(&word.text))
+        .collect::<Option<_>>()?;
     let mut attached = String::with_capacity(text.len());
     let mut copied = 0;
-    let mut found = false;
-    for word in scan_words(text) {
-        let Some(path) = image_path(&word.text) else {
-            continue;
-        };
+    for (word, path) in words.iter().zip(paths) {
         attached.push_str(&text[copied..word.start]);
         attached.push_str(&reference(&path.to_string_lossy()));
         copied = word.end;
-        found = true;
-    }
-    if !found {
-        return None;
     }
     attached.push_str(&text[copied..]);
     Some(attached)
 }
 
-/// 拖进窗口的文件若是一张图片，返回要插进输入框的 `@path`。
+/// 拖进窗口的文件若是一张图片，返回要插进输入框的 `@path` 引用。
 ///
 /// 只看扩展名（[`IMAGE_EXTENSIONS`]），不查文件是否存在；非图片返回 `None`，
-/// 调用方因此可以原样忽略它。
+/// 调用方因此可以原样忽略它。引用用 [`reference`] 格式化（含空白的路径加
+/// 引号），窗口拖入本身走 [`type_path`] 补前导/末尾空格。
 pub fn dropped_file_text(path: &Path) -> Option<String> {
-    is_image_path(path).then(|| format!("@{}", path.display()))
+    is_image_path(path).then(|| reference(&path.to_string_lossy()))
 }
 
 /// 一个 shell 风格分词后的词，以及它在原文里的字节范围（含引号）。
@@ -452,31 +456,55 @@ pub fn apply_paste(editor: &mut Editor, paste: Paste) {
 
 /// 在光标处插入文本（上游 `paste_text` 的文本分支）。
 ///
-/// 换行归一成 `\n` 由 [`Editor::insert`] 负责。文本里的图片文件路径会先被
-/// [`attach_image_paths`] 原地换成 `@path`（其余文字不动）；没有图片路径时
-/// 原样插入。
+/// 换行归一成 `\n` 由 [`Editor::insert`] 负责。**整段都是图片路径**时先被
+/// [`attach_image_paths`] 换成 `@path` 列表；混有普通文字时原样插入（与上游
+/// 一致，不把命令/句子里顺带提到的路径改掉）。附件若落在词中间（光标前不是
+/// 空白），先补一个空格，保证 `@` 在词首。
 pub fn paste_text(editor: &mut Editor, text: &str) {
     if text.is_empty() {
         return;
     }
     match attach_image_paths(text) {
-        Some(attached) => editor.insert(&attached),
+        Some(attached) => {
+            let before = editor
+                .text()
+                .get(..editor.cursor())
+                .unwrap_or_default()
+                .to_owned();
+            // 附件文本开头的空白已经把它和前面的词隔开了；没有就补一个。
+            let attached = if attached.starts_with(char::is_whitespace) {
+                attached
+            } else {
+                format!("{}{attached}", word_break(&before))
+            };
+            editor.insert(&attached);
+        }
         None => editor.insert(text),
     }
 }
 
-/// 在光标处打一个 `@path` 引用（图片粘贴的落点，上游 `type_path`）。
-///
-/// 前面不是空白时先补一个空格，末尾也留一个空格，让它成为独立 token。
-pub fn type_path(editor: &mut Editor, path: &Path) {
-    let before = editor.text().get(..editor.cursor()).unwrap_or_default();
-    let space = if before.is_empty() || before.ends_with(char::is_whitespace) {
+/// `before` 之后写一个 `@path` 需要的分隔空格：前面不是空白（也不是文本
+/// 开头）就补一个，保证引用从词首开始。
+fn word_break(before: &str) -> &'static str {
+    if before.is_empty() || before.ends_with(char::is_whitespace) {
         ""
     } else {
         " "
-    };
+    }
+}
+
+/// 在光标处打一个 `@path` 引用（图片粘贴/拖入的落点，上游 `type_path`）。
+///
+/// 前面不是空白时先补一个空格，末尾也留一个空格，让它成为独立 token；含空白
+/// 的路径由 [`reference`] 加引号。
+pub fn type_path(editor: &mut Editor, path: &Path) {
+    let before = editor
+        .text()
+        .get(..editor.cursor())
+        .unwrap_or_default()
+        .to_owned();
     let path = path.to_string_lossy();
-    editor.insert(&format!("{space}{} ", reference(&path)));
+    editor.insert(&format!("{}{} ", word_break(&before), reference(&path)));
 }
 
 /// Ctrl+V 的文本入口：读剪贴板，成功才插入；失败给可显示的错误。
@@ -804,28 +832,34 @@ mod tests {
     }
 
     #[test]
-    fn attach_image_paths_replaces_in_place() {
+    fn attach_image_paths_converts_only_whole_image_lists() {
         assert_eq!(
-            attach_image_paths("look at /tmp/x.png ok"),
-            Some("look at @/tmp/x.png ok".to_owned())
+            attach_image_paths("/tmp/a.png /tmp/b.jpg"),
+            Some("@/tmp/a.png @/tmp/b.jpg".to_owned()),
+            "整段都是图片路径：每个路径各自变成 @path"
         );
         assert_eq!(
-            attach_image_paths("/tmp/a.png and /tmp/b.jpg"),
-            Some("@/tmp/a.png and @/tmp/b.jpg".to_owned()),
-            "多个图片路径各自替换，中间的连接词不动"
+            attach_image_paths("convert a.png b.png out.pdf"),
+            None,
+            "混有普通文件（命令）时保持原样，不能改中间的图片路径"
+        );
+        assert_eq!(
+            attach_image_paths("look at /tmp/x.png ok"),
+            None,
+            "图片路径夹在句子里时也不转（与上游一致）"
         );
     }
 
     #[test]
     fn attach_image_paths_keeps_line_breaks_and_quotes_spaces() {
         assert_eq!(
-            attach_image_paths("look\n/tmp/a.png\nand /tmp/b.jpg"),
-            Some("look\n@/tmp/a.png\nand @/tmp/b.jpg".to_owned()),
-            "多行粘贴保持换行，附件各在自己的行"
+            attach_image_paths("/tmp/a.png\n/tmp/b.jpg"),
+            Some("@/tmp/a.png\n@/tmp/b.jpg".to_owned()),
+            "多行纯附件粘贴保持换行，附件各在自己的行"
         );
         assert_eq!(
-            attach_image_paths("see 'file:///tmp/a%20b.png' now"),
-            Some("see @\"/tmp/a b.png\" now".to_owned()),
+            attach_image_paths("'file:///tmp/a%20b.png'"),
+            Some("@\"/tmp/a b.png\"".to_owned()),
             "百分号解码后有空白，@path 加引号"
         );
     }
@@ -834,11 +868,41 @@ mod tests {
     fn pasting_a_text_with_an_image_path_attaches_it() {
         let mut editor = editor("look: ");
         let mut clipboard = MockClipboard {
-            content: Some("look at /tmp/x.png ok".to_owned()),
+            content: Some("/tmp/x.png".to_owned()),
             ..Default::default()
         };
         assert_eq!(paste_from_clipboard(&mut clipboard, &mut editor), Ok(()));
-        assert_eq!(editor.text(), "look: look at @/tmp/x.png ok");
+        assert_eq!(editor.text(), "look: @/tmp/x.png");
+    }
+
+    #[test]
+    fn pasting_mixed_text_leaves_image_paths_alone() {
+        let mut editor = editor("");
+        let mut clipboard = MockClipboard {
+            content: Some("convert a.png b.png out.pdf".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(paste_from_clipboard(&mut clipboard, &mut editor), Ok(()));
+        assert_eq!(
+            editor.text(),
+            "convert a.png b.png out.pdf",
+            "命令里的 a.png/b.png 不能被改成 @path"
+        );
+    }
+
+    #[test]
+    fn pasting_an_image_path_at_a_word_end_keeps_it_a_token() {
+        let mut editor = editor("hi");
+        let mut clipboard = MockClipboard {
+            content: Some("/tmp/a.png".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(paste_from_clipboard(&mut clipboard, &mut editor), Ok(()));
+        assert_eq!(
+            editor.text(),
+            "hi @/tmp/a.png",
+            "光标在词尾粘贴路径：先补空格，@ 必须在词首"
+        );
     }
 
     #[test]
@@ -846,6 +910,11 @@ mod tests {
         assert_eq!(
             dropped_file_text(Path::new("/tmp/a.png")),
             Some("@/tmp/a.png".to_owned())
+        );
+        assert_eq!(
+            dropped_file_text(Path::new("/tmp/a b.png")),
+            Some("@\"/tmp/a b.png\"".to_owned()),
+            "带空格的路径必须加引号，否则 rig 会在第一个空白处截断"
         );
         assert_eq!(
             dropped_file_text(Path::new("/tmp/a.WEBP")),

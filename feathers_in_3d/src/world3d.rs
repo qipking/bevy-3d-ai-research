@@ -875,6 +875,38 @@ mod tests {
         assert_eq!(row1, Vec4::new(0.0, 1.0, 0.0, -0.5));
     }
 
+    /// 面板不在原点、视口只裁掉一部分时，材质 uniform 仍按**世界坐标**算：
+    /// 裁剪空间原点 = 交集中心（不是面板中心/世界原点），半尺寸 = 交集一半。
+    #[test]
+    fn panel_clip_uniform_handles_a_translated_panel_with_a_partial_clip() {
+        // 面板中心 (2, -1)，半尺寸 (0.5, 0.25)：世界矩形 x∈[1.5, 2.5]，
+        // y∈[-1.25, -0.75]。
+        let anchor = Transform::from_xyz(2.0, -1.0, 0.0);
+        let half = Vec2::new(0.5, 0.25);
+        assert_eq!(
+            panel_world_rect(&anchor, half * 2.0),
+            Rect::new(1.5, -1.25, 2.5, -0.75),
+            "平移过的 anchor 给出的世界矩形"
+        );
+
+        // 视口在右边/上边裁掉一部分：交集 x∈[2.0, 2.5]，y∈[-1.25, -0.9]，
+        // 中心 (2.25, -1.075)，半尺寸 (0.25, 0.175)。
+        let clip = Rect::new(2.0, -2.0, 3.0, -0.9);
+        let (row0, row1, clip_half) = panel_clip_uniform(&anchor, half, Some(clip));
+        assert!(
+            (row0 - Vec4::new(1.0, 0.0, 0.0, -2.25)).length() < 1e-6,
+            "x 裁剪空间要平移到交集中心 2.25（不是面板中心 2 或原点）：{row0:?}"
+        );
+        assert!(
+            (row1 - Vec4::new(0.0, 1.0, 0.0, 1.075)).length() < 1e-6,
+            "y 裁剪空间原点 = 交集中心 -1.075：{row1:?}"
+        );
+        assert!(
+            (clip_half - Vec2::new(0.25, 0.175)).length() < 1e-6,
+            "可见半尺寸 = 交集的一半：{clip_half:?}"
+        );
+    }
+
     /// ECS 级：`sync_mirror` 把材质裁剪设成 `面板 ∩ WorldPanel::clip`；
     /// 面板整个滚出视口时仍然存在（不 despawn），材质宽/高为 0。
     #[test]

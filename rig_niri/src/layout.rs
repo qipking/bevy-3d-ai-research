@@ -218,6 +218,37 @@ impl Node {
         }
     }
 
+    /// 子树里的**全部**面板（叶子 + 容器），用于"整列一起平移"。
+    fn panel_ids(&self, out: &mut Vec<PanelId>) {
+        match self {
+            Self::Leaf { panel } => out.push(*panel),
+            Self::Container { panel, node } => {
+                out.push(*panel);
+                node.panel_ids(out);
+            }
+            Self::Split { children, .. } => {
+                for child in children {
+                    child.node.panel_ids(out);
+                }
+            }
+        }
+    }
+
+    /// 子树里是否还有 [`Size::Fraction`] 的子列。
+    ///
+    /// 嵌套的 Fraction 列会按**外层的视口**再乘一次比例：改外层列的
+    /// fraction 会把整棵子树一起缩放（`0.62 × 0.5` 变成 `1/3 × 0.5`），
+    /// 所以 [`Node::set_column_fraction`] 遇到它直接拒绝。
+    fn has_fraction_child(&self) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Container { node, .. } => node.has_fraction_child(),
+            Self::Split { children, .. } => children.iter().any(|child| {
+                matches!(child.size, Size::Fraction(_)) || child.node.has_fraction_child()
+            }),
+        }
+    }
+
     /// 把 `area` 递归切成每个**叶子**的矩形（容器不算，见 [`Node::containers`]）。
     ///
     /// 保证：同一个 split 的相邻叶子之间恰好是 `gap`；所有叶子既不重叠，
@@ -258,11 +289,14 @@ impl Node {
         strip
     }
 
-    /// 同 [`Node::placements`]，但把 `anchor` 所在条带里的面板水平左移
-    /// `scroll_px`（**UI 像素**，与 [`Size::Fixed`] 同单位）。
+    /// 同 [`Node::placements`]，但把条带**内容列**水平左移 `scroll_px`
+    /// （**UI 像素**，与 [`Size::Fixed`] 同单位）。
     ///
-    /// 只动横向条带里的矩形：`scroll_px = 0` 时与本函数之外的行为逐字节相同；
-    /// Hints / Status 这类横跨整条、位于条带之外的面板不会被滚走。面板尺寸
+    /// "内容列" = 包含 `anchor` 的最外层横向 split 里、除右列 chrome
+    /// （Spacer/Confirm/Complete/Input）之外的所有列：默认树里是转写列，
+    /// picker 打开时还有追加在条带末尾的 picker 列。`scroll_px = 0` 时与本
+    /// 函数之外的行为逐字节相同；右列是**固定 chrome**（贴视口右缘），和条带外
+    /// 的 Hints/Status 一样不参与横向滚动（`NIRI_SCROLL.md` §2.1）。面板尺寸
     /// 不变（`size` 一个字节都不改），只是中心 x 变小——越界部分由渲染层的
     /// 视口裁剪负责（见 `feathers_in_3d::WorldPanel::clip`）。
     pub fn placements_scrolled(
@@ -275,25 +309,50 @@ impl Node {
         let mut strip = None;
         self.walk(area, &mut out, Some(anchor), &mut strip);
         let scroll_px = scroll_px.sanitized();
-        if scroll_px > 0.0
-            && let Some(strip) = strip
-        {
-            let shift = scroll_px * PX_TO_METERS;
-            // 条带的纵向范围：条带里的面板高度都不超过它；条带外的
-            // Hints/Status 与它只共享一条边（一个在上/下，一个在条带内），
-            // 用"上下边都被条带包住"判断就不会误伤。
-            let strip_top = strip.center.y + strip.size.y * 0.5;
-            let strip_bottom = strip.center.y - strip.size.y * 0.5;
-            const EPS: f32 = 1e-5;
-            for (_, rect, _) in out.iter_mut() {
-                let top = rect.center.y + rect.size.y * 0.5;
-                let bottom = rect.center.y - rect.size.y * 0.5;
-                if top <= strip_top + EPS && bottom >= strip_bottom - EPS {
-                    rect.center.x -= shift;
-                }
+        let Some(strip) = strip else {
+            return out;
+        };
+        if scroll_px <= 0.0 {
+            return out;
+        }
+        // niri 的滚动单位是"条带"：横条里的**所有**列（转写、picker、右列的输入/确认/
+        // 补全）一起平移；Hints/Status 是根竖 split 的兄弟、在条带纵向范围之外，所以不动。
+        let shift = scroll_px * PX_TO_METERS;
+        let far = strip.center.y - strip.size.y * 0.5;
+        let near = strip.center.y + strip.size.y * 0.5;
+        let eps = 1e-4;
+        for (_, rect, _) in out.iter_mut() {
+            if rect.center.y >= far - eps && rect.center.y <= near + eps {
+                rect.center.x -= shift;
             }
         }
         out
+    }
+
+    /// 包含 `anchor` 的最外层横向 split（节点本身，见 [`Node::strip_area`]）。
+    fn horizontal_strip(&self, anchor: PanelId) -> Option<&Node> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Container { node, .. } => node.horizontal_strip(anchor),
+            Self::Split {
+                direction,
+                children,
+                ..
+            } => {
+                if !children
+                    .iter()
+                    .any(|child| child.node.leaves().contains(&anchor))
+                {
+                    return None;
+                }
+                match direction {
+                    Split::Horizontal => Some(self),
+                    Split::Vertical => children
+                        .iter()
+                        .find_map(|child| child.node.horizontal_strip(anchor)),
+                }
+            }
+        }
     }
 
     /// 同 [`Node::rects`]，但应用条带横向滚动（锚点取 [`PanelId::Transcript`]）。
@@ -740,6 +799,8 @@ impl Node {
             return false;
         };
         if *direction == Split::Horizontal && here_has_near {
+            // niri：新列追加在横条末尾。滚动是整条带的事，所以右列（输入/确认/补全）
+            // 会跟着一起左移——它是条带里的一列，不是钉在视口上的 chrome。
             children.push(Child::fraction(
                 DEFAULT_COLUMN_FRACTION,
                 column.clone(),
@@ -846,7 +907,8 @@ impl Node {
     ///
     /// 只写这一列的 [`Size::Fraction`]：列里竖直分裂的尺寸、其它列的尺寸都
     /// 一个字节不改（niri 不变量 2）。改不动时——列是比例/固定宽、面板不在
-    /// 条带里、`fraction` 是 NaN/负数——返回 `false`，树保持原样。
+    /// 条带里、`fraction` 是 NaN/负数、或者列子树里还有嵌套的 `Fraction`
+    /// 子列（二次缩放会把整棵树一起缩小）——返回 `false`，树保持原样。
     pub fn set_column_fraction(&mut self, panel: PanelId, fraction: f32) -> bool {
         let fraction = fraction.sanitized();
         if fraction <= 0.0 {
@@ -855,6 +917,14 @@ impl Node {
         let Some(child) = self.column_child_mut(panel) else {
             return false;
         };
+        // 嵌套的 Fraction 子列按外层视口再乘一次比例：改这一列会把整棵子树
+        // 一起缩放（例如 0.62 × 0.5 变成 1/3 × 0.5）。拒绝比悄悄缩错好。
+        if child.node.has_fraction_child() {
+            bevy::log::warn!(
+                "layout: 拒绝改列宽：目标列子树里还有 Fraction 子列（二次缩放会把整棵树一起缩小）"
+            );
+            return false;
+        }
         match &mut child.size {
             Size::Fraction(current) if *current == fraction => false,
             Size::Fraction(current) => {
@@ -1883,37 +1953,50 @@ mod tests {
         assert!(node.strip_area(area(), PanelId::Status).is_none(), "Status 不在横向条带里");
     }
 
-    // 26. 横向滚动只动条带里的矩形：转写/右列/picker 一起左移，Hints/Status 不动，
-    //     面板尺寸一个字节都不改。
-    #[test]
-    fn scrolling_moves_the_strip_but_not_hints_or_status() {
-        let mut node = default_tree();
-        assert!(node.append_column_at(
-            PanelId::Transcript,
-            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
-        ));
+    // 26. 横向滚动只动转写列：右列（Spacer/Confirm/Complete/Input）和
+    //     Hints/Status 是固定 chrome，一个像素都不动；面板尺寸一个字节都不改。
+    fn scrolling_moves_the_whole_strip_but_not_hints_or_status() {
+        let node = default_tree();
         let before = node.placements(area());
         let scroll_px = 200.0;
         let after = node.placements_scrolled(area(), PanelId::Transcript, scroll_px);
         let shift = scroll_px * PX_TO_METERS;
 
         assert_eq!(after.len(), before.len(), "滚动不增删面板");
+        // 条带里的列（转写 + 右列的 Spacer/Confirm/Complete/Input）一起左移；
+        // Hints/Status 是根 split 的兄弟、在条带纵向范围之外，保持不动。
+        let in_strip = |id: PanelId| {
+            matches!(
+                id,
+                PanelId::Transcript | PanelId::Spacer | PanelId::Confirm | PanelId::Complete
+                    | PanelId::Input
+            )
+        };
         for ((id, old, old_container), (fresh_id, fresh, fresh_container)) in
             before.iter().zip(after.iter())
         {
             assert_eq!(id, fresh_id, "顺序不变");
             assert_eq!(old_container, fresh_container);
             assert_eq!(old.size, fresh.size, "{id:?} 尺寸不能被滚动改小");
-            let moved = match id {
-                PanelId::Hints | PanelId::Status => 0.0,
-                _ => -shift,
-            };
+            let moved = if in_strip(*id) { -shift } else { 0.0 };
             assert!(
                 close(fresh.center.x - old.center.x, moved),
                 "{id:?} 的 x 位移是 {}（期望 {moved}）",
                 fresh.center.x - old.center.x
             );
             assert_eq!(fresh.center.y, old.center.y, "{id:?} 不该上下动");
+        }
+
+        // 固定的只有横跨整条的两行（它们在条带外）。
+        for panel in [PanelId::Hints, PanelId::Status] {
+            let rect = rect_of(
+                &after.iter().map(|(id, rect, _)| (*id, *rect)).collect::<Vec<_>>(),
+                panel,
+            );
+            assert!(
+                close(right(&rect), right(&area())),
+                "{panel:?} 应该横跨整条、不随滚动"
+            );
         }
 
         // scroll = 0 时与普通 placements 逐字节相同（回归）。
@@ -1923,23 +2006,68 @@ mod tests {
         assert_eq!(negative, before, "负滚动量夹到 0");
     }
 
+    // 26b. picker 打开、条带滚到 0.62 视口：输入框/确认 tile 仍贴视口右缘，
+    //      不能跟着转写列滑到视口中部（`NIRI_SCROLL.md` §2.1 的固定 chrome）。
+    fn with_the_picker_open_the_whole_strip_scrolls_together() {
+        let node = tree_with_picker_column();
+        let before: Vec<(PanelId, TileRect)> = node
+            .placements(area())
+            .into_iter()
+            .map(|(id, rect, _)| (id, rect))
+            .collect();
+        let scroll_px = 0.62 * area().size.x / PX_TO_METERS;
+        let after: Vec<(PanelId, TileRect)> = node
+            .placements_scrolled(area(), PanelId::Transcript, scroll_px)
+            .into_iter()
+            .map(|(id, rect, _)| (id, rect))
+            .collect();
+        let shift = 0.62 * area().size.x;
+
+        for panel in [
+            PanelId::Transcript,
+            PanelId::Spacer,
+            PanelId::Confirm,
+            PanelId::Complete,
+            PanelId::Input,
+            PanelId::Picker,
+            PanelId::List,
+        ] {
+            assert!(
+                close(
+                    rect_of(&before, panel).center.x - rect_of(&after, panel).center.x,
+                    shift
+                ),
+                "{panel:?} 要跟着条带左移"
+            );
+        }
+        for panel in [PanelId::Hints, PanelId::Status] {
+            assert_eq!(
+                rect_of(&before, panel),
+                rect_of(&after, panel),
+                "{panel:?} 横跨整条，不滚"
+            );
+        }
+        // 转写列滚出视口左缘是合法的（niri 的条带比视口宽），但它仍在树上。
+        assert!(
+            rect_of(&after, PanelId::Transcript).center.x
+                < rect_of(&after, PanelId::List).center.x,
+            "转写仍在 picker 左边"
+        );
+    }
+
     // 27. 完全滚出视口的面板仍然在树上（不 despawn），只是矩形在视口外。
     #[test]
     fn a_fully_scrolled_out_column_stays_in_the_tree() {
-        let mut node = default_tree();
-        assert!(node.append_column_at(
-            PanelId::Transcript,
-            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
-        ));
+        let node = default_tree();
         let strip = node.strip_area(area(), PanelId::Transcript).unwrap();
         let after = node.placements_scrolled(area(), PanelId::Transcript, 1200.0);
-        let picker = after
+        let transcript = after
             .iter()
-            .find(|(id, _, _)| *id == PanelId::Picker)
-            .expect("容器还在");
+            .find(|(id, _, _)| *id == PanelId::Transcript)
+            .expect("转写面板还在");
         assert!(
-            right(&picker.1) < left(&strip),
-            "picker 列完全滚到条带左边界之外"
+            right(&transcript.1) < left(&strip),
+            "转写列完全滚到条带左边界之外"
         );
         assert_eq!(after.len(), node.placements(area()).len(), "面板一个都没少");
     }
@@ -2070,6 +2198,45 @@ mod tests {
         assert_eq!(proportions, untouched);
         assert_eq!(proportions.column_fraction(PanelId::Transcript), None);
         assert_eq!(proportions.column_size(PanelId::Transcript), Some(Size::Proportion(2.0)));
+    }
+
+    // 30b. 目标列子树里还有 Fraction 子列时拒绝改宽：外层的 fraction 会再乘到
+    //      整棵子树上（0.62 × 0.5），把内层列一起二次缩放。
+    #[test]
+    fn resizing_a_column_with_nested_fraction_children_is_refused() {
+        let mut node = Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(
+                    0.62,
+                    Node::split(
+                        Split::Horizontal,
+                        NO_GAP,
+                        vec![
+                            Child::fraction(0.5, Node::leaf(PanelId::Transcript)),
+                            Child::fraction(0.5, Node::leaf(PanelId::List)),
+                        ],
+                    ),
+                ),
+                Child::fraction(0.38, Node::leaf(PanelId::Input)),
+            ],
+        );
+        let untouched = node.clone();
+        assert!(
+            !node.set_column_fraction(PanelId::Transcript, PRESET_COLUMN_FRACTIONS[0]),
+            "列里有嵌套 Fraction 子列：拒绝，返回 false"
+        );
+        assert_eq!(node, untouched, "拒绝时树一个字节都不改");
+        assert_eq!(
+            node.column_fraction(PanelId::Transcript),
+            Some(0.62),
+            "外层列宽保持原样，没有被改成 1/3"
+        );
+
+        // 列里的其它面板（同属这一列）也一样拒绝。
+        assert!(!node.set_column_fraction(PanelId::List, PRESET_COLUMN_FRACTIONS[1]));
+        assert_eq!(node, untouched);
     }
 
     // 31. 移动列 = 与邻列交换：整列（宽度 + 子树）一起搬，其它列一个字节不动；

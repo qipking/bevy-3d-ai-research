@@ -377,8 +377,9 @@ fn run_typed_prompts(
 ///
 /// 读 bevy 的 [`FileDragAndDrop::DroppedFile`] 消息：图片扩展名由
 /// [`rig_niri::clipboard::dropped_file_text`] 判断（非图片返回 `None`，
-/// 这里静默忽略）。没有 [`Editor`] 资源（例如只装本扩展的 headless App）
-/// 时也什么都不做，不 panic。
+/// 这里静默忽略）。命中后走 [`rig_niri::clipboard::type_path`] 插引用——
+/// 它负责词首空格、末尾空格和含空白路径的引号。没有 [`Editor`] 资源
+/// （例如只装本扩展的 headless App）时也什么都不做，不 panic。
 pub fn drop_image_files(
     mut dropped: MessageReader<FileDragAndDrop>,
     mut editor: Option<ResMut<rig_niri::editor::Editor>>,
@@ -390,8 +391,8 @@ pub fn drop_image_files(
         let FileDragAndDrop::DroppedFile { path_buf, .. } = file else {
             continue;
         };
-        if let Some(text) = rig_niri::clipboard::dropped_file_text(path_buf) {
-            editor.insert(&text);
+        if rig_niri::clipboard::dropped_file_text(path_buf).is_some() {
+            rig_niri::clipboard::type_path(editor.as_mut(), path_buf);
         }
     }
 }
@@ -920,7 +921,19 @@ mod tests {
     fn dropping_an_image_file_inserts_an_attachment() {
         let mut app = drop_app();
         drop_file(&mut app, "/tmp/shot.png");
-        assert_eq!(app.world().resource::<Editor>().text(), "@/tmp/shot.png");
+        assert_eq!(app.world().resource::<Editor>().text(), "@/tmp/shot.png ");
+    }
+
+    #[test]
+    fn dropping_a_file_with_spaces_quotes_it_and_starts_a_new_token() {
+        let mut app = drop_app();
+        app.world_mut().resource_mut::<Editor>().set("hi");
+        drop_file(&mut app, "/tmp/shot one.png");
+        assert_eq!(
+            app.world().resource::<Editor>().text(),
+            "hi @\"/tmp/shot one.png\" ",
+            "光标在词尾：先补空格；带空格的路径要加引号"
+        );
     }
 
     #[test]
