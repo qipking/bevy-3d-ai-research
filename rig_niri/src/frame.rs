@@ -901,15 +901,15 @@ mod tests {
             ],
             &roots,
         );
-        assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 64, 28));
+        assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 64, 25));
         // 右列：顶部留白 + 补全(0) + 输入(固定 4 行) + 状态(2 行) 贴底。
         assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
-        assert_eq!(areas[&status.index_u32()].rect, CellRect::new(64, 26, 32, 2));
+        assert_eq!(areas[&status.index_u32()].rect, CellRect::new(0, 26, 96, 2));
         // 精确中心来自树的 TileRect（不是格子取整后的矩形）。
         // 精确中心来自树的 TileRect：转写占上半部分（25 行），所以 y 中心不再是 0。
         let center = areas[&transcript.index_u32()].center.expect("树给精确中心");
         assert!((center.x - -16.0 * CELL.x).abs() < 1e-3);
-        assert_eq!(center.y, 0.0);
+        assert!((center.y - 1.5 * CELL.y).abs() < 1e-3, "y = {}", center.y);
     }
 
     /// 被固定宽度的兄弟挤到 0 列的叶子：这一帧没有文字区，`is_empty` 为真。
@@ -1061,7 +1061,7 @@ mod tests {
             ],
             &roots,
         );
-        assert_eq!(areas[&status.index_u32()].rect, CellRect::new(64, 26, 32, 2));
+        assert_eq!(areas[&status.index_u32()].rect, CellRect::new(0, 26, 96, 2));
         // 输入与状态之间现在夹着 1 行键位提示（它也是 tile）。
         assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
         assert_eq!(
@@ -1120,8 +1120,8 @@ mod tests {
         let complete = roots.entity(PanelId::Complete).expect("补全面板");
         let areas = app.world().resource::<PanelAreas>();
         assert_eq!(areas.0.len(), 6, "六块面板都由树放好（留白叶子没有面板）");
-        assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 28));
-        assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(64, 26, 32, 2));
+        assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 25));
+        assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(0, 26, 96, 2));
         // 补全 tile 关着：0 高度，但仍然有区域（这样每帧都能把它写成 0 高）。
         let closed = areas.get(complete).expect("补全区域");
         assert_eq!(closed.rect, CellRect::new(64, 21, 32, 0), "补全贴输入上方");
@@ -1133,7 +1133,7 @@ mod tests {
             (bevy_ui::Val::Px(width), bevy_ui::Val::Px(height)) => {
                 assert!((width - 64.0 * CELL.x).abs() < 1e-3, "width = {width}");
                 // 转写只占上半部分 25 行（下面两条横跨的 tile 各占 1/2 行）。
-                assert!((height - 28.0 * CELL.y).abs() < 1e-3, "height = {height}");
+                assert!((height - 25.0 * CELL.y).abs() < 1e-3, "height = {height}");
             }
             other => panic!("Node 尺寸应当是像素：{other:?}"),
         }
@@ -1145,7 +1145,7 @@ mod tests {
             world.anchor.translation.x
         );
         // y：转写占条带上半部分 25 行，中心在 1.5 行处（下面还有提示/状态两条）。
-        let want_y = 0.0;
+        let want_y = 1.5 * CELL.y * UNITS_TO_WORLD;
         assert!(
             (world.anchor.translation.y - want_y).abs() < 1e-5,
             "锚点 y = {}",

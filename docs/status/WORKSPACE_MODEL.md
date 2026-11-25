@@ -118,8 +118,29 @@ niri 的设计原则（`Development:-Design-Principles.md`）：
 | 确认行（Ask） | ✅ 独立 tile（`PanelId::Confirm`，无 Ask 时 0 高度） | — |
 | picker | ✅ 条带**最右边新加一列**（打开时已有列等比缩到 2/3，关掉后逐字节复原） | — |
 
-**已知限制（下一步）**：状态行/提示行现在还在右列（1/3 宽）里，状态行按优先级只显示得下右侧几项。
-要横跨整条得把根改成竖 split，但 `layout::rects()` 在**嵌套**里会把 `Fixed` 二次换算
-（实测 `Fixed(36px)` 变成 0.1px），导致兄弟重叠——这个 bug 已经定位，修完再把两条挪到根上。
+**状态行/提示行已横跨整条**（2026-11-25 晚）：树的根改成竖 split——
+
+```
+Vertical
+├── Horizontal (Proportion 1)   ← 主体
+│   ├── Transcript (Proportion 2)
+│   └── Vertical (Proportion 1)
+│       ├── Spacer (Proportion 1)
+│       ├── Confirm (Fixed 0 px)
+│       ├── Complete (Fixed 0 px)
+│       └── Input (Fixed 72 px = 4 行)
+├── Hints  (Fixed 18 px = 1 行)
+└── Status (Fixed 36 px = 2 行)
+```
+
+**教训（写下来避免再犯）**：`Size::Fixed` 的单位是 **UI 像素**，`walk()` 里只乘一次
+`PX_TO_METERS` 换成米。所以树里写 `Child::fixed(4.0 * ROW_HEIGHT, ...)`（=72 px），
+**不要**再乘 `PX_TO_METERS`——乘了会得到 0.06 px，固定子塌掉，同层的"第一个子吃剩余"
+就会把位置全打乱，看起来像兄弟重叠。`layout::walk` 里已经加了运行时告警
+（`Fixed` 在 (0, 1) 之间就 warn），下一个人踩到时能立刻看见。
+
+（此前把原因误判成"`rects()` 嵌套二次换算"，实测不是：`walk()` 每层只换算一次；
+故障来自树里写错了单位。`remove_column` 倒是真有 bug——它只在根的直接子里找列，
+列挂进嵌套的横向 split 之后会把整个主体行删掉，已改成递归。）
 
 验收标准：`grep -r 'Placement::Over\|Placement::Within' rig_niri/src` 为空。

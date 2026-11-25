@@ -1143,8 +1143,13 @@ mod tests {
         let after = tree.rects(frame);
 
         assert_eq!(after.len(), before_rects.len() + 1, "只多一列");
-        assert_eq!(after.last().map(|(id, _)| *id), Some(PanelId::List), "列在最后");
-        let column = after.last().expect("picker 列").1;
+        // 列挂在主体那一行的末尾；整棵树后面还有提示行/状态行，所以按 PanelId 找。
+        let column = after
+            .iter()
+            .find(|(id, _)| *id == PanelId::List)
+            .expect("picker 列")
+            .1;
+        assert!(close(right(&column), right(&frame)), "列在主体行最右");
         assert!(close(column.size.x, frame.size.x / 3.0), "新列占 1/3");
         assert!(close(right(&column), right(&frame)), "新列贴住条带最右");
         assert_eq!(
@@ -1154,8 +1159,12 @@ mod tests {
         );
         assert_tiles(&after, frame);
 
-        // 已有列全部乘同一个因子 2/3（相对宽度不变），高度不变。
+        // 主体行里的列全部乘同一个因子 2/3（相对宽度不变），高度不变。
+        // 注意 Hints / Status 是横跨整条的独立行（不在主体行里），它们不缩。
         for (id, old) in &before_rects {
+            if matches!(*id, PanelId::Hints | PanelId::Status) {
+                continue;
+            }
             let new = after
                 .iter()
                 .find(|(found, _)| found == id)
@@ -1163,7 +1172,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id:?} 还在树上"));
             assert!(
                 close(new.size.x, old.size.x * 2.0 / 3.0),
-                "{id:?} 按比例缩到 2/3"
+                "{id:?} 按比例缩到 2/3（{old:?} → {new:?}）"
             );
             assert!(close(new.size.y, old.size.y));
             assert!(close(top(&new), top(old)));
@@ -1193,7 +1202,12 @@ mod tests {
         assert_tiles(&tree.rects(frame), frame);
         // 容器面板和列表区域完全重合（容器垫在后面）。
         let column = tree.containers(frame).last().expect("容器").1;
-        let list = tree.rects(frame).last().expect("列表").1;
+        let list = tree
+            .rects(frame)
+            .into_iter()
+            .find(|(id, _)| *id == PanelId::List)
+            .expect("列表")
+            .1;
         assert!(close(left(&column), left(&list)));
         assert!(close(right(&column), right(&list)));
         assert!(close(top(&column), top(&list)));
@@ -1275,11 +1289,21 @@ mod tests {
         let tree = app.world().resource::<FrameTree>().0.clone();
         let rects = tree.rects(frame);
         assert_eq!(rects.len(), 9, "默认 7 叶 + 容器里的列表 + preview");
-        assert_eq!(rects[rects.len() - 2].0, PanelId::List);
-        assert_eq!(rects[rects.len() - 1].0, PanelId::Preview);
+        // picker 列挂在**主体那一行**的末尾；整棵树后面还有提示行/状态行，
+        // 所以不能拿 `rects.last()` 当列，只能按 PanelId 找。
+        let list = rects
+            .iter()
+            .find(|(id, _)| *id == PanelId::List)
+            .expect("列表")
+            .1;
+        let preview = rects
+            .iter()
+            .find(|(id, _)| *id == PanelId::Preview)
+            .expect("preview")
+            .1;
         let container = tree.containers(frame).last().expect("容器").1;
-        let list = rects[rects.len() - 2].1;
-        let preview = rects[rects.len() - 1].1;
+        assert!(close(right(&list), right(&container)));
+        assert!(close(right(&container), right(&frame)), "列贴条带最右");
         assert!(close(list.size.x, container.size.x));
         assert!(close(preview.size.x, container.size.x));
         assert!(close(list.size.y, container.size.y * 2.0 / 3.0), "列表 2/3");
@@ -1318,9 +1342,13 @@ mod tests {
         let tree = app.world().resource::<FrameTree>().0.clone();
         let rects = tree.rects(frame);
         assert_eq!(rects.len(), 8, "默认 7 叶 + 列表（preview 已摘）");
-        assert_eq!(rects.last().map(|(id, _)| *id), Some(PanelId::List));
         let container = tree.containers(frame).last().expect("容器").1;
-        let list = rects.last().expect("列表").1;
+        let list = rects
+            .iter()
+            .find(|(id, _)| *id == PanelId::List)
+            .expect("列表")
+            .1;
+        assert!(close(right(&list), right(&frame)), "列表占满整列、贴条带最右");
         assert!(close(left(&list), left(&container)));
         assert!(close(right(&list), right(&container)));
         assert!(close(top(&list), top(&container)));

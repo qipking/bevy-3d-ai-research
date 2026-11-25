@@ -1321,7 +1321,7 @@ mod tests {
         );
         // 转写只占条带上半部分（下面还有提示行/状态行两条横跨的 tile），
         // 所以它的锚点 y 是"上半部分的中心"，不再等于 0。
-        let want_y = 0.0;
+        let want_y = 1.5 * crate::transcript::ROW_HEIGHT * crate::layout::PX_TO_METERS;
         assert!((anchor.y - want_y).abs() < 1e-5, "转写锚点 y = {}", anchor.y);
     }
 
@@ -1831,7 +1831,7 @@ mod tests {
         assert!((anchor.x - want_x).abs() < 1e-5, "anchor.x = {}", anchor.x);
         // 转写只占条带上半部分（下面还有提示行/状态行两条横跨的 tile），
         // 所以它的锚点 y 是"上半部分的中心"，不再等于 0。
-        let want_y = 0.0;
+        let want_y = 1.5 * crate::transcript::ROW_HEIGHT * crate::layout::PX_TO_METERS;
         assert!((anchor.y - want_y).abs() < 1e-5, "转写锚点 y = {}", anchor.y);
     }
 

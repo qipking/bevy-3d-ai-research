@@ -231,6 +231,19 @@ impl Node {
                 let gaps = gap * (count.saturating_sub(1)) as f32;
                 let available = (total - gaps).max(0.0);
 
+                // 防护：固定尺寸是 UI 像素，不可能小于 1px。小于 1 基本就是把米当像素
+                // 传进来了（例如 `Child::fixed(36.0 * PX_TO_METERS)`），那样固定子会
+                // 塌成 ~0，同层"第一个子吃剩余"会把位置全打乱。
+                for child in children.iter() {
+                    if let Size::Fixed(px) = child.size
+                        && px.sanitized() > 0.0
+                        && px.sanitized() < 1.0
+                    {
+                        bevy::log::warn!(
+                            "layout: 固定尺寸 {px} px 小于 1，疑似把米当像素传了（Fixed 要写像素）"
+                        );
+                    }
+                }
                 let fixed_total: f32 = children
                     .iter()
                     .filter_map(|child| match child.size {
@@ -596,20 +609,33 @@ impl Node {
     /// 只动根的直接子节点；其余子的尺寸权重原样保留，所以"加列 → 摘列"之后
     /// 树和加列前逐字节相同。根不是 split、或者没有这一列时返回 `false`。
     pub fn remove_column(&mut self, panel: PanelId) -> bool {
+        // 列可能挂在某个嵌套的横向 split 里（主体那一行就是），所以先递归找
+        // "直接子节点里含这个面板"的那一层，在该层摘掉；不要整块把主体行删了。
         let Self::Split { children, .. } = self else {
             return false;
         };
-        let Some(index) = children
+        if let Some(index) = children
             .iter()
             .position(|child| child.node.leaves().contains(&panel))
-        else {
-            return false;
-        };
-        children.remove(index);
-        if let Some(only) = self.take_only_child() {
-            *self = only;
+        {
+            // 先看这个子节点自己能不能摘（它就是那一列）；
+            // 摘不动说明列在它更深处，递归下去。
+            let nested_removed = children[index].node.remove_column(panel);
+            if !nested_removed {
+                children.remove(index);
+            }
+            if let Some(only) = self.take_only_child() {
+                *self = only;
+            }
+            return true;
         }
-        true
+        // 根的直接子里没有它，但更深处可能有：递归每个子。
+        for child in children.iter_mut() {
+            if child.node.remove_column(panel) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 递归摘掉一个叶子：装着它的那个子节点被删除，只剩一个子的 split 摊平。
@@ -697,8 +723,29 @@ impl Sanitized for f32 {
 pub fn default_tree() -> Node {
     use crate::transcript::ROW_HEIGHT;
 
-    // 条带 = 横向：左转写，右列（留白 / 确认 / 补全 / 输入 / 提示 / 状态）。
-    // 全部是树里的叶子（niri 里就是窗口），没有浮层。
+    // 条带 = 一根竖着的根：
+    //   主体（转写 2/3 | 右列：留白 / 确认 / 补全 / 输入 4 行）
+    //   键位提示行（横跨整条，1 行）
+    //   状态行（横跨整条，2 行）
+    //
+    // 单位：`Size::Fixed` 是 **UI 像素**（`walk` 里乘一次 `PX_TO_METERS` 换成米），
+    // 所以这里写 `ROW_HEIGHT * 行数`，**不要**再乘 `PX_TO_METERS`（乘了会变成 0.06px，
+    // 固定子塌掉、"第一个子吃剩余"就会把同层位置全打乱）。
+    Node::split(
+        Split::Vertical,
+        NO_GAP,
+        vec![
+            Child::proportion(1.0, main_row()),
+            Child::fixed(1.0 * ROW_HEIGHT, Node::leaf(PanelId::Hints)),
+            Child::fixed(2.0 * ROW_HEIGHT, Node::leaf(PanelId::Status)),
+        ],
+    )
+}
+
+/// 条带主体：左转写、右列（留白 / 确认 / 补全 / 输入）。
+fn main_row() -> Node {
+    use crate::transcript::ROW_HEIGHT;
+
     Node::split(
         Split::Horizontal,
         NO_GAP,
@@ -712,14 +759,12 @@ pub fn default_tree() -> Node {
                     vec![
                         // 顶部留白：让输入区贴底。
                         Child::proportion(1.0, Node::leaf(PanelId::Spacer)),
-                        // 确认行（Ask）：没有待确认时 0 高度。
+                        // 确认行：没有待确认时 0 高度（`sync_confirm_tile` 按行数调）。
                         Child::fixed(0.0, Node::leaf(PanelId::Confirm)),
-                        // 补全：关着时 0 高度。
+                        // 补全：关着时 0 高度（`sync_completion_tile` 调）。
                         Child::fixed(0.0, Node::leaf(PanelId::Complete)),
+                        // 输入框固定 4 行。
                         Child::fixed(4.0 * ROW_HEIGHT, Node::leaf(PanelId::Input)),
-                        // 提示行 1 行（面板用无内边距的观感，否则 1 行放不下 1 行字）。
-                        Child::fixed(1.0 * ROW_HEIGHT, Node::leaf(PanelId::Hints)),
-                        Child::fixed(2.0 * ROW_HEIGHT, Node::leaf(PanelId::Status)),
                     ],
                 ),
             ),
