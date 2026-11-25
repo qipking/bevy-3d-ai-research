@@ -66,19 +66,23 @@ use rig_ecs::prelude::{Agent, AgentId, Conversation, SpawnedBy};
 use rig_ecs::spawn::spawn_root;
 use rig_harness::prelude::{Answerer, SessionPaths, ShownAgent};
 use rig_niri::batch;
+use rig_niri::frame::FrameSize;
 use rig_niri::layout;
 use rig_niri::panels::{KeyedRow, PanelId};
 use rig_niri::transcript::{Row, TextId, Transcript, row_hash};
 use rig_niri::workspaces::{
     Workspace, WorkspacePanels, WorkspaceSet, arrange_workspaces, focus_workspace, spawn_workspace,
+    workspace_step,
 };
 use rig_tui::ratatui::style::{Color as RColor, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
-/// 一个会话条带在世界里的高度（米）：帧高 × 行高 × 单位换算。
-const STRIP_HEIGHT_M: f32 = 28.0 * 18.0 * 0.0018;
-/// 首帧摆放用的粗略间距；真正的间距由 `arrange_workspaces` 按帧高算（见 `arrange_once`）。
-const STRIP_GAP_M: f32 = 0.03;
+/// spawn 时的粗略间距（米）。
+///
+/// 真正的间距必须由**当前帧高**算（旧的 28 行常量在窗口变成 44 行后会让相邻条带
+/// 竖直重叠 0.49m：下面那条的底部行会露进上面那条的可见范围）。所以这里只放一个
+/// 粗略值，启动后由 [`restack_on_resize`] 按真实 `FrameSize` 重排。
+const STRIP_SPACING_M: f32 = 1.47;
 
 /// 工作区演示插件。
 ///
@@ -127,7 +131,11 @@ impl Plugin for WorkspacesDemoPlugin {
                     .after(batch::collect_rows),
             )
             .add_systems(Update, demo_keys)
-            .add_systems(Update, (show_all_once, arrange_once));
+            .add_systems(Update, (show_all_once, arrange_once))
+            .add_systems(
+                Update,
+                restack_on_resize.after(rig_niri::FeathersSystems::Layout),
+            );
     }
 }
 
@@ -190,14 +198,14 @@ fn spawn_extra_workspaces(
     mut set: ResMut<WorkspaceSet>,
 ) {
     for index in 1..count.0 {
-        let pose = Transform::from_xyz(0.0, -(index as f32) * (STRIP_HEIGHT_M + STRIP_GAP_M), 0.0);
+        let pose = Transform::from_xyz(0.0, -(index as f32) * STRIP_SPACING_M, 0.0);
         spawn_workspace(&mut commands, &mut set, index as u64, pose, index);
     }
     if count.0 > 1 {
         info!(
             "[workspaces] 摆了 {} 个工作区（竖直间距 {:.2} m）",
             count.0,
-            STRIP_HEIGHT_M + STRIP_GAP_M
+            STRIP_SPACING_M
         );
     }
 }
@@ -535,6 +543,49 @@ fn arrange_once(mut done: Local<bool>, set: Res<WorkspaceSet>, mut commands: Com
     }
 }
 
+/// 帧高变化后，把**仍是自动排列**的工作区按新帧高重新堆叠。
+///
+/// 为什么需要它：`FrameSize` 启动时先按默认值插入，窗口尺寸同步后才变成真实格子数；
+/// `arrange_once` 可能跑在同步之前，于是条带间距按旧帧高算，窗口更大时相邻条带会
+/// 竖直重叠（下面条带的底部行露进上面条带的可见范围）。这里在每次 `FrameSize` 变化
+/// 时重排一次。
+///
+/// 只重排**没有被用户放动**的工作区：把当前 pose 和"按旧帧高自动堆叠"的期望值比较，
+/// 有一个不等就说明用户拖过（或别人安排过），这时不动——niri 里只有用户的动作能移动窗口。
+fn restack_on_resize(world: &mut World, mut last: Local<Option<FrameSize>>) {
+    let Some(size) = world.get_resource::<FrameSize>().copied() else {
+        return;
+    };
+    if *last == Some(size) {
+        return;
+    }
+    let previous = last.replace(size);
+
+    // 工作区的世界位姿来自 `Workspace::pose`；实体上没有 `Transform`（别把查询写成
+    // `(&Workspace, &Transform)`，那样会一个都查不到、重排静默失效）。
+    let mut workspaces: Vec<(usize, Vec3)> = world
+        .query::<&Workspace>()
+        .iter(world)
+        .map(|workspace| (workspace.order, workspace.pose.translation))
+        .collect();
+    if workspaces.len() < 2 {
+        return;
+    }
+    workspaces.sort_by_key(|(order, _)| *order);
+
+    // 首次（还没有旧帧高）：直接按当前帧高整理。
+    if let Some(previous) = previous {
+        let step = workspace_step(previous);
+        let auto = workspaces.iter().enumerate().all(|(index, (_, position))| {
+            index == 0 || (position.x.abs() < 1e-4 && (position.y + index as f32 * step).abs() < 1e-3)
+        });
+        if !auto {
+            return;
+        }
+    }
+    arrange_workspaces(world);
+}
+
 /// `RF_SHOW_ALL=1`：启动后取消聚焦，一次看到所有条带。
 fn show_all_once(mut shown: Local<bool>, set: Res<WorkspaceSet>) {
     if *shown || std::env::var("RF_SHOW_ALL").is_err() {
@@ -575,6 +626,83 @@ mod tests {
     use rig_niri::transcript::TranscriptFont;
     use rig_niri::workspaces::WorkspacesPlugin;
     use rig_tui::AppStatus;
+
+    /// 条带间距必须按**当前帧高**算：窗口变大后如果还用旧帧高，相邻条带会竖直重叠，
+    /// 下面条带底部的行会露进上面条带的可见范围（真实渲染里表现为"1 号的工作区标签
+    /// 出现在 0 号条带里"）。
+    #[test]
+    fn resizing_the_frame_restacks_workspaces_so_strips_do_not_overlap() {
+        let mut app = headless(3);
+        app.update(); // 首帧：spawn + arrange_once（此时是 96×28）
+        app.insert_resource(FrameSize {
+            cols: 164,
+            rows: 44,
+        });
+        app.update();
+
+        let size = FrameSize {
+            cols: 164,
+            rows: 44,
+        };
+        let step = workspace_step(size);
+        let strip = rig_niri::workspaces::workspace_strip_height(size);
+        assert!(step > strip, "步长必须大于条带高度（否则重叠）：{step} vs {strip}");
+
+        let mut poses: Vec<(usize, Vec3)> = app
+            .world_mut()
+            .query::<&Workspace>()
+            .iter(app.world())
+            .map(|workspace| (workspace.order, workspace.pose.translation))
+            .collect();
+        poses.sort_by_key(|(order, _)| *order);
+        assert_eq!(poses.len(), 3);
+        for pair in poses.windows(2) {
+            let gap = pair[0].1.y - pair[1].1.y;
+            assert!(
+                (gap - step).abs() < 1e-3,
+                "相邻条带按帧高堆叠：{:?} -> {:?} 间距 {gap}，期望 {step}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// 用户手放过的位置不能被"帧高变化"重排抢走（niri：只有用户的动作能移动窗口）。
+    #[test]
+    fn a_hand_placed_workspace_survives_a_frame_resize() {
+        let mut app = headless(3);
+        app.update();
+        // 手动把 2 号放远（模拟用户拖拽）。
+        let moved = app
+            .world_mut()
+            .query::<&Workspace>()
+            .iter(app.world())
+            .find(|workspace| workspace.order == 2)
+            .map(|workspace| workspace.pose.translation)
+            .expect("2 号工作区");
+        app.world_mut()
+            .query::<&mut Workspace>()
+            .iter_mut(app.world_mut())
+            .for_each(|mut workspace| {
+                if workspace.order == 2 {
+                    workspace.pose.translation = Vec3::new(0.4, moved.y - 2.5, 0.0);
+                }
+            });
+        app.insert_resource(FrameSize {
+            cols: 164,
+            rows: 44,
+        });
+        app.update();
+
+        let position = app
+            .world_mut()
+            .query::<&Workspace>()
+            .iter(app.world())
+            .find(|workspace| workspace.order == 2)
+            .map(|workspace| workspace.pose.translation)
+            .expect("2 号工作区");
+        assert!((position.x - 0.4).abs() < 1e-4, "手放的位置要保住：{position:?}");
+    }
 
     /// 一个永不返回的工具：调它一次就一直是"在飞"的，测试要断言的就是这个状态。
     struct NeverReturns;
