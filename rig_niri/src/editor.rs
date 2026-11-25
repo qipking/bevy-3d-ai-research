@@ -43,8 +43,12 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::{ButtonInput, ButtonState};
 use bevy::prelude::*;
-use rig_ecs::prelude::{ActiveTurn, Deliver, DeliveryMode, StopTurn};
+use rig_core::effect::EffectId;
+use rig_ecs::prelude::{
+    ActiveTurn, Decision, Decider, Deliver, DeliveryMode, Effect, ForAgent, Outcome, StopTurn,
+};
 use rig_harness::main_agent::ShownAgent;
+use rig_harness::prelude::{Answer, Ask};
 use rig_tui::AppStatus;
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
@@ -728,6 +732,102 @@ enum Act {
     Exit,
     /// Ctrl+V：读剪贴板文本，插到光标处（图片分支见 [`act`] 的注释）。
     Paste,
+    /// 用确认面板里第一个问题的第 `number` 个选项回答它（Alt+1..9，
+    /// 从 1 数）；越界什么也不做。
+    AnswerInline(usize),
+    /// 拒绝确认面板里第一个问题（Alt+0；Esc 也走同一条拒绝路径）。
+    DismissInline,
+}
+
+// ---------------------------------------------------------------------------
+// 回答确认面板里的 `Ask`：点击与键盘共用的唯一落点
+// ---------------------------------------------------------------------------
+
+/// 回答一个待确认的 `Ask`，用它的选项 `choice`（[`rig_harness::ask::Choice::id`]）。
+///
+/// **这是点击与键盘共用的唯一作答落点。** 确认行的点击处理器
+/// （`rig_harness_in_3d::kernel::answer_ask` 观察者，读
+/// [`crate::transcript::AskChoice`]）和键盘的 Alt+1..9（[`Act::AnswerInline`]）
+/// 都调用它，所以两条路产生完全相同的 rig-harness 效果：在 Ask 的
+/// [`Decision`] 上以 [`Decider::Person`] 记下 `Answer::choice(id).outcome()`
+/// ——和点击路径原来的构造逐字相同，没有另造一套。
+///
+/// 返回这次决定是否生效：Ask 没有 `Decision`、已经被回答过（第一次决定赢）
+/// 或实体没了都是 `false`。
+pub fn answer_ask(ask: Entity, choice: &str, decisions: &mut Query<&mut Decision>) -> bool {
+    let Ok(mut decision) = decisions.get_mut(ask) else {
+        return false;
+    };
+    decision.decide(Decider::Person, Answer::choice(choice).outcome())
+}
+
+/// 拒绝一个待确认的 `Ask`（Alt+0 与 Esc）。
+///
+/// 用的是 rig-harness 的 `Pick::person(ask, None)` 分支同一个结论
+/// （`rig-harness/src/pick.rs`：`Outcome::refused("The user closed the
+/// question.")`），决策者同样是 [`Decider::Person`]，只是不经过 `Pick`
+/// 事件：本 crate 的点击路径本来就直接写 `Decision`，拒绝走同一条落点才
+/// 不会有第二套语义（也不依赖 `PickPlugin` 是否装在本 app 里）。
+/// 返回这次决定是否生效。
+pub fn refuse_ask(ask: Entity, decisions: &mut Query<&mut Decision>) -> bool {
+    let Ok(mut decision) = decisions.get_mut(ask) else {
+        return false;
+    };
+    decision.decide(
+        Decider::Person,
+        Outcome::refused("The user closed the question."),
+    )
+}
+
+/// 确认面板里最老的那个未回答 `Ask`：键盘作答的对象。
+///
+/// 顺序和 [`crate::batch::confirm_rows`] 一致——只算当前工作区可见的
+/// （[`crate::keys::ask_is_visible`]），按内核效应 id 从老到新，还没登记
+/// 效应 id 的排最后。确认面板每个 `Ask` 一块，Alt+n 答的是第一块的
+/// 第 n 个选项；点击则可以点任何一块的任何一行。
+fn first_pending_ask(
+    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    shown: Option<Entity>,
+) -> Option<(Entity, Ask)> {
+    asks.iter()
+        .filter(|(_, _, _, owner)| {
+            crate::keys::ask_is_visible(shown, owner.map(|ForAgent(owner)| *owner))
+        })
+        .min_by_key(|(_, _, effect, _)| {
+            effect
+                .map(Effect::id)
+                .unwrap_or(EffectId::from_raw(u64::MAX))
+        })
+        .map(|(entity, ask, ..)| (entity, ask.clone()))
+}
+
+/// Alt+n：用当前确认问题的第 `number` 个选项回答；越界什么也不做。
+fn answer_shown_ask(
+    number: usize,
+    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    shown: Option<Entity>,
+    decisions: &mut Query<&mut Decision>,
+) -> bool {
+    let Some((ask, question)) = first_pending_ask(asks, shown) else {
+        return false;
+    };
+    let Some(choice) = number
+        .checked_sub(1)
+        .and_then(|index| question.choices.get(index))
+    else {
+        return false;
+    };
+    answer_ask(ask, &choice.id, decisions)
+}
+
+/// Alt+0 / Esc：拒绝当前确认问题（第一个未回答的 `Ask`）。
+fn refuse_shown_ask(
+    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    shown: Option<Entity>,
+    decisions: &mut Query<&mut Decision>,
+) -> bool {
+    first_pending_ask(asks, shown)
+        .is_some_and(|(ask, _)| refuse_ask(ask, decisions))
 }
 
 /// 执行一个内置动作；需要 agent 或 `Commands` 的留给调用方。
@@ -760,16 +860,18 @@ fn act(action: InputAction, editor: &mut Editor, busy: bool) -> Option<Act> {
         Do::LineDown => editor.line_down(),
         Do::Up => editor.up(),
         Do::Down => editor.down(),
-        // 滚动/选择/内联回答由别的模块负责；这里只有动作表。
+        // 滚动/选择由别的模块负责；内联回答走 Act：Alt+n 选第 n 个选项，
+        // Alt+0 拒绝。真正的作答落点是 [`answer_ask`] / [`refuse_ask`]，
+        // 和点击确认行走同一条路。
         Do::ScrollUp
         | Do::ScrollDown
         | Do::PageUp
         | Do::PageDown
         | Do::SelectUp
         | Do::SelectDown
-        | Do::Deselect
-        | Do::AnswerInline(_)
-        | Do::DismissInline => {}
+        | Do::Deselect => {}
+        Do::AnswerInline(number) => return Some(Act::AnswerInline(usize::from(number))),
+        Do::DismissInline => return Some(Act::DismissInline),
         // Ctrl+V 的绑定是上游同名动作 `PasteImage`：上游同时读文本和图片，
         // 本 crate **只接文本**。图片分支没做的原因不是漏了，而是
         // `bevy_clipboard` 没有开 `image` feature、也没有"剪贴板图片落盘到
@@ -894,7 +996,10 @@ pub struct Clipboards<'w> {
 /// * [`StopTurn`] 给同一个 agent；
 /// * [`AppExit`] 是空输入 Ctrl+D；
 /// * Ctrl+V 读剪贴板文本，插到光标处；空剪贴板/读失败写状态行的
-///   [`clipboard::PASTE_FAILED`]（和 `Copied` 同一套状态反馈）。
+///   [`clipboard::PASTE_FAILED`]（和 `Copied` 同一套状态反馈）；
+/// * 确认面板里有未回答的 `Ask` 时，Esc 先拒绝它、Alt+1..9 用第一个问题的
+///   第 n 个选项回答、Alt+0 拒绝——都走 [`answer_ask`] / [`refuse_ask`]，
+///   和点击确认行同一条落点；没有问题时的 Esc 行为不变。
 #[allow(clippy::too_many_arguments)]
 pub fn keys(
     mut input: MessageReader<KeyboardInput>,
@@ -909,6 +1014,8 @@ pub fn keys(
     mut completion: Option<ResMut<crate::complete::CompletionState>>,
     shown: Option<Res<ShownAgent>>,
     entering: Query<(), With<ActiveTurn>>,
+    asks: Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    mut decisions: Query<&mut Decision>,
     mut scroll: Option<ResMut<PaneScroll>>,
     mut clipboards: Clipboards,
 ) {
@@ -964,16 +1071,33 @@ pub fn keys(
                 }
                 match row.action {
                     Some(action) => {
+                        // 要送的 agent 是 `ShownAgent`：应用层在切聚焦工作区时更新它。
+                        let agent = shown.as_deref().and_then(|shown| shown.0);
+                        // 确认面板里有未回答的问题时，Esc 先拒绝它（上游
+                        // `input.rs::act` 的 `Do::Stop, Some(ask)` 分支）：
+                        // 不关补全、不停 turn；没有问题才走下面的原有行为。
+                        if matches!(action, InputAction::Stop)
+                            && let Some((ask, _)) = first_pending_ask(&asks, agent)
+                        {
+                            refuse_ask(ask, &mut decisions);
+                            continue;
+                        }
                         // 补全列表开着时，↑↓/Tab/Enter/Esc 先归列表（上游 accept_completion）。
                         if let Some(state) = completion.as_mut() {
                             if completion_act(action, state, &mut editor) {
                                 continue;
                             }
                         }
-                        // 要送的 agent 是 `ShownAgent`：应用层在切聚焦工作区时更新它。
-                        let agent = shown.as_deref().and_then(|shown| shown.0);
                         let busy = agent.is_some_and(|agent| entering.contains(agent));
                         match act(action, &mut editor, busy) {
+                            // 内联作答（Alt+1..9）与拒绝（Alt+0）走和点击确认行
+                            // 完全相同的 [`answer_ask`] / [`refuse_ask`]。
+                            Some(Act::AnswerInline(number)) => {
+                                answer_shown_ask(number, &asks, agent, &mut decisions);
+                            }
+                            Some(Act::DismissInline) => {
+                                refuse_shown_ask(&asks, agent, &mut decisions);
+                            }
                             Some(Act::Send(Sending { text, mode })) => {
                                 // 本地回显与历史照旧；历史由 `history` 模块从
                                 // `Editor.history` + `PromptSubmitted` 收一次。
@@ -1173,6 +1297,10 @@ impl Plugin for EditorPlugin {
         app.add_systems(
             Update,
             (
+                // 确认面板里有未回答的 Ask 时才启用 Alt+1..9/Alt+0；排在
+                // `keys` 前面，所以按键到来时开关已经生效（问题由内核在
+                // AgentPass 里 spawn 时可能晚一帧，和上游按帧更新一致）。
+                crate::keys::arm_inline_keys,
                 keys.run_if(crate::picker::no_picker),
                 layout_editor,
                 sync_editor_tile,
@@ -1609,7 +1737,10 @@ mod tests {
             .init_resource::<KeyFocus>()
             .init_resource::<PendingInput>();
         crate::keys::add_built_in(&mut app);
-        app.add_systems(Update, keys);
+        app.add_systems(
+            Update,
+            (crate::keys::arm_inline_keys, keys).chain(),
+        );
         app
     }
 
@@ -1758,6 +1889,312 @@ mod tests {
         app.update();
         assert_eq!(text(&app), "T", "全局插件绑定遮住打字");
         assert!(app.world().resource::<SubmittedPrompts>().0.is_empty());
+    }
+
+    // ---- 确认面板的键盘作答 / 拒绝：和点击共用一条落点 ----
+
+    /// 带真内核（Ask 的 Effect/Decision/Outcome 循环）+ 编辑器按键 + 确认面板
+    /// 资源的最小 App；不建窗口、不渲染。
+    fn ask_app() -> App {
+        use bevy::app::TaskPoolPlugin;
+
+        let mut app = App::new();
+        app.add_plugins(TaskPoolPlugin::default());
+        app.add_plugins(rig_ecs::AgentPlugin);
+        app.add_message::<KeyboardInput>()
+            .add_message::<PromptSubmitted>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Editor>()
+            .init_resource::<SubmittedPrompts>()
+            .init_resource::<KeyFocus>()
+            .init_resource::<PendingInput>()
+            .init_resource::<PanelRows>();
+        crate::keys::add_built_in(&mut app);
+        app.add_systems(Update, (crate::keys::arm_inline_keys, keys).chain());
+        app
+    }
+
+    /// 在世界里 spawn 一个确认问题（选项 `(id, label)`），等内核给它挂上
+    /// `Effect`/`Decision`。
+    fn spawn_ask(app: &mut App, choices: &[(&str, &str)]) -> Entity {
+        let mut ask = Ask::new("确认下单并支付？").body("商品：Nike Air Zoom Pegasus 40\n合计：469");
+        for (id, label) in choices {
+            ask = ask.choice(*id, *label);
+        }
+        let entity = app.world_mut().spawn(ask).id();
+        app.update();
+        assert!(
+            app.world().get::<Decision>(entity).is_some(),
+            "Ask 的 Effect 要带上内核的 Decision"
+        );
+        entity
+    }
+
+    /// Alt+数字：按住 Alt 发一个数字键，再松开。
+    fn alt_digit(app: &mut App, digit: char) {
+        let code = match digit {
+            '0' => KeyCode::Digit0,
+            '1' => KeyCode::Digit1,
+            '2' => KeyCode::Digit2,
+            '3' => KeyCode::Digit3,
+            other => panic!("测试只用 Alt+0..3，实际 {other}"),
+        };
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::AltLeft);
+        send(
+            app,
+            Key::Character(digit.to_string().into()),
+            code,
+            Some(&digit.to_string()),
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::AltLeft);
+    }
+
+    /// 内联回答键（Alt+1..9、Alt+0）各自的 `Disabled` 状态。
+    fn inline_disabled(app: &mut App) -> Vec<bool> {
+        let mut query = app.world_mut().query_filtered::<
+            Has<Disabled>,
+            (With<crate::keys::InlineKey>, Allow<Disabled>),
+        >();
+        query.iter(app.world()).collect()
+    }
+
+    /// 这一帧确认面板的行（手动跑一次产行系统，不依赖帧布局）。
+    fn confirm_rows_now(app: &mut App) -> Vec<KeyedRow> {
+        use bevy::ecs::system::RunSystemOnce;
+
+        app.world_mut()
+            .run_system_once(crate::batch::confirm_panel_rows)
+            .expect("确认面板系统要能跑");
+        app.world()
+            .resource::<PanelRows>()
+            .get(PanelId::Confirm)
+            .to_vec()
+    }
+
+    /// 这个 Ask 已经收到的选项答案（没有决定/拒绝/文本答案时 `None`）。
+    fn decision_answer(app: &App, ask: Entity) -> Option<Answer> {
+        app.world()
+            .get::<Decision>(ask)
+            .and_then(Decision::get)
+            .and_then(Answer::of)
+    }
+
+    fn decision_by_person(app: &App, ask: Entity) -> bool {
+        app.world()
+            .get::<Decision>(ask)
+            .is_some_and(|decision| matches!(decision.by(), Some(Decider::Person)))
+    }
+
+    #[test]
+    fn alt_one_answers_the_first_choice_of_the_confirm_ask() {
+        let mut app = ask_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+        assert_eq!(inline_disabled(&mut app).len(), 10, "Alt+0..9 共十条");
+        assert!(
+            inline_disabled(&mut app).iter().all(|disabled| !*disabled),
+            "有未回答的 Ask 时内联回答键要启用"
+        );
+
+        alt_digit(&mut app, '1');
+
+        assert_eq!(
+            decision_answer(&app, ask),
+            Some(Answer::choice("confirm")),
+            "Alt+1 应答第一个选项"
+        );
+        assert!(decision_by_person(&app, ask), "作答者应是 Decider::Person");
+    }
+
+    #[test]
+    fn alt_two_answers_the_second_choice_of_the_confirm_ask() {
+        let mut app = ask_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+        alt_digit(&mut app, '2');
+        assert_eq!(
+            decision_answer(&app, ask),
+            Some(Answer::choice("cancel")),
+            "Alt+2 应答第二个选项"
+        );
+    }
+
+    #[test]
+    fn alt_past_the_last_choice_answers_nothing() {
+        let mut app = ask_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+        alt_digit(&mut app, '3');
+        assert!(
+            !app.world()
+                .get::<Decision>(ask)
+                .is_some_and(Decision::is_decided),
+            "Alt+3 越界：什么也不答"
+        );
+        assert!(
+            !confirm_rows_now(&mut app).is_empty(),
+            "越界不改确认面板，问题还在"
+        );
+    }
+
+    #[test]
+    fn alt_digits_answer_the_first_ask_in_the_confirm_tile() {
+        let mut app = ask_app();
+        let first = spawn_ask(&mut app, &[("one", "一")]);
+        let second = spawn_ask(&mut app, &[("two", "二")]);
+
+        alt_digit(&mut app, '1');
+
+        assert_eq!(
+            decision_answer(&app, first),
+            Some(Answer::choice("one")),
+            "Alt+n 答的是确认 tile 里最老的那块（FIFO，和 confirm_rows 一致）"
+        );
+        assert!(
+            !app.world()
+                .get::<Decision>(second)
+                .expect("第二个 Ask 也要有 Decision")
+                .is_decided(),
+            "后面的问题不受影响"
+        );
+    }
+
+    #[test]
+    fn alt_zero_refuses_the_ask_the_way_the_harness_does() {
+        let mut app = ask_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+
+        alt_digit(&mut app, '0');
+
+        let decision = app.world().get::<Decision>(ask).expect("Ask 要有 Decision");
+        assert!(decision.is_decided(), "Alt+0 应拒绝问题");
+        assert!(matches!(decision.by(), Some(Decider::Person)));
+        assert!(
+            Answer::of(decision.get().expect("已决定")).is_none(),
+            "拒绝不是选项答案"
+        );
+        assert!(
+            decision.get().expect("已决定").0.is_err(),
+            "拒绝是 Outcome::refused（和 rig-harness 的 Pick::person(ask, None) 一致）"
+        );
+    }
+
+    #[test]
+    fn inline_keys_arm_only_while_an_ask_is_open() {
+        let mut app = ask_app();
+        app.update();
+        assert_eq!(inline_disabled(&mut app).len(), 10);
+        assert!(
+            inline_disabled(&mut app).iter().all(|disabled| *disabled),
+            "没有 Ask 时 Alt+0..9 全挂 Disabled"
+        );
+
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付")]);
+        assert!(
+            inline_disabled(&mut app).iter().all(|disabled| !*disabled),
+            "有未回答的 Ask 时摘掉 Disabled"
+        );
+
+        alt_digit(&mut app, '1');
+        for _ in 0..4 {
+            app.update();
+        }
+        if let Some(decision) = app.world().get::<Decision>(ask) {
+            assert!(decision.is_decided(), "问题应已被回答");
+        }
+        assert!(
+            inline_disabled(&mut app).iter().all(|disabled| *disabled),
+            "没有未回答的 Ask 后 Alt+0..9 挂回 Disabled"
+        );
+    }
+
+    #[test]
+    fn alt_digit_without_an_ask_does_not_swallow_a_plugin_binding() {
+        #[derive(Resource, Default)]
+        struct Pressed(bool);
+
+        let mut app = test_app();
+        app.init_resource::<Pressed>();
+        app.add_key_binding(
+            KeyBinding::new(KeyPress::alt('1'), "Plugin").in_scope(KeyScope::Global),
+            |_pressed: On<KeyPressed>, mut seen: ResMut<Pressed>| seen.0 = true,
+        );
+        app.update();
+        assert!(
+            inline_disabled(&mut app).iter().all(|disabled| *disabled),
+            "没有 Ask：内联键不能启用"
+        );
+
+        alt_digit(&mut app, '1');
+
+        assert!(
+            app.world().resource::<Pressed>().0,
+            "没有 Ask 时 Alt+1 不能让内联绑定吞掉，插件绑定要收到 KeyPressed"
+        );
+        assert!(text(&app).is_empty(), "Alt+1 也不能当字符打进输入框");
+    }
+
+    #[test]
+    fn answering_the_ask_clears_the_confirm_panel_next_frame() {
+        let mut app = ask_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+        let texts: Vec<String> = confirm_rows_now(&mut app)
+            .iter()
+            .map(|keyed| plain(&keyed.row.line))
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("确认支付")),
+            "确认面板要列出选项，实际 {texts:?}"
+        );
+
+        alt_digit(&mut app, '1');
+        assert_eq!(decision_answer(&app, ask), Some(Answer::choice("confirm")));
+
+        // 内核把 Decision 落成 Outcome 后，下一帧确认面板不再产出这些行。
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(
+            confirm_rows_now(&mut app).is_empty(),
+            "回答后确认行应消失（confirm_panel_rows 下一帧不再产出）"
+        );
+    }
+
+    #[test]
+    fn escape_refuses_the_open_ask_before_stopping_the_turn() {
+        let (mut app, agent) = sending_app();
+        run_a_turn(&mut app, agent);
+        type_text(&mut app, "keep");
+        let ask = app
+            .world_mut()
+            .spawn(
+                Ask::new("确认下单并支付？")
+                    .choice("confirm", "确认支付")
+                    .choice("cancel", "取消"),
+            )
+            .id();
+        app.update();
+
+        send(&mut app, Key::Escape, KeyCode::Escape, None);
+
+        let decision = app.world().get::<Decision>(ask).expect("Ask 要有 Decision");
+        assert!(decision.is_decided(), "有 Ask 时 Esc 先拒绝问题");
+        assert!(matches!(decision.by(), Some(Decider::Person)));
+        assert!(
+            Answer::of(decision.get().expect("已决定")).is_none(),
+            "拒绝不是选项答案"
+        );
+        assert!(
+            observed(&app).stopped.is_empty(),
+            "拒绝问题不能顺手停掉正在跑的 turn"
+        );
+        assert_eq!(text(&app), "keep", "Esc 不动输入");
+
+        // 问题没了以后 Esc 回到原来的行为：停 ShownAgent 的 turn。
+        app.world_mut().entity_mut(ask).despawn();
+        send(&mut app, Key::Escape, KeyCode::Escape, None);
+        assert_eq!(observed(&app).stopped, [agent], "没有问题时 Esc 还是停 turn");
     }
 
     // ---- 发送 / 排队 / 停止 / 退出：键 -> 内核事件的整条链路 ----

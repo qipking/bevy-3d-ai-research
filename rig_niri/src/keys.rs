@@ -15,8 +15,10 @@
 //! - [`KeyBinding`] / [`KeyScope`] / [`KeyFocus`] / [`KeyPressed`] /
 //!   [`Keys`] / [`find`] / 多键前缀匹配 / 作用域遮蔽；
 //! - [`add_built_in`] 额外生成的两类绑定：转写区 Esc（`Deselect`）与
-//!   Alt+1..9、Alt+0 的内联回答键（先挂 `Disabled`，本 crate 还没有内联问题
-//!   的显示，所以它们暂时不会启用）。
+//!   Alt+1..9、Alt+0 的内联回答键（带 [`InlineKey`]，先挂 `Disabled`）。
+//!   确认面板里有未回答的 `Ask` 时，[`arm_inline_keys`] 摘掉 `Disabled`
+//!   启用它们；问题答完/被拒后挂回去——和上游 `keys.rs::arm_inline_keys`
+//!   同一条规则。
 //!
 //! 未移植：`run_command`（要 rig-harness 的命令总线）、`Reflect` 与
 //! `tell_refused` 的 Notice 展示；拒绝绑定时只记 [`RefusedKeys`] 并 `warn!`。
@@ -30,6 +32,9 @@ use bevy::ecs::system::IntoObserverSystem;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
+use rig_ecs::prelude::{ForAgent, Outcome};
+use rig_harness::main_agent::ShownAgent;
+use rig_harness::prelude::Ask;
 
 /// 修饰键：上游 `crossterm::KeyModifiers` 的等价物。
 ///
@@ -623,6 +628,14 @@ pub fn built_in() -> Vec<(Keys, &'static str, InputAction)> {
     ]
 }
 
+/// 内联回答键的标记：Alt+1..9（[`InputAction::AnswerInline`]）与 Alt+0
+/// （[`InputAction::DismissInline`]）十条绑定带它。
+///
+/// [`arm_inline_keys`] 只动这些绑定，别的 Alt+数字绑定（插件的）不会被它
+/// 开关。对应上游 `keys.rs` 的 `InlineKey`。
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct InlineKey;
+
 /// 生成视图自带的内置绑定：43 条输入键、转写区 Esc，以及先挂
 /// `Disabled` 的内联回答键（Alt+1..9、Alt+0）。
 pub fn add_built_in(app: &mut App) {
@@ -639,8 +652,8 @@ pub fn add_built_in(app: &mut App) {
     if let Some(mut bound) = bind(app.world_mut(), back) {
         bound.insert(InputAction::Deselect);
     }
-    // 内联问题：Alt+1..9 选第 n 个，Alt+0 拒绝。还没有内联问题显示，
-    // 所以先全部 Disabled；等有显示方时按上游 `arm_inline_keys` 摘掉。
+    // 内联问题：Alt+1..9 选第 n 个，Alt+0 拒绝。没有显示中的问题时它们
+    // 挂 `Disabled`，由 [`arm_inline_keys`] 按确认面板的内容开关。
     let inline = (1..=9u8)
         .map(|number| (number, "Answer the question beside the work"))
         .chain([(0, "Dismiss the question beside the work")]);
@@ -652,7 +665,49 @@ pub fn add_built_in(app: &mut App) {
             number => InputAction::AnswerInline(number),
         };
         if let Some(mut bound) = bind(app.world_mut(), binding) {
-            bound.insert((action, Disabled));
+            bound.insert((action, InlineKey, Disabled));
+        }
+    }
+}
+
+/// 这个 `Ask` 是否显示在**当前工作区**的确认面板里：没有 `ShownAgent`
+/// （无视图的测试/导出路径）时全部可见；有 `ForAgent` 的只认当前 agent，
+/// 无主的（app 级问题）也可见。
+///
+/// 和 `batch::confirm_panel_rows` 的过滤同一口径（那边的 `focused_visible`
+/// 是私有函数）；[`arm_inline_keys`] 与键盘作答都用它挑"当前确认 tile 的
+/// 问题"。
+pub fn ask_is_visible(shown: Option<Entity>, owner: Option<Entity>) -> bool {
+    shown.is_none_or(|shown| owner.is_none_or(|owner| owner == shown))
+}
+
+/// 确认面板里有未回答的 `Ask` 时启用 Alt+1..9 / Alt+0，没有时挂回
+/// `Disabled`（上游 `keys.rs::arm_inline_keys`）。
+///
+/// 只在"有问题显示"时占住这些键，所以没有问题时 Alt+1..9 会落回插件或
+/// 输入框，不会被内联绑定吞掉。启不启用看的是显示中的问题，不是本帧的
+/// 按键；Commands 在本系统与 [`crate::editor::keys`] 之间自动同步，所以问题
+/// 出现/答完后的下一次检查就生效（问题由内核在 AgentPass 里 spawn 时最多
+/// 晚一帧，和上游按帧更新一致）。
+pub fn arm_inline_keys(
+    asks: Query<Option<&ForAgent>, (With<Ask>, Without<Outcome>)>,
+    shown: Option<Res<ShownAgent>>,
+    keys: Query<(Entity, Has<Disabled>), (With<InlineKey>, Allow<Disabled>)>,
+    mut commands: Commands,
+) {
+    let shown = shown.as_deref().and_then(|shown| shown.0);
+    let showing = asks
+        .iter()
+        .any(|owner| ask_is_visible(shown, owner.map(|ForAgent(owner)| *owner)));
+    for (key, disabled) in &keys {
+        match (showing, disabled) {
+            (true, true) => {
+                commands.entity(key).remove::<Disabled>();
+            }
+            (false, false) => {
+                commands.entity(key).insert(Disabled);
+            }
+            _ => {}
         }
     }
 }

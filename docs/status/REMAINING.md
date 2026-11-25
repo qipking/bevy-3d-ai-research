@@ -1,7 +1,7 @@
 # 还没做的事（按用户能感知的价值排序）
 
-> **状态**：当前（2026-11-25 第二轮之后；第 1 条已落地，其余是 20:10 快照）。配套
-> [`PARITY.md`](PARITY.md)：那边是"每个模块到什么程度"，这里是"现在真正还剩什么、先做哪个"。
+> **状态**：当前（2026-11-25 第三轮之后；第 1 条、第 5 条的键盘作答与 §9 的 picker
+> 队列已落地，其余是 20:10 快照）。配套 [`PARITY.md`](PARITY.md)：那边是"每个模块到什么程度"，这里是"现在真正还剩什么、先做哪个"。
 > **范围**：`rig_niri` 前端 + 为跑通它必须接的应用层线（`rig_harness_in_3d`）。
 > 真实模型接入（provider/API key）不在这份表里——那是 app 侧的事，见
 > [`HANDOFF.md`](HANDOFF.md) §7。
@@ -94,19 +94,40 @@
 
 ---
 
-## 5. 确认/问题只能点，键盘答不了
+## 5. 确认/问题只能点，键盘答不了 —— ✅ 已完成（键盘作答；输入框内作答仍未做）
 
-- **用户会看到什么**：闸门弹出 `[1] 确认 [2] 取消`，鼠标能点，但 **Alt+1/Alt+2 没反应**，
-  Esc 也不会拒绝；也没法在输入框里直接打字回答（上游"在输入框里作答"）。
-- **上游 API / 我们的落点**：上游 `input::answer_inline`（`input.rs:950`）+ `pick::choice_key`
-  （`pick.rs:723`），Alt+1..9/Alt+0 的绑定只在问题显示时启用（`keys::arm_inline_keys`）。
-  我们的确认行由 `batch::confirm_rows`（`batch.rs:1174`）产出、带 `Row.choice` 和 `AskChoice`
-  （`transcript.rs:71`/`:190`），点击由应用层 `answer_ask` 观察者处理
-  （`rig_harness_in_3d/src/kernel.rs:267`）；`AnswerInline`/`DismissInline` 在 `act` 里空实现
-  （`editor.rs:476`–`:479`），Alt+1..9 绑定被 `Disabled` 挂起（`keys.rs:641`–`:655`）。
-- **工作量**：**S**（键盘回答：把 `AnswerInline` 接到 `Chosen::item` 并摘 `Disabled`；
-  输入框内作答是 M）。
-- **依赖**：无（点击路径已在，照着接）。
+- **现在的行为**：确认 tile 里有未回答的 `Ask` 时，`keys::arm_inline_keys`
+  摘掉 Alt+1..9/Alt+0 绑定的 `Disabled`：Alt+n 用当前确认 tile 第一块（最老、
+  按内核效应 id FIFO，和 `batch::confirm_rows` 同一顺序）的第 n 个选项回答；
+  越界什么都不做。Alt+0 与 Esc 拒绝问题（`Outcome::refused`，和 rig-harness
+  `pick.rs` 的 `Pick::person(ask, None)` 是同一个结论）。Esc 只在有未回答问题
+  时抢占：没有问题仍是原来的关补全 / 停 turn / 面板交还焦点。
+- **点击与键盘共用一条路**：`editor::answer_ask`（`editor.rs:757`）是唯一的
+  作答落点——应用层点击观察者 `kernel::answer_ask`（`kernel.rs:291`）和键盘
+  Alt+n 都调它；拒绝是 `editor::refuse_ask`。点击仍可点任何一块的任意选项。
+- **应用层**：`answer_to_decision` 现在也把"人拒绝问题"（Esc/Alt+0，没有
+  `Answer`）转成被按住调用的拒绝；否则 hold 释放后，没决定的 `create_order`
+  会照常开跑——拒绝问题反而把下单放过去。
+- **测试**（本轮 `rig_niri` +9、app 侧 +3；`rig_niri` 现在共 407 个 lib 测试，
+  含并行落地的 picker 测试）：`alt_one_answers_the_first_choice_of_the_confirm_ask`、
+  `alt_two_answers_the_second_choice_of_the_confirm_ask`、
+  `alt_past_the_last_choice_answers_nothing`、
+  `alt_digits_answer_the_first_ask_in_the_confirm_tile`、
+  `alt_zero_refuses_the_ask_the_way_the_harness_does`、
+  `inline_keys_arm_only_while_an_ask_is_open`、
+  `alt_digit_without_an_ask_does_not_swallow_a_plugin_binding`、
+  `answering_the_ask_clears_the_confirm_panel_next_frame`、
+  `escape_refuses_the_open_ask_before_stopping_the_turn`；app 侧（`+3`）：
+  `a_click_and_alt_one_make_the_same_rig_harness_answer`（点行内子节点、真观察者
+  vs 真 Alt+1，断言同一个 `Answer` 和 `Decider::Person`）、
+  `a_click_can_answer_any_choice_and_alt_one_the_first`、
+  `refusing_the_ask_cancels_the_held_order`（内核记录里 `create_order` 的
+  `started_ms` 为 `None` 且 outcome 是 Err）。
+- **还没做**：输入框里直接打字作答（上游 `pick.rs:132` 的 `in_input`/`draft`，
+  落到 `Answer::text`）；多问题时键盘只答第一块（FIFO），不能像上游那样用插件
+  自定义的 `ChoiceKeys`；`Alt+(选项数+1)` 把问题挪进输入框作答的分支也没有。
+- **工作量**：键盘作答已完成；输入框内作答是 **M**。
+- **依赖**：无（输入框内作答复用已有的 `Editor`）。
 
 ---
 
@@ -159,17 +180,37 @@
 
 ---
 
-## 9. 多个 picker/问题只显示第一个；插件不能给选项加键
+## 9. 多个 picker 已排队显示（✅ picker 队列已完成）；插件不能给选项加键
 
-- **用户会看到什么**：两个插件同时打开选择器时，只看到其中一个（顺序还不稳定），另一个既不
-  显示也不会被排队；单选器/问题不能像上游那样用 Alt+1..9/插件自定义键选，只能用鼠标点；
-  选项的 `more`（展开选中项的说明）、列表体滚动、在输入框里作答这些细节也没有。
-- **上游 API / 我们的落点**：上游 `pick::queue_choices`（`pick.rs:500`，一次一个、关掉交接）、
-  `ChoiceKeys`/`ChoiceAction`（`:51`/`:55`）、`PickerInput` 的 `scroll`/`more`/`draft`/`picked`/
-  `in_input`（`:103`–`:132`）。我们：`sync_picker` 取 `pickers.iter().next()`
-  （`rig_niri/src/picker.rs:376`）；`PickerInput` 字段见 `picker.rs:42`（缺 scroll/more/draft/
-  picked）；`ChoiceKeys` 0 命中。
-- **工作量**：**M**。
+- **picker 队列（✅ 2026-11-25）**：多个 picker 同时存在时，条带最右边仍然只有
+  **一列**、一次显示一个，按创建顺序排队；关掉队首（Esc/回车提交/取消 → harness
+  收到 `Pick` 后 despawn）或被外部 despawn 后，下一个在**同一帧**的 `sync_picker`
+  里接进同一列（容器/列表/preview 面板复用，不闪空列）。队列是 `PickerQueue`
+  资源（`rig_niri/src/picker.rs:86`）：`Add<Picker>` 观察者（`:435`）在组件加入
+  world 的瞬间按 spawn/insert 顺序入队（是创建顺序，不依赖 ECS 查询迭代顺序），
+  `sync_picker`（`:450`）每帧清掉已 despawn 的、兜底补漏；`push` 对同一实体去重，
+  重复的 add/spawn 事件不会排两次。最后一个关掉后 `remove_column` 摘列、树逐字节
+  复原；列里有 preview 时先 `remove_leaf(Preview)` 再摘整列，不会留下只有 preview
+  的空列。
+- **`Ask` 有意不进这个队列**：3D 这边的 `Ask` 是条带里的确认 tile
+  （`batch::confirm_rows`，`PanelId::Confirm`），不是 picker 列、也没有弹层。
+  把 `Ask` 塞进 picker 队列会让确认 tile 去等 picker 列、违背"所有东西都是 tile、
+  没有弹层"的设计；所以队列只装 `Picker`，和上游 `queue_choices` 的差异是故意的。
+- **还没做**：单选器（picker）不能像上游那样用 Alt+1..9/插件自定义键选，只能用
+  鼠标点（`ChoiceKeys`/`ChoiceAction` 0 命中）；确认问题（`Ask`）已能键盘作答，
+  见 §5。选项的 `more`（展开选中项的说明）、列表体滚动、在输入框里作答这些细节
+  也没有。
+- **上游 API / 我们的落点**：上游队列 `pick::queue_choices`（`pick.rs:500`）、
+  `ChoiceKeys`/`ChoiceAction`（`:51`/`:55`）、`PickerInput` 的
+  `scroll`/`more`/`draft`/`picked`/`in_input`（`:103`–`:132`）。我们：队列见上；
+  `PickerInput` 字段见 `rig_niri/src/picker.rs:47`（仍缺 scroll/more/draft/picked）；
+  `ChoiceKeys` 0 命中。
+- **测试**：`pickers_show_one_at_a_time_in_creation_order`、
+  `the_same_picker_is_never_queued_twice`、`escape_hands_the_column_to_the_next_picker`、
+  `closing_a_picker_whose_preview_is_open_removes_the_whole_column`、
+  `closing_after_a_focus_switch_clears_the_old_workspaces_column`、
+  `an_ask_never_enters_the_picker_queue`。
+- **工作量**：剩余部分 **M**（选项键 + 输入框作答 + scroll/more；队列本身已完成）。
 - **依赖**：`in_input`（输入框内作答）与 §5 的输入框作答是同一件事。
 
 ---
