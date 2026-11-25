@@ -29,11 +29,12 @@ use std::time::Duration;
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use rig_core::conversation::{self as talk, Note, TurnEnd, pairing::answered_by};
+use rig_core::conversation::{self as talk, CallRef, Note, TurnEnd, pairing::answered_by};
 use rig_core::effect::EffectId;
 use rig_core::message::{
-    AssistantMessage, CallId, Message, Text, ToolCall, ToolResult, ToolResultContent, UserContent,
+    AssistantMessage, CallId, Message, ToolCall, ToolResult, ToolResultContent, UserContent,
 };
+use rig_core::tool::ToolResultContext;
 use rig_ecs::prelude::*;
 use rig_harness::prelude::{Ask, CallOutput, ShownAgent, ToolProgress};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style, Stylize};
@@ -78,7 +79,19 @@ pub struct CallFact {
     pub ordinal: usize,
     pub call: ToolCall,
     pub result: ToolResult,
-    /// 从开始到结算的时长（真实时钟）。
+    /// 它发布过的事实（内核 `Published` 组件里的 `ToolResultContext`：
+    /// `ExitStatus`、`OutputCut`、`FilesChanged` 之类），按会话保存时的
+    /// 上限裁剪过（[`published_facts`]）。
+    ///
+    /// **来源**：效应答复时 `Published` 和 `Outcome` 一起插在效应实体上
+    /// （rig-ecs `stage.rs:458`、`answer()`），而效应在 Commit 后会被回收，
+    /// 所以必须在 [`record_calls`]（Review）抄下来。运行中的调用没有它
+    /// —— 没有发布就没有退出码/截断标记，这是上游语义，不是缺口。
+    pub facts: Option<ToolResultContext>,
+    /// 从开始到结算的时长（真实时钟）：结算那一刻用 `Started.at.elapsed()`
+    /// 算的，比真正完成晚一点点。上游用的是效应记录里的
+    /// `EffectRecord::started_ms`/`finished_ms`（精确）；要那两列得消费
+    /// `EffectRecorded`（TODO(past)，重启后的旧调用同理）。
     pub took: Option<Duration>,
 }
 
@@ -87,7 +100,10 @@ pub struct CallFact {
 /// 转写用它还原子 agent 的调用树、`took` 和"已经结算但还没落进对话"的卡片。
 ///
 /// TODO(past): 恢复会话时更早的效应记录（上游 `PastEffects` / `EffectRecorded`）
-/// 还没接：重启后旧的 `took` 与调用树是空的。
+/// 还没接：重启后旧的 `took` 与调用树是空的，`facts` 也只有已经落进对话的
+/// 调用才拿得回来（`Entry::facts`），没提交的结算调用那份在 `KeptFacts`
+/// 里 —— 那是 rig-ecs 的 `pub(crate)` 类型，本 crate 读不到（见
+/// [`CallFact::facts`]）。
 #[derive(Resource, Default)]
 pub struct CallHistory(pub Vec<CallFact>);
 
@@ -197,13 +213,17 @@ const STOPPED_BLOCK: usize = usize::MAX;
 
 /// 调用之间的关系：谁启动了谁（子 agent 的调用树）。
 ///
-/// 上游 `transcript::CallTree` 的对位，数据来自 `Effect.parent`（还没结算的）
-/// 和 [`CallFact::parent`]（结算过的）。
+/// 上游 `transcript::CallTree` 的对位，数据来自 `Effect.parent`（还没结算的）、
+/// [`CallFact::parent`]（结算过的）和 [`EffectParents`]（已经结算、实体没了的
+/// 非调用效应）。父子关系收**所有**效应，节点仍然只给工具调用：非调用的效应
+/// （模型调用、turn、消息……）在 [`CallTree::below`] 里被穿过去，depth 不变，
+/// 子 agent 的调用因此能接到发起它的调用下面（上游 `CallFacts::add_below`
+/// 同样让没有节点的那层穿过）。
 ///
-/// TODO(model-calls): 只把工具调用当节点；上游还会画模型调用节点
+/// TODO(model-calls): 上游还会画模型调用节点
 /// （`ChildCall { call: None, name: "vendor/model" }`，来自 `ModelRequest`/`SentTo`）。
-/// 非调用的效应现在是从它下面穿过去（深度不变），所以子 agent 的调用链是通的，
-/// 只是少了"模型调用"那一层。
+/// 本前端没有这一层节点，所以子 agent 的调用比上游少缩进一层（upstream 的
+/// depth 多 1），但相对层次和顺序一致；要补得先有模型调用的名字/状态来源。
 #[derive(Default)]
 struct CallTree {
     /// 每个效应作为调用时给 look 的信息（`depth` 在取子树时填）。
@@ -223,11 +243,18 @@ impl CallTree {
 
     /// 只记父子关系（[`live_additions`] 不画调用树，但要用同一套"根 + 后代"
     /// 过滤，见 [`CallTree::scope`]）。
+    ///
+    /// 幂等：同一效应先由 [`EffectParents`] 预链、再由 [`CallTree::add`] 链
+    /// 一次，子列表里不会出现两份。
     fn link(&mut self, effect: EffectId, parent: Option<EffectId>) {
-        if let Some(parent) = parent.filter(|parent| *parent != effect) {
-            self.parents.insert(effect, parent);
-            self.children.entry(parent).or_default().push(effect);
+        let Some(parent) = parent.filter(|parent| *parent != effect) else {
+            return;
+        };
+        if self.parents.contains_key(&effect) {
+            return;
         }
+        self.parents.insert(effect, parent);
+        self.children.entry(parent).or_default().push(effect);
     }
 
     /// `roots` 连同它们在树里的全部后代（含根）。
@@ -299,6 +326,37 @@ impl CallTree {
     }
 }
 
+/// 每个效应挂在哪（`Effect::parent`），按效应 id 记 —— 结算后实体没了，
+/// 关系还得留着，调用树才能跨过非调用的效应找到最近的调用祖先。
+///
+/// **来源**：`Effect` 组件（rig-ecs `stage.rs:251`，`parent` 是公开字段），
+/// 在 Review 抄（[`record_effect_parents`]）：Commit 才 settle，所以这一
+/// pass 里要结算的效应在 Review 还看得见。上游读的是每条
+/// `EffectRecorded`（`Settled::note` 都记进 `CallTree`）；本前端没有消费
+/// 那个消息，理由和 `Published` 一样 —— 组件比消息更直接。
+///
+/// 只增不删：一个效应 id 的父关系不会变（重试是新的效应 id），长会话里
+/// 每个效应一条，和上游保留整份记录同一个量级。
+#[derive(Resource, Default)]
+pub struct EffectParents(HashMap<EffectId, Option<EffectId>>);
+
+impl EffectParents {
+    /// 已知的每条（效应, 父效应），给建树用。
+    fn iter(&self) -> impl Iterator<Item = (EffectId, Option<EffectId>)> + '_ {
+        self.0.iter().map(|(effect, parent)| (*effect, *parent))
+    }
+}
+
+/// 把每个活效应的父关系抄进 [`EffectParents`]（Review，Commit 之前）。
+///
+/// 不跳过已抄过的：一个效应只有一条父关系，重复写是同值；这样不用给每个
+/// 效应再挂一个记账组件，每 pass 的开销就是 effect 数（几十个）次哈希插入。
+fn record_effect_parents(effects: Query<&Effect>, mut parents: ResMut<EffectParents>) {
+    for effect in &effects {
+        parents.0.insert(effect.id(), effect.parent);
+    }
+}
+
 /// `owner`（`None` = 没有 owner）在 `shown` 的条带里可不可见。
 ///
 /// 没有 `ShownAgent`（`shown == None`）= 不过滤：无视图的测试/导出路径保留
@@ -326,11 +384,13 @@ pub struct KernelData<'w, 's> {
             &'static ToolRequest,
             &'static Effect,
             Option<&'static Outcome>,
+            Has<Started>,
             Option<&'static Running>,
             Option<&'static Holds>,
             Option<&'static ForAgent>,
             Option<&'static ToolProgress>,
             Option<&'static CallOutput>,
+            Option<&'static Published>,
         ),
         Without<Settled>,
     >,
@@ -399,9 +459,10 @@ fn track_reply_stream(mut stream: ResMut<ReplyStream>, turn: ShownTurn) {
 
 /// 在 Review 阶段（Commit 之前）把已答复的调用抄进历史。
 ///
-/// 抄的东西：调用的结果（[`CompletedCalls`]）、效应 id/父效应/agent/时长
-/// （[`CallHistory`]）—— 效应实体结算后会被回收，这些是转写画调用树和
-/// "结算了但还没落进对话"卡片的唯一来源。
+/// 抄的东西：调用的结果（[`CompletedCalls`]）、效应 id/父效应/agent/时长/
+/// 发布的事实（[`CallHistory`]）—— 效应实体结算后会被回收（`Published` 和
+/// `Outcome` 都不在了），这些是转写画调用树、退出码/截断标记和"结算了但
+/// 还没落进对话"卡片的唯一来源。
 fn record_calls(
     mut commands: Commands,
     calls: Query<
@@ -412,6 +473,7 @@ fn record_calls(
             &Effect,
             Option<&ForAgent>,
             Option<&Started>,
+            Option<&Published>,
         ),
         Without<Recorded>,
     >,
@@ -420,7 +482,7 @@ fn record_calls(
     mut history: ResMut<CallHistory>,
     mut ordinals: ResMut<LiveOrdinals>,
 ) {
-    for (entity, request, outcome, effect, agent, started) in calls.iter() {
+    for (entity, request, outcome, effect, agent, started, published) in calls.iter() {
         let result = tool_result_of(outcome, &request.call);
         completed.0.push((request.call.clone(), result.clone()));
         let took = started
@@ -438,6 +500,7 @@ fn record_calls(
             ordinal: ordinals.of(effect.id()),
             call: request.call.clone(),
             result,
+            facts: published_facts(published),
             took,
         });
         commands.entity(entity).insert(Recorded);
@@ -445,14 +508,36 @@ fn record_calls(
 }
 
 /// 内核的 outcome -> look 读的 `ToolResult`。
+///
+/// 和内核把结果交给模型时同一套构造（`rig-core` 的 `ToolCall::answer`，
+/// `completion/message.rs:601`）：保留输出里的 JSON/图片块，并且
+/// 拒绝/跳过的结果也算错误（`!is_success()`，不只是 `is_error()`）。
 fn tool_result_of(outcome: &Outcome, call: &ToolCall) -> ToolResult {
     let tool = outcome.tool_result();
     ToolResult {
         call: call.id.clone(),
         name: call.function.name.clone(),
-        content: vec![ToolResultContent::Text(Text::new(tool.output().render()))],
-        is_error: tool.is_error(),
+        content: tool.output().clone().into_content(),
+        is_error: !tool.is_success(),
     }
+}
+
+/// rig-ecs 保存在会话里的 facts 上限（`stage.rs:463` 的
+/// `MAX_KEPT_FACTS_BYTES`，那边是私有的）：最多 256 KiB JSON，超出的大值
+/// （比如一次重写整个文件的 diff）被丢掉，小的 `ExitStatus` 留下。
+const KEPT_FACTS_BYTES: usize = 256 * 1024;
+
+/// 内核 `Published` 组件 -> `ToolRender::facts` 读的 `ToolResultContext`。
+///
+/// **实时来源**：`Published` 是效应实体上的组件（rig-ecs `stage.rs:458`），
+/// 只在 handler 答复时和 `Outcome` 一起插入（`stage.rs:answer()`），所以
+/// 还在跑的调用没有 facts（退出码/截断标记/`FilesChanged` 都要等结果）。
+/// 裁成会话会保存的形状（`ToolResultContext::kept`），这样结算到提交之间
+/// 卡片上看到的事实，和之后从对话 entry 里读到的完全一致。
+fn published_facts(published: Option<&Published>) -> Option<ToolResultContext> {
+    published
+        .map(|Published(facts)| facts.kept(KEPT_FACTS_BYTES))
+        .filter(|facts| !facts.is_empty())
 }
 
 /// 一个还没结算的调用（这是建批时 `Streaming` 位置的真实来源）。
@@ -466,16 +551,22 @@ struct LiveCall {
     owner: Option<Entity>,
     state: CallState,
     result: Option<ToolResult>,
+    /// 工具自己发布的事实，答复之前没有（见 [`published_facts`]）。
+    facts: Option<ToolResultContext>,
     output: Option<String>,
     ordinal: usize,
 }
 
 /// 还没结算的调用的状态（和上游 `render::CallStates` 同一套判断顺序）。
 ///
+/// `started` 是 `Has<Started>`（上游 `CallStates::state` 的判据）：`Running`
+/// 是任务句柄，`Started` 是"内核已经启动它"，两者任一都算 started
+/// —— 比如 `ToolStart::Open` 的调用有 `Started` 而没有 `Running`。
 /// `hold_name` 给"在等谁"的那个名字：真管线从 `Name` 查询里取，
 /// [`live_additions`] 直接读同一个 `Name` 组件 —— 两条路必须说同一句话。
 fn live_state(
     outcome: Option<&Outcome>,
+    started: bool,
     running: Option<&Running>,
     holds: Option<&Holds>,
     progress: Option<&ToolProgress>,
@@ -491,7 +582,7 @@ fn live_state(
     if outcome.is_some() {
         return CallState::Done;
     }
-    if running.is_some() {
+    if started || running.is_some() {
         return CallState::Running(progress.map(|ToolProgress(line)| line.clone()));
     }
     CallState::Waiting
@@ -505,6 +596,7 @@ pub fn rebuild_batch(
     mut batch: ResMut<RenderBatch>,
     mut ordinals: ResMut<LiveOrdinals>,
     history: Res<CallHistory>,
+    parents: Res<EffectParents>,
     stream: Res<ReplyStream>,
     mut dialogue: ResMut<Dialogue>,
     areas: Res<PanelAreas>,
@@ -532,8 +624,18 @@ pub fn rebuild_batch(
 
     // 1) 还没结算的调用：先收成自己的数据，后面既进 batch 也进调用树。
     let mut live: Vec<LiveCall> = Vec::new();
-    for (request, effect, outcome, running, holds, agent, progress, output) in
-        kernel.requests.iter()
+    for (
+        request,
+        effect,
+        outcome,
+        started,
+        running,
+        holds,
+        agent,
+        progress,
+        output,
+        published,
+    ) in kernel.requests.iter()
     {
         let owner = agent.map(|ForAgent(agent)| *agent);
         let agent = agent
@@ -545,7 +647,7 @@ pub fn rebuild_batch(
             call: request.call.clone(),
             agent,
             owner,
-            state: live_state(outcome, running, holds, progress, |hold| {
+            state: live_state(outcome, started, running, holds, progress, |hold| {
                 kernel
                     .names
                     .get(hold)
@@ -553,15 +655,40 @@ pub fn rebuild_batch(
                     .map(|name| name.as_str().to_owned())
             }),
             result: outcome.map(|outcome| tool_result_of(outcome, &request.call)),
+            facts: published_facts(published),
             output: output.map(CallOutput::text).filter(|text| !text.is_empty()),
             ordinal: ordinals.of(effect.id()),
         });
     }
     live.sort_by_key(|call| call.effect);
 
+    // 对话里已经出现、结果还没提交的调用（assistant 消息先提交、结果后提交），
+    // 在飞时的状态/输出/子树仍然来自活效应 —— 上游 `ShownConversation` 的
+    // `calls`/`outputs` 和 `ChildCalls` 的对位。`conversation_frame` 是纯函数，
+    // 读不到内核，所以在这里收好传进去。
+    let running_calls: HashMap<CallId, RunningCall> = live
+        .iter()
+        .map(|call| {
+            (
+                call.call.id.clone(),
+                RunningCall {
+                    effect: call.effect,
+                    state: call.state.clone(),
+                    output: call.output.clone(),
+                },
+            )
+        })
+        .collect();
+
     // 2) 调用树：结算过的 + 还在跑的（子 agent 的调用由此挂到发起它的调用下）。
     //    仍然收全量：父卡片要拿到自己的孩子；过滤留到 `scope`/`is_card`。
     let mut tree = CallTree::default();
+    // 先接上所有已知的父子关系（含模型调用这类非调用效应）：子 agent 的
+    // 调用挂在模型调用下，模型调用又挂在发起它的工具调用下（内核
+    // `EffectParent`），中间那层没有卡片，但关系不能断。
+    for (effect, parent) in parents.iter() {
+        tree.link(effect, parent);
+    }
     let mut roots: Vec<EffectId> = Vec::new();
     for fact in &history.0 {
         tree.add(
@@ -605,7 +732,14 @@ pub fn rebuild_batch(
 
     // 3) 对话：assistant 正文/推理进文字块，调用/entry/内容块/aside 进 batch。
     if let Some(conversation) = turn.conversation() {
-        let frame = conversation_frame(conversation, &history, &tree, &theme, batch.width);
+        let frame = conversation_frame(
+            conversation,
+            &history,
+            &tree,
+            &running_calls,
+            &theme,
+            batch.width,
+        );
         for (key, input) in frame.requests {
             let output = RenderOutput {
                 lines: default_lines(&input, &theme),
@@ -643,10 +777,13 @@ pub fn rebuild_batch(
             result: Some(fact.result.clone()),
             state: CallState::Done,
             theme,
-            // TODO(facts): `ToolRender::facts`（`ToolResultContext`，退出码/进度/
-            // 截断标记）还没有来源：内核的 `Outcome` 只给了输出文本。
-            facts: None,
+            // 结算时从效应上的 `Published` 抄下来的事实：退出码、输出截断
+            // 标记、`FilesChanged` 都从这里进 header/结果行（见
+            // [`published_facts`] 与 [`record_calls`]）。
+            facts: fact.facts.clone(),
             took: fact.took,
+            // 答复后 `CallOutput` 不再是"运行中的输出"（上游同样只给
+            // 在飞调用画），结果本身已经在上面的 `result` 里。
             output: None,
             children: tree.children_of(fact.effect),
             item: Some(CallItem::Streaming(fact.ordinal)),
@@ -671,7 +808,11 @@ pub fn rebuild_batch(
             result: call.result.clone(),
             state: call.state.clone(),
             theme,
-            facts: None,
+            // 已经答复但还没提交进对话的调用有 `Published`（和 `Outcome` 一起
+            // 插上的）；还在跑的没有 —— 那时确实没有任何退出码/截断事实。
+            facts: call.facts.clone(),
+            // 上游 `ToolRender::took` 只在结算后才有（EffectRecord 的
+            // started/finished）；这里等 [`record_calls`] 记进历史再填。
             took: None,
             output: call.output.clone(),
             children: tree.children_of(call.effect),
@@ -721,6 +862,21 @@ fn default_lines(input: &RenderInput, theme: &RTheme) -> Vec<LookLine> {
 // 对话 -> 请求 / 文字块（纯函数，测试直接喂构造的 `Conversation`）
 // ---------------------------------------------------------------------------
 
+/// 对话里还没结果的调用在飞时的样子（按调用 id）。
+///
+/// 上游 `transcript::Look` 从 `ShownConversation` 的 `calls`/`outputs` 和
+/// `ChildCalls` 拿同一批数据：assistant 消息先提交、工具结果后提交，所以
+/// 已经出现在对话里的调用仍然可能在跑，它的状态（含 [`ToolProgress`] 的
+/// 进度行）、输出和子树都要从活效应来。
+struct RunningCall {
+    /// 它的效应 id：`CallTree::children_of` 用（还在跑的调用也能有子调用）。
+    effect: EffectId,
+    /// `render::CallStates::state`（含进度行）。
+    state: CallState,
+    /// 运行中工具报告的输出（`CallOutput::text`）；没有报告就是 `None`。
+    output: Option<String>,
+}
+
 /// 一个 agent 的**对话历史** -> 这一帧的 `RenderBatch` + 没有 `RenderKey` 的文字块。
 ///
 /// 这是 [`conversation_frame`] 的公开出口，给**没有自己管线**的工作区用（见
@@ -741,6 +897,9 @@ pub fn dialogue_batch(
         conversation,
         &CallHistory::default(),
         &CallTree::default(),
+        // 没有自己管线的工作区拿不到内核的活效应（正是"没有管线"的定义），
+        // 所以没有在飞状态可传：对话里没结果的调用按 Running(None) 画。
+        &HashMap::new(),
         &theme,
         width,
     );
@@ -769,6 +928,7 @@ fn conversation_frame(
     conversation: &talk::Conversation,
     history: &CallHistory,
     tree: &CallTree,
+    running: &HashMap<CallId, RunningCall>,
     theme: &RTheme,
     width: u16,
 ) -> DialogueFrame {
@@ -790,7 +950,10 @@ fn conversation_frame(
     stopped_after.sort_unstable();
     stopped_after.dedup();
     for (at, entry) in entries.iter().enumerate() {
-        let next = entries.get(at + 1).map(|entry| entry.message);
+        // 下一条 entry 既是结果消息（`answers`），也是调用 facts 的来源
+        // （`Entry::facts`，见 assistant 分支）。
+        let next_entry = entries.get(at + 1);
+        let next = next_entry.map(|entry| entry.message);
         match entry.message {
             Message::System { .. } => {}
             Message::User { content } => {
@@ -886,7 +1049,17 @@ fn conversation_frame(
             }
             Message::Assistant(assistant) => {
                 let results = answers(assistant, next);
-                let mut calls = (0..).zip(results);
+                // `ToolRender::facts` 的**真来源**（上游
+                // `transcript::message_lines` 同一段）：结果那条 entry 里
+                // 保存的 `ResultFacts`，按 `CallRef`（回复 id + 调用位置）
+                // 配给每个调用。退出码/截断标记/`FilesChanged` 都在里面，
+                // 恢复会话后也照样有 —— 它跟着对话存，不跟着效应走。
+                let facts = next_entry.map(|next| {
+                    let calls = CallRef::calls(entry.id, assistant).map(|(at, call)| (at, &call.id));
+                    next.facts.of(calls)
+                });
+                let facts = facts.into_iter().flatten().chain(std::iter::repeat(None));
+                let mut calls = (0..).zip(results).zip(facts);
                 for (block, item) in assistant.content.iter().enumerate() {
                     match item {
                         AssistantContent::Text(text) => {
@@ -901,26 +1074,39 @@ fn conversation_frame(
                             ));
                         }
                         AssistantContent::ToolCall(call) => {
-                            let (index, result) = calls.next().unwrap_or((0, None));
+                            let ((index, result), facts) = calls.next().unwrap_or_default();
                             let at_call = CallRef {
                                 reply: entry.id,
                                 index,
                             };
                             let fact = history.by_call(&call.id);
-                            let effect = fact.map(|fact| fact.effect);
+                            // 已经出现在对话里的调用仍然可能在跑：状态、输出、
+                            // 子树都从活效应来（上游 `Look::state` /
+                            // `ShownConversation::outputs` / `ChildCalls`）。
+                            let running = running.get(&call.id);
+                            let state = running.map_or_else(
+                                || match result {
+                                    Some(_) => CallState::Done,
+                                    None => CallState::Running(None),
+                                },
+                                |running| running.state.clone(),
+                            );
+                            let output = match result {
+                                Some(_) => None,
+                                None => running.and_then(|running| running.output.clone()),
+                            };
+                            let effect = fact
+                                .map(|fact| fact.effect)
+                                .or_else(|| running.map(|running| running.effect));
                             frame.calls.insert(call.id.clone());
                             let render = ToolRender {
                                 call: call.clone(),
                                 result: result.cloned(),
-                                state: match result {
-                                    Some(_) => CallState::Done,
-                                    None => CallState::Running(None),
-                                },
+                                state,
                                 theme: *theme,
-                                // TODO(facts): 同 `rebuild_batch`：`ToolResultContext` 没有来源。
-                                facts: None,
+                                facts: facts.cloned(),
                                 took: fact.and_then(|fact| fact.took),
-                                output: None,
+                                output,
                                 children: effect
                                     .map(|effect| tree.children_of(effect))
                                     .unwrap_or_default(),
@@ -1500,6 +1686,9 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
         call: ToolCall,
         result: Option<ToolResult>,
         state: CallState,
+        /// 答复过才有（见 [`published_facts`]）。
+        facts: Option<ToolResultContext>,
+        output: Option<String>,
     }
 
     // 1) 在飞的调用：还没结算的 `ToolRequest`。收全量（别的 agent 的也收）才能
@@ -1512,17 +1701,30 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
                 &ToolRequest,
                 &Effect,
                 Option<&Outcome>,
+                Has<Started>,
                 Option<&Running>,
                 Option<&Holds>,
                 Option<&ToolProgress>,
                 Option<&ForAgent>,
+                Option<&Published>,
+                Option<&CallOutput>,
             ),
             Without<Settled>,
         >();
         // 同一个 world 的两次共享借用：查询请求 + 在闭包里读持有者的名字。
         let shared: &World = world;
-        for (request, effect, outcome, running, holds, progress, for_agent) in
-            requests.iter(shared)
+        for (
+            request,
+            effect,
+            outcome,
+            started,
+            running,
+            holds,
+            progress,
+            for_agent,
+            published,
+            output,
+        ) in requests.iter(shared)
         {
             live.push(Live {
                 effect: effect.id(),
@@ -1530,11 +1732,13 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
                 owner: for_agent.map(|ForAgent(owner)| *owner),
                 call: request.call.clone(),
                 result: outcome.map(|outcome| tool_result_of(outcome, &request.call)),
-                state: live_state(outcome, running, holds, progress, |hold| {
+                state: live_state(outcome, started, running, holds, progress, |hold| {
                     shared
                         .get::<Name>(hold)
                         .map(|name| name.as_str().to_owned())
                 }),
+                facts: published_facts(published),
+                output: output.map(CallOutput::text).filter(|text| !text.is_empty()),
             });
         }
     }
@@ -1544,6 +1748,14 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
     //    谁挂在父卡片下。仍然收全量（别的 agent 的也收），过滤靠 `is_card`。
     //    历史只借两次、不整段克隆（每帧每个非聚焦条带都会调这个函数）。
     let mut tree = CallTree::default();
+    // 已知的父子关系全接上，包括模型调用这类没有卡片的效应（和
+    // `rebuild_batch` 第 2 步同一口径）：子 agent 的调用要穿过它们挂到
+    // 发起它的调用下面。
+    if let Some(parents) = world.get_resource::<EffectParents>() {
+        for (effect, parent) in parents.iter() {
+            tree.link(effect, parent);
+        }
+    }
     let mut roots: Vec<EffectId> = Vec::new();
     for call in &live {
         // 对话里已经有的调用也接进树：它下面的实时子调用不能因此升成根。
@@ -1579,6 +1791,8 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
             let mut render =
                 ToolRender::new(fact.call.clone(), Some(fact.result.clone()), CallState::Done);
             render.took = fact.took;
+            // 结算时从 `Published` 抄下的事实（退出码/截断标记/…）。
+            render.facts = fact.facts.clone();
             render.item = Some(CallItem::Streaming(fact.ordinal));
             cards.push((fact.effect, render));
         }
@@ -1587,10 +1801,11 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
         if !tree.is_card(Some(&scope), call.effect) || !rendered.insert(call.call.id.clone()) {
             continue;
         }
-        cards.push((
-            call.effect,
-            ToolRender::new(call.call.clone(), call.result.clone(), call.state.clone()),
-        ));
+        let mut render =
+            ToolRender::new(call.call.clone(), call.result.clone(), call.state.clone());
+        render.facts = call.facts.clone();
+        render.output = call.output.clone();
+        cards.push((call.effect, render));
     }
     cards.sort_by_key(|(effect, _)| *effect);
     for (effect, render) in cards {
@@ -1855,6 +2070,7 @@ impl Plugin for BatchPlugin {
             .init_resource::<LiveOrdinals>()
             .init_resource::<Dialogue>()
             .init_resource::<TranscriptEngine>()
+            .init_resource::<EffectParents>()
             .configure_sets(
                 TranscriptRender,
                 (
@@ -1872,7 +2088,10 @@ impl Plugin for BatchPlugin {
                     child_calls_look.in_set(RenderSystems::Decorate),
                 ),
             )
-            .add_systems(AgentPass, record_calls.in_set(Stage::Review))
+            .add_systems(
+                AgentPass,
+                (record_effect_parents, record_calls).in_set(Stage::Review),
+            )
             .add_systems(
                 Update,
                 (
@@ -1893,7 +2112,10 @@ mod tests {
     //! 建批的测试：不跑模型、不连网，用构造的 `Conversation` / `CallFact` 断言。
 
     use super::*;
-    use rig_core::message::{AssistantContent, Image, ToolFunction, ToolName, ToolResultContent};
+    use rig_core::message::{
+        AssistantContent, Image, Text, ToolFunction, ToolName, ToolResultContent,
+    };
+    use rig_core::tool::ToolContext;
 
     /// 一个工具调用。
     fn call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -1951,6 +2173,7 @@ mod tests {
             &conversation,
             &CallHistory::default(),
             &CallTree::default(),
+            &HashMap::new(),
             &RTheme::default(),
             80,
         );
@@ -2050,6 +2273,7 @@ mod tests {
             &conversation,
             &CallHistory::default(),
             &CallTree::default(),
+            &HashMap::new(),
             &RTheme::default(),
             80,
         );
@@ -2084,6 +2308,7 @@ mod tests {
             conversation,
             &CallHistory::default(),
             &CallTree::default(),
+            &HashMap::new(),
             &RTheme::default(),
             80,
         )
@@ -2207,6 +2432,7 @@ mod tests {
             &conversation,
             &CallHistory::default(),
             &CallTree::default(),
+            &HashMap::new(),
             &RTheme::default(),
             80,
         );
@@ -2245,6 +2471,7 @@ mod tests {
             &conversation,
             &CallHistory::default(),
             &CallTree::default(),
+            &HashMap::new(),
             &RTheme::default(),
             80,
         );
@@ -2470,6 +2697,7 @@ mod tests {
             ordinal,
             call,
             result,
+            facts: None,
             took: None,
         }
     }
@@ -3523,6 +3751,462 @@ mod tests {
         assert!(
             !text.contains("settling_tool"),
             "落进对话后实时块不再重复画：{text:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 工具卡的事实（`ToolRender::facts`）：退出码 / 截断 / 进度 / 调用树
+    // -----------------------------------------------------------------------
+
+    /// 结果那条 entry 里的 `ResultFacts`：`ToolRender::facts` 在对话路径上的
+    /// 真来源（上游 `transcript::message_lines` 的 `next.facts.of(calls)`）。
+    fn result_facts(
+        reply: talk::MessageId,
+        call: &CallId,
+        context: &ToolContext,
+    ) -> talk::ResultFacts {
+        let facts = context
+            .result_context()
+            .with_at(CallRef { reply, index: 0 });
+        [(call.clone(), facts)].into_iter().collect()
+    }
+
+    /// 批里某张工具卡的 `ToolRender`。
+    fn tool_render<'a>(batch: &'a RenderBatch, key: &RenderKey) -> &'a ToolRender {
+        match &batch
+            .requests
+            .get(key)
+            .unwrap_or_else(|| panic!("批里没有 {key:?}"))
+            .input
+        {
+            RenderInput::Tool(render) => render,
+            _ => panic!("{key:?} 不是工具卡"),
+        }
+    }
+
+    #[test]
+    fn a_nonzero_exit_in_the_result_facts_reaches_the_header() {
+        use rig_core::tool::ExitStatus;
+
+        let mut conversation = talk::Conversation::new();
+        let tool = named_call("call_exit", "shell");
+        let reply = conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::ToolCall(tool.clone()),
+        ])));
+        let mut context = ToolContext::new();
+        context
+            .insert_result(ExitStatus::Exited(3))
+            .expect("退出码要能发布");
+        conversation.push(
+            talk::Entry::new(Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: tool.id.clone(),
+                    name: tool.function.name.clone(),
+                    content: vec![ToolResultContent::Text(Text::new("boom"))],
+                    is_error: false,
+                })],
+            })
+            .with_facts(result_facts(reply, &tool.id, &context)),
+        );
+
+        let frame = conversation_frame(
+            &conversation,
+            &CallHistory::default(),
+            &CallTree::default(),
+            &HashMap::new(),
+            &RTheme::default(),
+            80,
+        );
+        let render = frame
+            .requests
+            .iter()
+            .find_map(|(key, input)| match (key, input) {
+                (RenderKey::Tool(0, 0), RenderInput::Tool(render)) => Some(render),
+                _ => None,
+            })
+            .expect("调用卡");
+        assert_eq!(
+            render
+                .facts
+                .as_ref()
+                .and_then(|facts| facts.get::<ExitStatus>().ok().flatten()),
+            Some(ExitStatus::Exited(3)),
+            "facts 来自结果那条 entry 的 ResultFacts：{:?}",
+            render.facts
+        );
+        let lines = render.default_lines();
+        let header = text(lines[0].line());
+        assert!(header.contains("exit 3"), "header 要说出退出码：{header:?}");
+        assert_eq!(
+            lines[0].line().style.bg,
+            Some(RTheme::default().call_failed),
+            "非 0 退出码要走失败色带：{header:?}"
+        );
+    }
+
+    #[test]
+    fn a_settled_call_keeps_the_facts_it_published_for_its_card() {
+        use bevy::ecs::system::RunSystemOnce;
+        use rig_core::tool::ExitStatus;
+
+        let (mut app, shown) = focused_app();
+        let call = named_call("call_published", "shell");
+        let mut context = ToolContext::new();
+        context
+            .insert_result(ExitStatus::Exited(2))
+            .expect("退出码要能发布");
+        app.world_mut().spawn((
+            ToolRequest { call: call.clone() },
+            // 结果本身不是错误：失败色带只能来自 facts 里的退出码。
+            Outcome::from(rig_core::tool::ToolResult::success(
+                rig_core::tool::ToolOutput::text("printed"),
+            )),
+            Published(context.result_context()),
+            ForAgent(shown),
+        ));
+        app.world_mut()
+            .run_system_once(record_calls)
+            .expect("record_calls 要能跑");
+
+        let facts = app
+            .world()
+            .resource::<CallHistory>()
+            .0
+            .iter()
+            .find(|fact| fact.call.id == call.id)
+            .expect("结算调用进了历史")
+            .facts
+            .clone();
+        assert_eq!(
+            facts
+                .as_ref()
+                .and_then(|facts| facts.get::<ExitStatus>().ok().flatten()),
+            Some(ExitStatus::Exited(2)),
+            "效应上的 `Published` 要抄进 CallFact：{facts:?}"
+        );
+
+        rebuild_now(&mut app);
+        let batch = app.world().resource::<RenderBatch>();
+        let key = batch
+            .requests
+            .keys()
+            .find(|key| match &batch.requests[*key].input {
+                RenderInput::Tool(render) => render.call.id == call.id,
+                _ => false,
+            })
+            .expect("结算到提交之间的卡还在批里")
+            .clone();
+        let render = tool_render(batch, &key);
+        assert_eq!(render.state, CallState::Done);
+        let lines = &batch
+            .requests
+            .get(&key)
+            .expect("请求在批里")
+            .output
+            .lines;
+        let header = text(lines[0].line());
+        assert!(header.contains("exit 2"), "header 要说出退出码：{header:?}");
+        assert_eq!(
+            lines[0].line().style.bg,
+            Some(RTheme::default().call_failed),
+            "非 0 退出码要走失败色带：{header:?}"
+        );
+    }
+
+    #[test]
+    fn a_running_call_in_the_conversation_shows_its_progress_from_tool_progress() {
+        let (mut app, shown) = focused_app();
+        let call = named_call("call_progress", "build");
+        let mut conversation = talk::Conversation::new();
+        conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::ToolCall(call.clone()),
+        ])));
+        app.world_mut()
+            .entity_mut(shown)
+            .insert(Conversation(conversation));
+        app.world_mut().spawn((
+            ToolRequest { call: call.clone() },
+            ForAgent(shown),
+            // 上游 `CallStates::state` 的判据是 `Has<Started>`：任务句柄还没
+            // 交出去也算 started。进度行本身来自 `ToolProgress`，不是编的字。
+            Started {
+                at: std::time::SystemTime::now(),
+            },
+            ToolProgress("12 of 40 files".to_owned()),
+        ));
+        rebuild_now(&mut app);
+
+        let batch = app.world().resource::<RenderBatch>();
+        let key = RenderKey::Tool(0, 0);
+        let render = tool_render(batch, &key);
+        assert_eq!(
+            render.state,
+            CallState::Running(Some("12 of 40 files".to_owned())),
+            "对话里还在跑的调用要拿活效应的状态（含进度）"
+        );
+        assert!(
+            render.facts.is_none(),
+            "答复之前没有 `Published`，facts 没有来源，只能是 None"
+        );
+        assert!(
+            render.took.is_none(),
+            "还没结算，took 没有来源（上游也是结算后才有）"
+        );
+        let lines = &batch.requests.get(&key).expect("调用卡在批里").output.lines;
+        let progress = lines
+            .iter()
+            .find(|line| text(line.line()).contains("12 of 40 files"))
+            .expect("进度行要出现");
+        assert_eq!(
+            progress.line().style.fg,
+            Some(RColor::Yellow),
+            "进度行是 `progress_lines` 的黄色"
+        );
+        assert!(
+            !batch
+                .requests
+                .keys()
+                .any(|key| matches!(key, RenderKey::Streaming(_))),
+            "对话里已经有的调用不该再占一张 Streaming 卡：{:?}",
+            batch.requests.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_cut_result_draws_its_marker_from_the_result_facts() {
+        use rig_core::tool::{KeptEnd, OutputCut};
+
+        let marker = "[10 earlier lines cut; all of it in /tmp/full.log]";
+        let mut conversation = talk::Conversation::new();
+        let tool = named_call("call_cut", "shell");
+        let reply = conversation.push(Message::Assistant(AssistantMessage::new(vec![
+            AssistantContent::ToolCall(tool.clone()),
+        ])));
+        let mut context = ToolContext::new();
+        context
+            .insert_result(OutputCut {
+                kept: KeptEnd::Start,
+                kept_lines: 2,
+                total_lines: 12,
+                spill: Some("/tmp/full.log".to_owned()),
+            })
+            .expect("截断事实要能发布");
+        conversation.push(
+            talk::Entry::new(Message::User {
+                content: vec![UserContent::ToolResult(ToolResult {
+                    call: tool.id.clone(),
+                    name: tool.function.name.clone(),
+                    content: vec![ToolResultContent::Text(Text::new(format!(
+                        "first\nsecond\n{marker}"
+                    )))],
+                    is_error: false,
+                })],
+            })
+            .with_facts(result_facts(reply, &tool.id, &context)),
+        );
+
+        let frame = conversation_frame(
+            &conversation,
+            &CallHistory::default(),
+            &CallTree::default(),
+            &HashMap::new(),
+            &RTheme::default(),
+            80,
+        );
+        let render = frame
+            .requests
+            .iter()
+            .find_map(|(key, input)| match (key, input) {
+                (RenderKey::Tool(0, 0), RenderInput::Tool(render)) => Some(render),
+                _ => None,
+            })
+            .expect("调用卡");
+        let cut = render
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.get::<OutputCut>().ok().flatten())
+            .expect("OutputCut 从 ResultFacts 来");
+        assert_eq!(cut.kept, KeptEnd::Start);
+        assert_eq!(cut.cut_lines(), 10);
+        let lines: Vec<String> = render
+            .default_lines()
+            .iter()
+            .map(|line| text(line.line()))
+            .collect();
+        let at = lines
+            .iter()
+            .position(|line| line.contains(marker))
+            .unwrap_or_else(|| panic!("截断标记要出现：{lines:?}"));
+        assert_eq!(
+            at,
+            lines.len() - 1,
+            "`KeptEnd::Start` 的标记排在保留下来的行之后：{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains(marker)).count(),
+            1,
+            "标记只画一次（facts 认得它，不会重复/吞掉）：{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_tree_keeps_upstream_depth_through_non_call_effects() {
+        let child = |name: &str, state: CallState| ChildCall {
+            depth: 0,
+            call: Some(ToolFunction::new(
+                ToolName::new(name).expect("工具名非空"),
+                serde_json::json!({}),
+            )),
+            name: name.to_owned(),
+            agent: None,
+            state,
+            failed: false,
+            answer: None,
+        };
+        let mut tree = CallTree::default();
+        tree.add(
+            EffectId::from_raw(10),
+            None,
+            child("parent", CallState::Done),
+        );
+        tree.add(
+            EffectId::from_raw(11),
+            Some(EffectId::from_raw(10)),
+            child("child", CallState::Done),
+        );
+        tree.add(
+            EffectId::from_raw(12),
+            Some(EffectId::from_raw(11)),
+            child("grandchild", CallState::Done),
+        );
+        // 不是调用的效应 13（比如模型调用）挂在 10 下面、14 挂在 13 下面：
+        // 上游 `CallFacts::add_below` 让调用从它下面穿过，depth 不变。
+        tree.link(EffectId::from_raw(13), Some(EffectId::from_raw(10)));
+        tree.add(
+            EffectId::from_raw(14),
+            Some(EffectId::from_raw(13)),
+            child(
+                "through",
+                CallState::Running(Some("half way".to_owned())),
+            ),
+        );
+
+        let found: Vec<(String, usize, CallState)> = tree
+            .children_of(EffectId::from_raw(10))
+            .into_iter()
+            .map(|child| (child.name, child.depth, child.state))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("child".to_owned(), 0, CallState::Done),
+                ("grandchild".to_owned(), 1, CallState::Done),
+                (
+                    "through".to_owned(),
+                    0,
+                    CallState::Running(Some("half way".to_owned()))
+                ),
+            ],
+            "直接子调用 depth 0、孙调用 1，穿过的非调用效应不改 depth"
+        );
+    }
+
+    #[test]
+    fn a_non_call_effect_between_the_spawn_and_a_subagent_call_keeps_the_chain() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let (mut app, shown) = focused_app();
+        let helper = app.world_mut().spawn_empty().id();
+        // 父卡片：发起子 agent 的调用（结算过、还没进对话）。
+        app.world_mut()
+            .resource_mut::<CallHistory>()
+            .0
+            .push(settled_fact(
+                10,
+                None,
+                Some(shown),
+                50,
+                named_call("call_spawn", "spawn_agent"),
+            ));
+        // 中间那层：模型调用（不是工具调用，没有卡片）。真实内核里它的
+        // `Effect::parent` 来自 agent 的 `EffectParent`，也就是 spawn 调用。
+        let model = app
+            .world_mut()
+            .spawn(Effect::with_parent_id(Some(EffectId::from_raw(10))))
+            .id();
+        let model_effect = app
+            .world()
+            .get::<Effect>(model)
+            .expect("模型调用要有自己的效应")
+            .id();
+        // 子 agent 的调用挂在模型调用下面（`spawn_reply_calls` 的真实形状：
+        // `Effect::with_parent_id(Some(reply))`，`reply` 就是模型调用效应）。
+        app.world_mut().spawn((
+            ToolRequest {
+                call: named_call("call_child", "subagent_tool"),
+            },
+            Effect::with_parent_id(Some(model_effect)),
+            ForAgent(helper),
+        ));
+        app.world_mut()
+            .run_system_once(record_effect_parents)
+            .expect("父关系要能抄下来");
+        assert_eq!(
+            app.world()
+                .resource::<EffectParents>()
+                .0
+                .get(&model_effect)
+                .copied()
+                .flatten(),
+            Some(EffectId::from_raw(10)),
+            "模型调用要挂在 spawn 调用下（Review 抄的 `Effect::parent`）"
+        );
+
+        rebuild_now(&mut app);
+        let batch = app.world().resource::<RenderBatch>();
+        let parent = batch
+            .requests
+            .values()
+            .find_map(|request| match &request.input {
+                RenderInput::Tool(render) if render.name() == "spawn_agent" => Some(render),
+                _ => None,
+            })
+            .expect("父卡片");
+        let children: Vec<(String, usize, CallState)> = parent
+            .children
+            .iter()
+            .map(|child| (child.name.clone(), child.depth, child.state.clone()))
+            .collect();
+        assert_eq!(
+            children,
+            vec![("subagent_tool".to_owned(), 0, CallState::Waiting)],
+            "子 agent 的调用要穿过没有卡片的模型调用，挂到 spawn 卡片下（depth 0）"
+        );
+        assert_eq!(
+            streaming_cards(batch).len(),
+            1,
+            "子 agent 的调用只出现在父卡片的 children 里，不单独占一张卡：{:?}",
+            streaming_cards(batch)
+        );
+    }
+
+    #[test]
+    fn a_started_call_is_running_before_its_task_handle_exists() {
+        let progress = ToolProgress("half way".to_owned());
+        assert_eq!(
+            live_state(None, true, None, None, None, |_| None),
+            CallState::Running(None),
+            "`Has<Started>` 就够（上游 `CallStates::state` 的判据）"
+        );
+        assert_eq!(
+            live_state(None, true, None, None, Some(&progress), |_| None),
+            CallState::Running(Some("half way".to_owned())),
+            "进度行来自 `ToolProgress`"
+        );
+        assert_eq!(
+            live_state(None, false, None, None, None, |_| None),
+            CallState::Waiting,
+            "没开始、没答复：queued"
         );
     }
 }

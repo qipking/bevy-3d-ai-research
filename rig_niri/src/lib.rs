@@ -113,7 +113,9 @@ pub mod prelude {
     pub use crate::batch::{CallFact, CallHistory};
     pub use crate::niri::{Column, Layer, PresetSize, Tile, TileRect, Tiling, TilingPlugin};
     pub use crate::spatial::{Card, CardContent, CardLook, Funnel, SpatialFocus, spawn_card};
-    pub use crate::status::StatusPlugin;
+    pub use crate::status::{
+        AppStatusPartsExt, StatusPart, StatusParts, StatusPlugin, StatusSettings,
+    };
     pub use crate::theme::Theme;
     pub use crate::title::WindowTitle;
     pub use crate::transcript::{Row, RowText, TranscriptFont};
@@ -177,8 +179,11 @@ impl Plugin for FeathersViewPlugin {
 
     fn finish(&self, app: &mut App) {
         // 与 rig-tui 一样在 finish 里补：别的插件可能已 spawn 了 editor / agent。
-        app.world_mut()
-            .register_required_components::<rig_ecs::prelude::Agent, rig_tui::StatusItems>();
+        // turn 也要求 `StatusItems`（上游 `status::add` 同样注册 `TurnOf`），
+        // 这样状态行能直接读到运行中 turn 自己的条目。
+        let world = app.world_mut();
+        world.register_required_components::<rig_ecs::prelude::Agent, rig_tui::StatusItems>();
+        world.register_required_components::<rig_ecs::agent::TurnOf, rig_tui::StatusItems>();
     }
 }
 

@@ -1,8 +1,75 @@
 //! ratatui style/color -> Bevy color, so rig-tui's looks keep their semantics.
 
 use bevy::prelude::*;
+use rig_tui::ratatui::style::Color as RColor;
 
-pub fn color(c: Option<rig_tui::ratatui::style::Color>) -> Color {
+/// ratatui 颜色 → xterm 的 RGB。
+///
+/// 这条通路和 [`color`] 分开：`color` 是"给 Bevy 画布挑一个好看的近似色"，
+/// 命名色用的是本前端自己的调色板；这里要的是"终端里那个色相"，命名色按
+/// xterm 的 16 基色取值，供主题明暗判断、混色和 `NO_COLOR` 的明度计算用。
+/// `Reset` 没有色相，返回 `None`（调用方保留自己的兜底）。
+pub fn rgb(color: RColor) -> Option<(u8, u8, u8)> {
+    // xterm 的 16 个基础色（0–15），和 [`color`] 的 `indexed` 同一张表。
+    const BASE: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match color {
+        RColor::Reset => None,
+        RColor::Black => Some(BASE[0]),
+        RColor::Red => Some(BASE[1]),
+        RColor::Green => Some(BASE[2]),
+        RColor::Yellow => Some(BASE[3]),
+        RColor::Blue => Some(BASE[4]),
+        RColor::Magenta => Some(BASE[5]),
+        RColor::Cyan => Some(BASE[6]),
+        RColor::Gray => Some(BASE[7]),
+        RColor::DarkGray => Some(BASE[8]),
+        RColor::LightRed => Some(BASE[9]),
+        RColor::LightGreen => Some(BASE[10]),
+        RColor::LightYellow => Some(BASE[11]),
+        RColor::LightBlue => Some(BASE[12]),
+        RColor::LightMagenta => Some(BASE[13]),
+        RColor::LightCyan => Some(BASE[14]),
+        RColor::White => Some(BASE[15]),
+        RColor::Rgb(r, g, b) => Some((r, g, b)),
+        RColor::Indexed(index) => Some(match index {
+            0..=15 => BASE[usize::from(index)],
+            16..=231 => {
+                // 6×6×6 立方体，每级 0/95/135/175/215/255。
+                const STEPS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+                let n = index - 16;
+                (
+                    STEPS[usize::from(n / 36)],
+                    STEPS[usize::from(n / 6 % 6)],
+                    STEPS[usize::from(n % 6)],
+                )
+            }
+            // 232–255 是 8 起步、间隔 10 的灰阶。
+            index => {
+                let level = 8 + 10 * (index - 232);
+                (level, level, level)
+            }
+        }),
+    }
+}
+
+pub fn color(c: Option<RColor>) -> Color {
     use rig_tui::ratatui::style::Color as R;
     let c = match c {
         Some(c) => c,
