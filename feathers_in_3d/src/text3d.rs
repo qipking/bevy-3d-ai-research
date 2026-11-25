@@ -18,7 +18,7 @@ use bevy_ui::{ComputedNode, Node, UiGlobalTransform};
 use crate::sort::PanelSort;
 use crate::world3d::{
     LAYER_BIAS, MirrorRoot, PanelSortRange, WorldLayer, WorldPanel, Z_BIAS_PER_LEVEL,
-    physical_size_to_world, physical_to_logical,
+    effective_clip, panel_world_rect, physical_size_to_world, physical_to_logical,
 };
 
 /// Cache of one `StandardMaterial` per font-atlas texture.
@@ -96,7 +96,11 @@ pub fn sync_panel_text(
         // Collect this panel's text nodes and their offsets from the panel centre.
         // `ComputedNode`/`UiGlobalTransform` 都是物理像素，镜像统一用逻辑像素
         // （见 `world3d` 的换算说明）；1× 下 inverse_scale_factor == 1.0，结果不变。
-        let clip_half = physical_to_logical(panel_cn.size * 0.5, inverse_scale_factor);
+        //
+        // 文字裁剪和材质用同一口径：面板自身矩形 ∩ `WorldPanel::clip`。`None` 或
+        // 视口完整包住面板时就是面板自身（scroll = 0 的常规情况，与旧行为一致）；
+        // 交集为空（面板整个滚出视口）时一个字都不画。
+        let clip_bounds = text_clip_bounds(panel, panel_cn, inverse_scale_factor);
         let mut rows: Vec<PanelText> = Vec::new();
         for (entity, info, cn, ugt, block, color) in texts.iter() {
             if info.glyphs.is_empty() {
@@ -121,6 +125,16 @@ pub fn sync_panel_text(
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         panel_cn.size.to_bits_parts().hash(&mut hasher);
         inverse_scale_factor.to_bits().hash(&mut hasher);
+        match clip_bounds {
+            Some((min_x, max_x, min_y, max_y)) => {
+                1u8.hash(&mut hasher);
+                min_x.to_bits().hash(&mut hasher);
+                max_x.to_bits().hash(&mut hasher);
+                min_y.to_bits().hash(&mut hasher);
+                max_y.to_bits().hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
         for row in &rows {
             row.entity.hash(&mut hasher);
             row.info.glyphs.len().hash(&mut hasher);
@@ -172,12 +186,16 @@ pub fn sync_panel_text(
                     row.offset + content_min + glyph.position,
                     inverse_scale_factor,
                 );
-                // Clip to the panel box (one glyph of margin keeps half-scrolled rows sane).
+                // Clip to the panel box ∩ strip viewport (one glyph of margin keeps
+                // half-scrolled rows sane). An empty intersection culls everything.
                 let margin = 2.0;
-                if centre.x < -clip_half.x - margin
-                    || centre.x > clip_half.x + margin
-                    || centre.y < -clip_half.y - margin
-                    || centre.y > clip_half.y + margin
+                let Some((min_x, max_x, min_y, max_y)) = clip_bounds else {
+                    continue;
+                };
+                if centre.x < min_x - margin
+                    || centre.x > max_x + margin
+                    || centre.y < min_y - margin
+                    || centre.y > max_y + margin
                 {
                     continue;
                 }
@@ -289,6 +307,53 @@ pub fn sync_panel_text(
     }
 }
 
+/// 文字可见区：`面板自身 ∩ WorldPanel::clip`，换算成"面板中心为原点、
+/// y 朝下"的**逻辑像素**边界 `(min_x, max_x, min_y, max_y)`。
+///
+/// 返回 `None` = 交集为空（面板整个在视口外，或者本身没有面积）：一个字形都
+/// 不该画。`clip = None` 或视口完整包住面板时退回面板自身——和加 clip 之前
+/// 的 `±panel_half` 逐字节相同（1× 缩放下）。
+fn text_clip_bounds(
+    panel: &WorldPanel,
+    panel_cn: &ComputedNode,
+    inverse_scale_factor: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    let half = physical_to_logical(panel_cn.size * 0.5, inverse_scale_factor);
+    let panel_bounds = (-half.x, half.x, -half.y, half.y);
+    let Some(clip) = panel.clip else {
+        return Some(panel_bounds);
+    };
+    let units = panel.units_to_world;
+    let size_world = physical_size_to_world(panel_cn.size, inverse_scale_factor, units);
+    let panel_rect = panel_world_rect(&panel.anchor, size_world);
+    // 视口完整包住面板：交集就是面板自身，用旧口径（逐字节不变）。
+    if clip.contains(panel_rect.min) && clip.contains(panel_rect.max) {
+        return Some(panel_bounds);
+    }
+    let effective = effective_clip(panel_rect, Some(clip));
+    if effective.is_empty() || units <= 0.0 {
+        return None;
+    }
+    // 把有效裁剪矩形（世界坐标）的四个角变换回面板局部（米），取 AABB；
+    // 锚点带旋转时这才是正确的局部可见区。世界 y 朝上 → 文字逻辑 y 朝下。
+    let inv = panel.anchor.to_matrix().inverse();
+    let inv_units = units.recip();
+    let mut min = Vec2::splat(f32::INFINITY);
+    let mut max = Vec2::splat(f32::NEG_INFINITY);
+    for corner in [
+        effective.min,
+        Vec2::new(effective.max.x, effective.min.y),
+        effective.max,
+        Vec2::new(effective.min.x, effective.max.y),
+    ] {
+        let local = inv.transform_point3(corner.extend(0.0));
+        let local = Vec2::new(local.x, -local.y) * inv_units;
+        min = min.min(local);
+        max = max.max(local);
+    }
+    Some((min.x, max.x, min.y, max.y))
+}
+
 struct PanelText<'a> {
     entity: Entity,
     info: &'a TextLayoutInfo,
@@ -338,3 +403,41 @@ impl BitsParts for Vec2 {
 // `Node` keeps the query bounds aligned with the mirror's.
 #[allow(dead_code)]
 fn needs_node(_: &Node) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 文字可见区 = 面板 ∩ 条带视口，换算成面板中心为原点、y 朝下的逻辑像素；
+    /// 面板整个在视口外时返回 `None`（一个字都不画）。
+    #[test]
+    fn text_clip_bounds_follow_the_strip_viewport() {
+        let mut panel = WorldPanel {
+            units_to_world: 0.0018,
+            anchor: Transform::default(),
+            clip: None,
+        };
+        let cn = ComputedNode {
+            size: Vec2::new(200.0, 100.0),
+            ..default()
+        };
+        // 没有 clip：面板自身（和加 clip 之前的 ±panel_half 完全一致）。
+        let full = text_clip_bounds(&panel, &cn, 1.0).expect("有面积");
+        assert!((full.0 + 100.0).abs() < 1e-6 && (full.1 - 100.0).abs() < 1e-6);
+        assert!((full.2 + 50.0).abs() < 1e-6 && (full.3 - 50.0).abs() < 1e-6);
+
+        // 视口只留右半边（世界 x >= 0）：逻辑 x ∈ [0, 100]。
+        panel.clip = Some(Rect::new(0.0, -1.0, 1.0, 1.0));
+        let right_half = text_clip_bounds(&panel, &cn, 1.0).expect("右半边可见");
+        assert!(right_half.0.abs() < 1e-3, "左边界 = 面板中心");
+        assert!((right_half.1 - 100.0).abs() < 1e-3, "右边界 = 面板右边界");
+        assert!((right_half.2 + 50.0).abs() < 1e-3 && (right_half.3 - 50.0).abs() < 1e-3);
+
+        // 视口完全在面板外：None（不画任何字形）。
+        panel.clip = Some(Rect::new(5.0, 5.0, 6.0, 6.0));
+        assert!(
+            text_clip_bounds(&panel, &cn, 1.0).is_none(),
+            "面板整个滚出视口：文字一个都不画"
+        );
+    }
+}

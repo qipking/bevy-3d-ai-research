@@ -4,7 +4,9 @@
 > 拖拽 放置 自动整理（niri 排列工作区的方式重置工作区空间 pos 坐标）聚焦（无特殊动作只是隐藏
 > 其他工作区）」
 >
-> 这份文档把这句话翻译成数据结构与不变量。**它是当前唯一的布局目标**，比 `PLAN.md` 的旧条目优先。
+> 这份文档把这句话翻译成数据结构与不变量。**它是"工作区层"的唯一目标**，比 `PLAN.md` 的旧条目优先。
+> 条带**内部**的列宽/横向滚动几何按 [`NIRI_SCROLL.md`](../design/NIRI_SCROLL.md) 的 L1–L5 改造
+> （**L1 进行中**；本文 §5 的第 4 条不变量会被 L1 取代，见那里）。
 
 ## 1. 两个层级，各管一件事
 
@@ -19,7 +21,8 @@
 ```
 
 - **世界**负责：每个工作区（= 一个 agent 会话）放在哪、朝哪、是否可见。
-- **条带内部**负责：这个会话的界面怎么排——niri 的分裂树，全部是 tile。
+- **条带内部**负责：这个会话的界面怎么排——niri 的列 + 列内竖直分裂树，全部是 tile；
+  列宽/滚动见 `NIRI_SCROLL.md`。
 
 ## 2. 数据结构（`rig_niri`）
 
@@ -44,7 +47,9 @@ pub struct WorkspacePanels { /* PanelRows, PanelRoots, PanelSpawned, HashMap<Ent
 ```
 
 （2026-11-25 复核：上面是 `rig_niri/src/workspaces.rs:79`–`:150` 的实际形状。旧版本这里写的是
-`session: SessionId`、`items: Vec<Workspace>`、`focused: Option<SessionId>`，与代码不符。）
+`session: SessionId`、`items: Vec<Workspace>`、`focused: Option<SessionId>`，与代码不符。
+**L1 会改这里**：每个工作区加自己的 `Strip { columns, scroll }`，`tree` 退成"列内竖直分割"，
+见 `NIRI_SCROLL.md` §3.1/§3.5；L1 进行中，当前代码仍是 `tree` 一份几何。）
 
 每个 `Leaf(PanelId)` 的几何 = `tree.rects(area)` 算出的帧内矩形 → 乘 `pose` 变成世界坐标。
 **面板不存位置**，位置永远由「树 + 位姿」推导。
@@ -85,7 +90,9 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
    非聚焦工作区只是不再接受拖拽（抓取区域，`workspace_under_pointer`，`workspaces.rs:821`），
    画面照常显示、点选照常。
 3. `arrange_workspaces` 之后：顺序 = `order`、间距一致、x/z 为 0、朝向一致。
-4. 工作区内部：`rects()` 的叶子面积之和 = 条带面积（由 `layout.rs` 的测试保证，当前 24 个测试）。
+4. 工作区内部（**L1 之前**）：`rects()` 的叶子面积之和 = 条带面积（由 `layout.rs` 的测试保证，
+   当前 24 个测试）。**L1 起改成"列按视口比例累加 + 视口裁剪"**，这条被 `NIRI_SCROLL.md` §5 的
+   不变量 1–3 取代；L1 进行中，不要按这条写新测试。
 5. 相机在空间里任意移动，所有工作区位姿保持不变（世界坐标，不是相对相机）。
 6. 拖拽中其它工作区不动；拖拽结束位置被记住（不会自动弹回，除非调用整理）。
 
@@ -97,13 +104,15 @@ right. Workspaces are dynamic and arranged vertically.* —— 窗口往右排�
 - `Placement::Over`/`Within` 已全部删掉（`grep -r 'Placement::Over\|Placement::Within' rig_niri/src`
   为空），picker/确认/补全都是条带里的 tile；`Placement` 现在只剩 `Tree`/`Rest`。
 - 应用层 `rig_harness_in_3d` 现在是"装一个 `WorkspaceSet` + 相机 + 导航手势"
-  （`workspaces_demo.rs`，F1–F8 聚焦、F10 整理）。
+  （`workspaces_demo.rs`，F1–F8 聚焦、F10 整理；**这是 `workspaces_demo` 自己的编号，和
+  `FEATHERS_UI.md` 的 F1–F5 无关**）。
 
 ## 7. 分批（每批都能单独验收）
 
 > 2026-11-25 复核：五批均已完成（`WorkspacePanels` = 批 2，四个操作 = 批 3，
 > picker/确认 tile = 批 4，`workspaces_demo` 的 F1–F8/F10 = 批 5）。下表保留当时的分批与
-> 验收标准；“255 个测试”是当时的基线，现在 `rig_niri` 是 441（2026-11-25 22:50 实测，`cargo test -p rig_niri --offline` 全绿）。
+> 验收标准；“255 个测试”是当时的基线，现在 `rig_niri` 是 526（2026-11-26 00:5x 基线，`cargo test -p rig_niri --offline` 全绿；
+并行 L1 改动期间已到 528，以复跑为准）。
 
 | 批 | 内容 | 验收 |
 |---|---|---|
@@ -131,7 +140,7 @@ niri 的设计原则（`Development:-Design-Principles.md`）：
 | 右列顶部留白 | `PanelId::Spacer`（只吃空间，不画） | ✅ |
 | 键位提示行 | ✅ 独立 1 行 tile（`PanelId::Hints`，无内边距否则 1 行放不下 1 行字） | — |
 | 确认行（Ask） | ✅ 独立 tile（`PanelId::Confirm`，无 Ask 时 0 高度） | — |
-| picker | ✅ 条带**最右边新加一列**（打开时已有列等比缩到 2/3，关掉后逐字节复原） | — |
+| picker | ✅ 条带**最右边新加一列**（**当前实现**：打开时已有列等比缩到 2/3，关掉后逐字节复原） | **L1 改掉**：新列取自己的宽度、已有列一个字节不动（`NIRI_SCROLL.md` §2 不变量 1）。L1 进行中，别把"等比缩小"当目标 |
 
 **状态行/提示行已横跨整条**（2026-11-25 晚）：树的根改成竖 split——
 

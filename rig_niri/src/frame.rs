@@ -44,7 +44,9 @@ use crate::theme::{
     BAR_BG, CONFIRM_BG, FOCUS_BORDER, INPUT_BG, PANEL_BG, PANEL_BORDER as PANEL_BORDER_TOKEN,
     PANEL_RADIUS,
 };
-use crate::workspaces::{Workspace, WorkspacePanel, WorkspacePanels, WorkspaceSet};
+use crate::workspaces::{
+    Workspace, WorkspacePanel, WorkspacePanels, WorkspaceScroll, WorkspaceSet,
+};
 
 pub use crate::panels::PanelRoots;
 
@@ -396,6 +398,23 @@ pub fn lay_out(
     roots: &HashMap<PanelId, Entity>,
     screen: CellRect,
 ) -> HashMap<Entity, PanelArea> {
+    lay_out_scrolled(tree, panels, roots, screen, 0.0)
+}
+
+/// 同 [`lay_out`]，但把工作区条带按 `scroll_px`（**UI 像素**）横向滚动。
+///
+/// `scroll_px = 0` 时与 [`lay_out`] 逐字节相同。滚动只作用在包含
+/// [`PanelId::Transcript`] 的最外层横向条带上（`layout::Node::placements_scrolled`）：
+/// Hints/Status 这类条带之外的 chrome 行不动。`PanelArea` 的 `size` 永远是
+/// 面板自身的大小，滚动只改 `center`（以及从它推导的格子 `rect` 近似值），
+/// 越界部分交给 `feathers_in_3d::WorldPanel::clip` 裁剪。
+pub fn lay_out_scrolled(
+    tree: &LayoutNode,
+    panels: impl IntoIterator<Item = ToLayOut>,
+    roots: &HashMap<PanelId, Entity>,
+    screen: CellRect,
+    scroll_px: f32,
+) -> HashMap<Entity, PanelArea> {
     let panels: Vec<ToLayOut> = panels.into_iter().collect();
 
     let frame_tile = TileRect {
@@ -403,7 +422,11 @@ pub fn lay_out(
         size: Vec2::new(f32::from(screen.w), f32::from(screen.h)) * CELL * UNITS_TO_WORLD,
     };
     let mut out: HashMap<Entity, PanelArea> = HashMap::new();
-    for (id, tile, _container) in tree.placements(frame_tile) {
+    for (id, tile, _container) in tree.placements_scrolled(
+        frame_tile,
+        PanelId::Transcript,
+        scroll_px,
+    ) {
         let Some(entity) = roots.get(&id).copied() else {
             continue;
         };
@@ -567,12 +590,12 @@ pub fn lay_out_frame(
     tree: Option<Res<FrameTree>>,
     set: Option<Res<WorkspaceSet>>,
     panels: Query<(Entity, &FramePanel, Option<&WorkspacePanel>)>,
-    mut workspaces: Query<(&Workspace, &mut WorkspacePanels)>,
+    mut workspaces: Query<(&Workspace, &mut WorkspacePanels, Option<&WorkspaceScroll>)>,
 ) {
     if let Some(set) = set.as_deref().filter(|set| !set.items.is_empty()) {
         let mut focused_areas = None;
         for workspace_entity in &set.items {
-            let Ok((workspace, mut stored)) = workspaces.get_mut(*workspace_entity) else {
+            let Ok((workspace, mut stored, scroll)) = workspaces.get_mut(*workspace_entity) else {
                 continue;
             };
             let focused = set.focused == Some(*workspace_entity);
@@ -589,7 +612,13 @@ pub fn lay_out_frame(
                         inset: panel.inset,
                     })
             });
-            let next = lay_out(want_tree, to_lay_out, want_roots, size.screen());
+            let next = lay_out_scrolled(
+                want_tree,
+                to_lay_out,
+                want_roots,
+                size.screen(),
+                scroll.map_or(0.0, |scroll| scroll.scroll),
+            );
             if stored.areas != next {
                 stored.areas = next.clone();
             }
@@ -633,6 +662,25 @@ fn area_center_px(area: &PanelArea, frame_px: Vec2) -> Vec2 {
                 - (f32::from(area.rect.y) + f32::from(area.rect.h) * 0.5) * CELL.y,
         )
     })
+}
+
+/// 一个工作区条带的**视口矩形**（世界坐标，轴对齐）：帧的四个角经
+/// `pose` 变换后的 AABB。
+///
+/// 工作区只做平移（自动整理/拖拽都不转），所以 AABB 就是精确的视口；即使
+/// 以后允许旋转，`WorldPanel::clip` 的定义也是"世界坐标、轴对齐"，AABB 仍然
+/// 是正确口径。`units` 用 [`FrameGeometry::units_to_world`]（和 `WorldPanel`
+/// 的换算一致），`center` 是帧中心在世界里的偏移。
+fn workspace_viewport(pose: &Transform, frame_px: Vec2, units: f32, center: Vec3) -> Rect {
+    let half = frame_px * 0.5 * units;
+    let mut min = Vec2::splat(f32::INFINITY);
+    let mut max = Vec2::splat(f32::NEG_INFINITY);
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let world = pose.transform_point(center + Vec3::new(half.x * sx, half.y * sy, 0.0));
+        min = min.min(world.truncate());
+        max = max.max(world.truncate());
+    }
+    Rect::from_corners(min, max)
 }
 
 /// 把格子区域落到每块面板的 `Node` 尺寸与 `WorldPanel` 锚点上。
@@ -695,6 +743,24 @@ pub fn place_panels(
             if world.units_to_world != geometry.units_to_world {
                 world.units_to_world = geometry.units_to_world;
             }
+            // 条带视口裁剪：面板不再画到本工作区条带之外（picker 列伸出视口
+            // 右边时尤其重要，否则会压到隔壁工作区上）。scroll = 0 时面板本来
+            // 就在视口里，`面板 ∩ 视口 == 面板自身矩形`，画面逐像素不变。
+            //
+            // 这里给**所有**工作区面板（含 Hints/Status/Input/Confirm 这些
+            // chrome）都填 `Some(视口)`，不填 `None`：chrome 本来就在视口内，
+            // 交集等于自身、没有视觉变化；这样任何面板（包括跟着条带滚动的
+            // 右列）都不可能画到视口外。`None` 只留给没有工作区概念的旧单屏
+            // 路径（见本函数末尾）。
+            let viewport = workspace_viewport(
+                &workspace.pose,
+                frame_px,
+                geometry.units_to_world,
+                geometry.center,
+            );
+            if world.clip != Some(viewport) {
+                world.clip = Some(viewport);
+            }
             match layer {
                 Some(mut layer) => {
                     if layer.0 != want_layer {
@@ -734,6 +800,10 @@ pub fn place_panels(
         }
         if world.units_to_world != geometry.units_to_world {
             world.units_to_world = geometry.units_to_world;
+        }
+        // 没有工作区（旧单屏路径）：不额外裁剪，保持旧行为逐字节不变。
+        if world.clip.is_some() {
+            world.clip = None;
         }
         match layer {
             Some(mut layer) => {
@@ -781,7 +851,7 @@ pub(crate) fn default_screen_panels(
         FramePanel::tree().inset(PanelInset::THIN),
         Look::panel(BAR_BG, PANEL_BORDER_TOKEN).justify(JustifyContent::Center),
     );
-    // 转写：左列（Proportion 2，占 2/3 宽）。
+    // 转写：主体行左列（Fraction 0.62，占视口宽的 62%）。
     let transcript = spawn(
         commands,
         PanelId::Transcript,
@@ -1015,6 +1085,8 @@ pub fn spawn_panel(
         WorldPanel {
             units_to_world: UNITS_TO_WORLD,
             anchor: Transform::default(),
+            // 由 `place_panels` 按工作区条带视口每帧填。
+            clip: None,
         },
         WorldLayer(panel.layer),
         MirrorRoot,
@@ -1237,8 +1309,8 @@ mod tests {
         .collect()
     }
 
-    /// 默认屏幕（分裂树）：96×28 里，转写占左 64 列；右 32 列上面是输入、
-    /// 下面是状态（2 行贴底）。
+    /// 默认屏幕（分裂树）：96×28 里，转写占视口宽的 62%（取整 60 列）；右列
+    /// 38%（36 列）上面是输入、下面是状态（2 行贴底）。
     #[test]
     fn default_screen_is_a_split_tree() {
         let (input, status, transcript) = (entity(0), entity(1), entity(2));
@@ -1257,14 +1329,18 @@ mod tests {
             ],
             &roots,
         );
-        assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 64, 25));
+        assert_eq!(areas[&transcript.index_u32()].rect, CellRect::new(0, 0, 60, 25));
         // 右列：顶部留白 + 补全(0) + 输入(固定 4 行) + 状态(2 行) 贴底。
-        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
+        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(60, 21, 36, 4));
         assert_eq!(areas[&status.index_u32()].rect, CellRect::new(0, 26, 96, 2));
         // 精确中心来自树的 TileRect（不是格子取整后的矩形）。
-        // 精确中心来自树的 TileRect：转写占上半部分（25 行），所以 y 中心不再是 0。
+        // 转写精确宽度 = 0.62 × 96 = 59.52 列，中心 x = 59.52/2 - 48 = -18.24 列。
         let center = areas[&transcript.index_u32()].center.expect("树给精确中心");
-        assert!((center.x - -16.0 * CELL.x).abs() < 1e-3);
+        assert!(
+            (center.x - -18.24 * CELL.x).abs() < 1e-3,
+            "center.x = {}",
+            center.x
+        );
         assert!((center.y - 1.5 * CELL.y).abs() < 1e-3, "y = {}", center.y);
     }
 
@@ -1419,7 +1495,7 @@ mod tests {
         );
         assert_eq!(areas[&status.index_u32()].rect, CellRect::new(0, 26, 96, 2));
         // 输入与状态之间现在夹着 1 行键位提示（它也是 tile）。
-        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(64, 21, 32, 4));
+        assert_eq!(areas[&input.index_u32()].rect, CellRect::new(60, 21, 36, 4));
         assert_eq!(
             areas[&input.index_u32()].rect.bottom(),
             areas[&status.index_u32()].rect.y - 1,
@@ -1476,25 +1552,30 @@ mod tests {
         let complete = roots.entity(PanelId::Complete).expect("补全面板");
         let areas = app.world().resource::<PanelAreas>();
         assert_eq!(areas.0.len(), 6, "六块面板都由树放好（留白叶子没有面板）");
-        assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 64, 25));
+        assert_eq!(areas.get(transcript).expect("转写区域").rect, CellRect::new(0, 0, 60, 25));
         assert_eq!(areas.get(status).expect("状态区域").rect, CellRect::new(0, 26, 96, 2));
         // 补全 tile 关着：0 高度，但仍然有区域（这样每帧都能把它写成 0 高）。
         let closed = areas.get(complete).expect("补全区域");
-        assert_eq!(closed.rect, CellRect::new(64, 21, 32, 0), "补全贴输入上方");
+        assert_eq!(closed.rect, CellRect::new(60, 21, 36, 0), "补全贴输入上方");
         assert!(closed.is_empty());
 
         // `Node` 尺寸 = 树给的精确像素；3D 锚点 = 树给的精确中心（不是格子中心）。
         let node = app.world().get::<Node>(transcript).expect("Node");
         match (node.width, node.height) {
             (bevy_ui::Val::Px(width), bevy_ui::Val::Px(height)) => {
-                assert!((width - 64.0 * CELL.x).abs() < 1e-3, "width = {width}");
+                assert!(
+                    (width - crate::layout::TRANSCRIPT_COLUMN_FRACTION * 96.0 * CELL.x)
+                        .abs()
+                        < 1e-3,
+                    "width = {width}"
+                );
                 // 转写只占上半部分 25 行（下面两条横跨的 tile 各占 1/2 行）。
                 assert!((height - 25.0 * CELL.y).abs() < 1e-3, "height = {height}");
             }
             other => panic!("Node 尺寸应当是像素：{other:?}"),
         }
         let world = app.world().get::<WorldPanel>(transcript).expect("WorldPanel");
-        let want_x = -16.0 * CELL.x * UNITS_TO_WORLD;
+        let want_x = -18.24 * CELL.x * UNITS_TO_WORLD;
         assert!(
             (world.anchor.translation.x - want_x).abs() < 1e-5,
             "anchor.x = {}",
@@ -1532,11 +1613,11 @@ mod tests {
             &roots,
         );
         let tile = areas[&complete.index_u32()];
-        assert_eq!(tile.rect, CellRect::new(64, 21, 32, 0), "补全贴输入上方");
+        assert_eq!(tile.rect, CellRect::new(60, 21, 36, 0), "补全贴输入上方");
         assert!(tile.is_empty(), "0 高度的 tile 这一帧没有文字区");
         assert_eq!(
             areas[&input.index_u32()].rect,
-            CellRect::new(64, 21, 32, 4),
+            CellRect::new(60, 21, 36, 4),
             "关着的 tile 不挤输入（输入固定 4 行贴底）"
         );
     }
@@ -1859,9 +1940,13 @@ mod tests {
             .resource::<PanelAreas>()
             .get(transcript)
             .expect("转写区域");
-        assert_eq!(before.rect, CellRect::new(0, 0, 109, 41));
+        // 0.62 × 164 = 101.68 列，CellRect 取整成 102。
+        assert_eq!(before.rect, CellRect::new(0, 0, 102, 41));
         assert!(
-            (node_width(&app, transcript) - 2.0 / 3.0 * 164.0 * CELL.x).abs() < 1e-3,
+            (node_width(&app, transcript)
+                - crate::layout::TRANSCRIPT_COLUMN_FRACTION * 164.0 * CELL.x)
+                .abs()
+                < 1e-3,
             "Node 宽度 = 树的精确像素"
         );
 
@@ -1878,13 +1963,17 @@ mod tests {
             .resource::<PanelAreas>()
             .get(transcript)
             .expect("转写区域");
-        assert_eq!(after.rect, CellRect::new(0, 0, 68, 30));
+        // 0.62 × 102 = 63.24 列，CellRect 取整成 63。
+        assert_eq!(after.rect, CellRect::new(0, 0, 63, 30));
         assert!(
             after.rect.w < before.rect.w && after.rect.h < before.rect.h,
             "面板 rect 必须跟着变小：{before:?} -> {after:?}"
         );
         assert!(
-            (node_width(&app, transcript) - 68.0 * CELL.x).abs() < 1e-3,
+            (node_width(&app, transcript)
+                - crate::layout::TRANSCRIPT_COLUMN_FRACTION * 102.0 * CELL.x)
+                .abs()
+                < 1e-3,
             "Node 宽度跟着树重算"
         );
     }

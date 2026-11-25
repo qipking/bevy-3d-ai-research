@@ -1788,6 +1788,7 @@ mod wiring_tests {
                 WorldPanel {
                     units_to_world: crate::frame::UNITS_TO_WORLD,
                     anchor: Transform::default(),
+                    clip: None,
                 },
                 // 800px 宽、没有边框/内边距：一行从 x = -400 开始。
                 ComputedNode {
@@ -2029,6 +2030,7 @@ mod wiring_tests {
         let panel = WorldPanel {
             units_to_world: crate::frame::UNITS_TO_WORLD,
             anchor: Transform::from_xyz(1.5, -2.0, 3.0),
+            clip: None,
         };
         let pixels = Vec2::new(-400.0, 12.0);
         let world = panel.anchor.transform_point(Vec3::new(

@@ -50,6 +50,37 @@ pub struct WorldPanel {
     /// `inverse_scale_factor` 回到逻辑像素（见本文件上方的换算说明）。
     pub units_to_world: f32,
     pub anchor: Transform,
+    /// 额外的**世界坐标、轴对齐**裁剪矩形（工作区条带的视口）。
+    ///
+    /// `None` = 不额外裁剪（面板自身矩形就是全部）；`Some(rect)` 时镜像的
+    /// 材质/文字都只画 `面板自身矩形 ∩ rect` 里的部分。面板**不**会因为完全
+    /// 在 `rect` 外而被 despawn：交集为空时材质宽/高为 0（shader 丢弃所有片元，
+    /// 不会 panic），实体还在，滚回来就能重新看见。
+    pub clip: Option<Rect>,
+}
+
+/// 面板在世界里的**轴对齐**包围盒（`anchor` 是面板中心，`size` 是世界米尺寸）。
+///
+/// 工作区通常只平移（轴对齐 = 面板自身矩形）；锚点带旋转/缩放时取真实的
+/// 世界 AABB，裁剪只可能多留一些空角，不会把面板还看得见的部分误裁掉。
+pub fn panel_world_rect(anchor: &Transform, size: Vec2) -> Rect {
+    let half = size * 0.5;
+    let matrix = anchor.to_matrix();
+    let axis_x = matrix.transform_vector3(Vec3::X).truncate();
+    let axis_y = matrix.transform_vector3(Vec3::Y).truncate();
+    let world_half = (axis_x * half.x).abs() + (axis_y * half.y).abs();
+    Rect::from_center_size(anchor.translation.truncate(), world_half * 2.0)
+}
+
+/// 有效裁剪矩形 = 面板自身矩形 ∩ `clip`（`None` 时就是面板自身）。
+///
+/// 这是一个纯函数：完全在视口外时返回**空矩形**（`is_empty()` 为真，
+/// `min == max`，宽/高都是 0），没有 panic 路径。材质要的正是这个矩形。
+pub fn effective_clip(panel: Rect, clip: Option<Rect>) -> Rect {
+    match clip {
+        Some(clip) => panel.intersect(clip),
+        None => panel,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +135,14 @@ pub struct PanelNode {
     pub cached_border: Vec4,
     pub cached_radius: Vec4,
     pub cached_border_width: f32,
+    /// 上次写进材质的裁剪 uniform；`clip` 或面板位置变化时据此重写。
+    pub cached_clip: Option<ClipUniform>,
 }
+
+/// 材质裁剪的 uniform 三元组：世界→裁剪空间矩阵前两行 + 半尺寸（世界米）。
+///
+/// 见 [`panel_clip_uniform`]；`None` 表示这一帧还没算过。
+pub type ClipUniform = (Vec4, Vec4, Vec2);
 
 /// One mirrored [`Outline`] ring (feathers' focus indicator uses `Outline`).
 ///
@@ -120,6 +158,8 @@ pub struct PanelOutlineNode {
     pub cached_color: Vec4,
     pub cached_radius: Vec4,
     pub cached_width: f32,
+    /// 上次写进材质的裁剪 uniform（和 [`PanelNode::cached_clip`] 同口径）。
+    pub cached_clip: Option<ClipUniform>,
 }
 
 /// [`outline_to_world`] 的结果（世界米），纯数据方便测试。
@@ -209,7 +249,7 @@ pub fn sync_mirror(
     // out against the same target and therefore shares it. Mirror geometry is built in
     // *logical* pixels, so all `ComputedNode`/`UiGlobalTransform` values (which bevy
     // reports in physical pixels) go through these helpers.
-    let panel_map: HashMap<Entity, (f32, Transform, u16, f32)> = panels
+    let panel_map: HashMap<Entity, (f32, Transform, u16, f32, Option<Rect>)> = panels
         .iter()
         .map(|(e, p, layer)| {
             let inverse_scale_factor = all_nodes
@@ -222,6 +262,7 @@ pub fn sync_mirror(
                     p.anchor,
                     layer.map_or(0, |l| l.0),
                     inverse_scale_factor,
+                    p.clip,
                 ),
             )
         })
@@ -231,24 +272,20 @@ pub fn sync_mirror(
     }
 
     // Per-panel clip: UI subtree content is clipped to the panel's own box, which is what a
-    // transcript needs once it scrolls. The material clips in *panel-local* space, so the
-    // uniform rows are the rows of the panel's world -> local matrix.
-    let mut panel_clip: HashMap<Entity, (Vec4, Vec4, Vec2)> = HashMap::new();
+    // transcript needs once it scrolls. A panel may additionally carry a strip viewport
+    // (`WorldPanel::clip`, world-axis-aligned); the effective clip is the intersection.
+    let mut panel_clip: HashMap<Entity, ClipUniform> = HashMap::new();
     for root in panel_map.keys() {
         let Ok((_, cn, _, _, _, _)) = all_nodes.get(*root) else {
             continue;
         };
-        let (units, anchor, _, inverse_scale_factor) = panel_map
+        let (units, anchor, _, inverse_scale_factor, clip) = panel_map
             .get(root)
             .copied()
-            .unwrap_or((0.001, Transform::default(), 0, 1.0));
-        let inv = anchor.to_matrix().inverse();
-        let m = inv.to_cols_array_2d();
-        let row0 = Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]);
-        let row1 = Vec4::new(m[0][1], m[1][1], m[2][1], m[3][1]);
+            .unwrap_or((0.001, Transform::default(), 0, 1.0, None));
         // bounds are in the *clip space* the shader works in: metres, not UI pixels
         let half = physical_size_to_world(cn.size * 0.5, inverse_scale_factor, units);
-        panel_clip.insert(*root, (row0, row1, half));
+        panel_clip.insert(*root, panel_clip_uniform(&anchor, half, clip));
     }
 
     // Depth-first pre-order gives every node a painter index: a node always comes
@@ -267,12 +304,12 @@ pub fn sync_mirror(
                 }
             }
         }
-        let layer = panel_map.get(root).map_or(0, |(_, _, layer, _)| *layer);
+        let layer = panel_map.get(root).map_or(0, |(_, _, layer, _, _)| *layer);
         let layer_bias = layer as f32 * LAYER_BIAS;
         panel_max_bias.insert(*root, layer_bias + order.saturating_sub(1) as f32 * SORT_STEP);
     }
     for (root, max_bias) in panel_max_bias {
-        let layer = panel_map.get(&root).map_or(0, |(_, _, layer, _)| *layer);
+        let layer = panel_map.get(&root).map_or(0, |(_, _, layer, _, _)| *layer);
         commands.entity(root).insert(PanelSortRange { max_bias, layer });
     }
 
@@ -287,11 +324,12 @@ pub fn sync_mirror(
     }
 
     for (node, (panel_root, depth, order)) in in_panel.iter() {
-        let Some((units_to_world, anchor, layer, inverse_scale_factor)) =
+        let Some((units_to_world, anchor, layer, inverse_scale_factor, _)) =
             panel_map.get(panel_root).copied()
         else {
             continue;
         };
+        let clip = panel_clip.get(panel_root).copied();
         let layer_bias = layer as f32 * LAYER_BIAS;
         let Ok((entity, cn, ugt, bg, border_color, outline)) = all_nodes.get(*node) else {
             continue;
@@ -367,9 +405,10 @@ pub fn sync_mirror(
                         if node3d.cached_color != wanted.color
                             || node3d.cached_radius != wanted.radius
                             || !(node3d.cached_width - wanted.width).abs().lt(&1e-9)
+                            || node3d.cached_clip != clip
                         {
                             if let Some(mut mat) = materials.get_mut(&node3d.material) {
-                                apply_panel_clip(&mut mat, panel_clip.get(panel_root));
+                                apply_panel_clip(&mut mat, clip.as_ref());
                                 mat.color = LinearRgba::NONE.to_vec4();
                                 mat.border_color = wanted.color;
                                 mat.radius = wanted.radius;
@@ -379,15 +418,14 @@ pub fn sync_mirror(
                                 node3d.cached_color = wanted.color;
                                 node3d.cached_radius = wanted.radius;
                                 node3d.cached_width = wanted.width;
+                                node3d.cached_clip = clip;
                             }
                         }
                     }
                 }
                 None => {
-                    let (clip_row0, clip_row1, clip_half) = panel_clip
-                        .get(panel_root)
-                        .copied()
-                        .unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
+                    let (clip_row0, clip_row1, clip_half) =
+                        clip.unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
                     let material = UNodeMaterial3d {
                         clip_inv_x: [clip_row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
                         clip_inv_y: [clip_row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
@@ -417,6 +455,7 @@ pub fn sync_mirror(
                             cached_color: wanted.color,
                             cached_radius: wanted.radius,
                             cached_width: wanted.width,
+                            cached_clip: clip,
                         },
                         Mesh3d(mesh),
                         MeshMaterial3d(material),
@@ -463,9 +502,10 @@ pub fn sync_mirror(
                 || node3d.cached_border != border4
                 || node3d.cached_radius != radius_vec
                 || !(node3d.cached_border_width - b_width).abs().lt(&1e-9)
+                || node3d.cached_clip != clip
             {
                 if let Some(mut mat) = materials.get_mut(&node3d.material) {
-                    apply_panel_clip(&mut mat, panel_clip.get(panel_root));
+                    apply_panel_clip(&mut mat, clip.as_ref());
                     mat.color = color4;
                     mat.border_color = border4;
                     mat.radius = radius_vec;
@@ -476,13 +516,12 @@ pub fn sync_mirror(
                     node3d.cached_border = border4;
                     node3d.cached_radius = radius_vec;
                     node3d.cached_border_width = b_width;
+                    node3d.cached_clip = clip;
                 }
             }
         } else {
-            let (clip_row0, clip_row1, clip_half) = panel_clip
-                .get(panel_root)
-                .copied()
-                .unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
+            let (clip_row0, clip_row1, clip_half) =
+                clip.unwrap_or((Vec4::ZERO, Vec4::ZERO, Vec2::ZERO));
             let material = UNodeMaterial3d {
                 clip_inv_x: [clip_row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
                 clip_inv_y: [clip_row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO],
@@ -513,6 +552,7 @@ pub fn sync_mirror(
                     cached_border: border4,
                     cached_radius: radius_vec,
                     cached_border_width: b_width,
+                    cached_clip: clip,
                 },
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
@@ -526,8 +566,49 @@ pub fn sync_mirror(
     }
 }
 
+/// 面板的材质裁剪 uniform（节点与 Outline 环共用）。
+///
+/// * `clip = None`：旧口径——裁剪空间 = 面板局部坐标（世界→局部矩阵前两行），
+///   原点在面板中心，半尺寸 = 面板半宽高；与加 `clip` 字段前逐字节一致。
+/// * `clip = Some(rect)`：裁剪空间 = 世界坐标平移到"有效裁剪矩形"的中心
+///   （世界轴对齐），半尺寸 = `面板 ∩ rect` 的一半。完全在视口外时半尺寸
+///   为 0（shader 会丢弃所有片元，不 panic），面板实体仍然存在。
+/// * 视口把面板整个包住（scroll = 0、没有伸出列）时退回旧口径：材质 uniform
+///   与旧实现逐字节相同，画面不差一像素。
+fn panel_clip_uniform(anchor: &Transform, half: Vec2, clip: Option<Rect>) -> ClipUniform {
+    let local = || {
+        let m = anchor.to_matrix().inverse().to_cols_array_2d();
+        (
+            Vec4::new(m[0][0], m[1][0], m[2][0], m[3][0]),
+            Vec4::new(m[0][1], m[1][1], m[2][1], m[3][1]),
+            half,
+        )
+    };
+    let Some(clip) = clip else {
+        return local();
+    };
+    let panel = panel_world_rect(anchor, half * 2.0);
+    // 视口完整包住面板：交集就是面板自身，用旧口径（逐字节不变）。
+    if clip.contains(panel.min) && clip.contains(panel.max) {
+        return local();
+    }
+    let effective = effective_clip(panel, Some(clip));
+    let center = effective.center();
+    // 空交集：半尺寸 0；shader 的 clip_bounds.xy 为 0，所有片元都被丢弃。
+    let half = if effective.is_empty() {
+        Vec2::ZERO
+    } else {
+        effective.half_size()
+    };
+    (
+        Vec4::new(1.0, 0.0, 0.0, -center.x),
+        Vec4::new(0.0, 1.0, 0.0, -center.y),
+        half,
+    )
+}
+
 /// 把面板的裁剪 uniform 写进材质（节点与 Outline 环共用）。
-fn apply_panel_clip(mat: &mut UNodeMaterial3d, clip: Option<&(Vec4, Vec4, Vec2)>) {
+fn apply_panel_clip(mat: &mut UNodeMaterial3d, clip: Option<&ClipUniform>) {
     if let Some((row0, row1, half)) = clip {
         mat.clip_inv_x = [*row0, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
         mat.clip_inv_y = [*row1, Vec4::ZERO, Vec4::ZERO, Vec4::ZERO];
@@ -679,6 +760,7 @@ mod tests {
                 WorldPanel {
                     units_to_world: UNITS,
                     anchor: Transform::from_xyz(0.0, 0.0, -1.0),
+                    clip: None,
                 },
                 WorldLayer(0),
                 Node::default(),
@@ -761,6 +843,102 @@ mod tests {
         assert!(
             world.get_entity(ring_entity).is_err(),
             "没有 Outline 的节点不该留着环"
+        );
+    }
+
+    // ---- 条带视口裁剪（L2） ----
+
+    /// 有效裁剪 = 面板 ∩ clip；`None` 就是面板自身；完全在外时是空矩形。
+    #[test]
+    fn effective_clip_is_the_panel_intersect_the_viewport() {
+        let panel = Rect::new(-1.0, -0.5, 1.0, 0.5);
+        assert_eq!(effective_clip(panel, None), panel, "None = 不额外裁剪");
+
+        let viewport = Rect::new(0.0, -1.0, 2.0, 1.0);
+        assert_eq!(
+            effective_clip(panel, Some(viewport)),
+            Rect::new(0.0, -0.5, 1.0, 0.5),
+            "左半边被裁掉"
+        );
+
+        // 完全在视口外：空矩形（min == max），不会 panic。
+        let outside = Rect::new(5.0, 5.0, 6.0, 6.0);
+        let empty = effective_clip(panel, Some(outside));
+        assert!(empty.is_empty(), "无交集要塌成空矩形：{empty:?}");
+        assert_eq!(empty.size(), Vec2::ZERO);
+
+        // 空交集也能算出材质 uniform：半尺寸 0 = shader 丢弃所有片元。
+        let (row0, row1, half) =
+            panel_clip_uniform(&Transform::default(), Vec2::new(1.0, 0.5), Some(outside));
+        assert_eq!(half, Vec2::ZERO);
+        assert_eq!(row0, Vec4::new(1.0, 0.0, 0.0, -1.0), "裁剪空间原点塌到面板角");
+        assert_eq!(row1, Vec4::new(0.0, 1.0, 0.0, -0.5));
+    }
+
+    /// ECS 级：`sync_mirror` 把材质裁剪设成 `面板 ∩ WorldPanel::clip`；
+    /// 面板整个滚出视口时仍然存在（不 despawn），材质宽/高为 0。
+    #[test]
+    fn sync_mirror_clips_the_material_to_the_strip_viewport() {
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<UNodeMaterial3d>::default());
+
+        let panel = world
+            .spawn((
+                MirrorRoot,
+                WorldPanel {
+                    units_to_world: UNITS,
+                    anchor: Transform::default(),
+                    // 面板世界矩形 x ∈ [-0.18, 0.18]；视口只留右半边。
+                    clip: Some(Rect::new(0.0, -1.0, 1.0, 1.0)),
+                },
+                WorldLayer(0),
+                Node::default(),
+                ComputedNode {
+                    size: Vec2::new(200.0, 100.0),
+                    ..default()
+                },
+                UiGlobalTransform::default(),
+                BackgroundColor(Color::WHITE),
+            ))
+            .id();
+
+        world.run_system_once(sync_mirror).unwrap();
+        let node = world.get::<PanelNode>(panel).expect("有底色就有填充 mesh");
+        let material = world
+            .resource::<Assets<UNodeMaterial3d>>()
+            .get(&node.material)
+            .expect("材质");
+        assert!(
+            (material.clip_bounds[0] - Vec4::new(0.09, 0.09, 1.0, 0.0)).length() < 1e-6,
+            "可见半尺寸 = 交集的一半：{:?}",
+            material.clip_bounds[0]
+        );
+        assert!(
+            (material.clip_inv_x[0] - Vec4::new(1.0, 0.0, 0.0, -0.09)).length() < 1e-6,
+            "裁剪空间 x 原点在 0.09（交集中心）：{:?}",
+            material.clip_inv_x[0]
+        );
+        assert!(
+            (material.clip_inv_y[0] - Vec4::new(0.0, 1.0, 0.0, -0.0)).length() < 1e-6,
+            "y 方向视口完整包住面板：{:?}",
+            material.clip_inv_y[0]
+        );
+
+        // 滚出视口：面板还在，材质裁剪塌成 0×0（不 panic）。
+        world.get_mut::<WorldPanel>(panel).unwrap().clip =
+            Some(Rect::new(5.0, 5.0, 6.0, 6.0));
+        world.run_system_once(sync_mirror).unwrap();
+        assert!(world.get_entity(panel).is_ok(), "滚出去不 despawn");
+        let node = world.get::<PanelNode>(panel).expect("mesh 还在");
+        let material = world
+            .resource::<Assets<UNodeMaterial3d>>()
+            .get(&node.material)
+            .expect("材质");
+        assert_eq!(
+            material.clip_bounds[0],
+            Vec4::new(0.0, 0.0, 1.0, 0.0),
+            "空交集：可见尺寸 0×0"
         );
     }
 }

@@ -233,6 +233,7 @@ pub fn spawn_card_sized(
             WorldPanel {
                 units_to_world: UNITS_TO_WORLD,
                 anchor: Transform::default(),
+                clip: None,
             },
             WorldLayer(0),
             MirrorRoot,

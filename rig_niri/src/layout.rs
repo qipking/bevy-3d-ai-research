@@ -13,19 +13,26 @@
 //!
 //! * 同层相邻两个子之间恰好留 [`Node::Split::gap`] 的缝；
 //! * 每个子沿切分轴的长度由 [`Size`] 决定：
-//!   * [`Size::Proportion`]：按权重分**去掉固定尺寸和缝之后剩下的空间**；
+//!   * [`Size::Fraction`]：**相对视口**的宽度（niri 的列宽）。`Fraction(0.62)`
+//!     永远等于 `0.62 × 区域宽`，不参与 leftover 分配、不随兄弟数量变化；
+//!     只用于 [`Split::Horizontal`] 的列（竖直方向仍用 `Proportion` 分高度）。
+//!   * [`Size::Proportion`]：按权重分**去掉固定尺寸和缝之后剩下的空间**
+//!     （旧的"同层份额"语义，保留给竖直方向的高度分配）；
 //!   * [`Size::Fixed`]：固定的 **UI 像素**（见 [`PX_TO_METERS`]），
 //!     输入框 4 格、状态行 2 格这种"几行字"的量就用它；
-//! * 用累计坐标算边界、**最后一个子把右/下边贴到区域边上**，吃掉浮点舍入误差，
-//!   所以叶子之间既不重叠也不留缝（和 `niri.rs::column_edges` 同一做法）。
+//! * 水平方向按**累计 x 从左往右**摆列：`Fraction` 列之后可以超出区域右边界，
+//!   超出就是超出（下一层 `scroll` 才会把它滚进来）。旧的比例/固定布局（没有
+//!   `Fraction` 子）仍把最后一个子贴到区域右边，吃掉浮点舍入误差。
 //!
 //! 一个 split 若没有比例子，剩余空间给**第一个子**（主区域）。这条规则让
 //! 只有固定子的列也能铺满：第一个子吃掉剩余，后面的固定子保持精确。
 //! `default_tree` 的右列则把输入写成比例子（补全 tile 的 0/6 行是固定子，
-//! 输入拿剩下的），所以补全打开/关闭时右列总高都精确不变。
+//! 输入拿剩下的），所以补全打开/关闭时右列总高都精确不变。含 `Fraction` 的
+//! 水平 split 不套用这条：列各有自己的宽度，剩下的空间就是空着。
 //!
-//! 条带最右边加一列（picker）用 [`Node::append_column`]：新列占 1/3，已有列
-//! 按同一因子等比缩小；[`Node::remove_column`] 摘掉它，树逐字节复原。
+//! 条带最右边加一列（picker）用 [`Node::append_column`]：新列拿
+//! [`DEFAULT_COLUMN_FRACTION`] 的视口宽，**已有列的宽度和 x 一个字节都不动**；
+//! [`Node::remove_column`] 摘掉它，树逐字节复原。
 //!
 //! 3D 坐标：区域用 [`TileRect`]（米，原点在帧中心，y 朝上）。第一块子区域在
 //! 上/左，第二块在下/右。
@@ -50,6 +57,21 @@ pub const DEFAULT_GAP: f32 = 6.0;
 /// 不留缝。
 pub const NO_GAP: f32 = 0.0;
 
+/// 新开一列的默认宽度：**视口宽的比例**（niri 的默认 `proportion 0.5`）。
+///
+/// 新列拿这个宽度，已有列的宽度/x 不变；条带比视口宽的部分留给下一步的
+/// `scroll`（L2）。
+pub const DEFAULT_COLUMN_FRACTION: f32 = 0.5;
+
+/// `default_tree` 主体行里转写列的宽度（相对视口）。
+pub const TRANSCRIPT_COLUMN_FRACTION: f32 = 0.62;
+
+/// `default_tree` 主体行里右列（Spacer/Confirm/Complete/Input）的宽度（相对视口）。
+///
+/// 和 [`TRANSCRIPT_COLUMN_FRACTION`] 相加为 1，默认屏幕仍然正好铺满视口；
+/// 取值接近旧的 2:1 比例。
+pub const RIGHT_COLUMN_FRACTION: f32 = 0.38;
+
 /// 切分方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Split {
@@ -62,9 +84,17 @@ pub enum Split {
 /// 子区域沿切分轴要占多少。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size {
+    /// **相对视口**的宽度：`f = 1.0` 是整条视口宽，`0.62` 永远等于视口宽的 62%。
+    ///
+    /// 只用于 [`Split::Horizontal`] 的列：它不参与 leftover 分配，兄弟数量再多
+    /// 也不会把它挤窄；累计到区域右边界之外就是超出（滚动见 `NIRI_SCROLL.md`
+    /// 的 L2）。竖直方向没有"列宽"的概念，右列内部仍用 [`Size::Proportion`]
+    /// 分高度。
+    Fraction(f32),
     /// 相对同层兄弟的比例：权重 / 同层所有比例权重之和。
     ///
-    /// 它分的是"区域去掉固定尺寸和 gap 之后剩下的空间"。
+    /// 它分的是"区域去掉固定尺寸和 gap 之后剩下的空间"。旧的 share 语义保留
+    /// （`default_tree` 根竖 split 与右列内部的竖直分配仍用它）。
     Proportion(f32),
     /// 固定 **UI 像素**（会按 [`PX_TO_METERS`] 换算成米）。
     ///
@@ -87,6 +117,11 @@ impl Child {
     /// 比例子的便捷构造。
     pub fn proportion(weight: f32, node: Node) -> Self {
         Self::new(Size::Proportion(weight), node)
+    }
+
+    /// 按视口比例定宽的列（见 [`Size::Fraction`]）。
+    pub fn fraction(fraction: f32, node: Node) -> Self {
+        Self::new(Size::Fraction(fraction), node)
     }
 
     /// 固定尺寸子的便捷构造（UI 像素）。
@@ -194,17 +229,87 @@ impl Node {
     /// 返回值第三项是"这是不是容器"：容器永远在它内部的面板之前出现。
     pub fn placements(&self, area: TileRect) -> Vec<(PanelId, TileRect, bool)> {
         let mut out = Vec::new();
-        self.walk(area, &mut out);
+        self.walk(area, &mut out, None, &mut None);
         out
     }
 
+    /// 包含 `anchor` 的**最外层横向 split** 的矩形——也就是 niri 的"条带视口"。
+    ///
+    /// 默认树里 root 是竖的（主体 / Hints / Status），横向的那一层是主体行：
+    /// 转写列、右列、picker 列都在它里面，Hints/Status 不在。横向滚动只作用在
+    /// 这个矩形里的面板上（见 [`Node::placements_scrolled`]）。
+    pub fn strip_area(&self, area: TileRect, anchor: PanelId) -> Option<TileRect> {
+        let mut out = Vec::new();
+        let mut strip = None;
+        self.walk(area, &mut out, Some(anchor), &mut strip);
+        strip
+    }
+
+    /// 同 [`Node::placements`]，但把 `anchor` 所在条带里的面板水平左移
+    /// `scroll_px`（**UI 像素**，与 [`Size::Fixed`] 同单位）。
+    ///
+    /// 只动横向条带里的矩形：`scroll_px = 0` 时与本函数之外的行为逐字节相同；
+    /// Hints / Status 这类横跨整条、位于条带之外的面板不会被滚走。面板尺寸
+    /// 不变（`size` 一个字节都不改），只是中心 x 变小——越界部分由渲染层的
+    /// 视口裁剪负责（见 `feathers_in_3d::WorldPanel::clip`）。
+    pub fn placements_scrolled(
+        &self,
+        area: TileRect,
+        anchor: PanelId,
+        scroll_px: f32,
+    ) -> Vec<(PanelId, TileRect, bool)> {
+        let mut out = Vec::new();
+        let mut strip = None;
+        self.walk(area, &mut out, Some(anchor), &mut strip);
+        let scroll_px = scroll_px.sanitized();
+        if scroll_px > 0.0
+            && let Some(strip) = strip
+        {
+            let shift = scroll_px * PX_TO_METERS;
+            // 条带的纵向范围：条带里的面板高度都不超过它；条带外的
+            // Hints/Status 与它只共享一条边（一个在上/下，一个在条带内），
+            // 用"上下边都被条带包住"判断就不会误伤。
+            let strip_top = strip.center.y + strip.size.y * 0.5;
+            let strip_bottom = strip.center.y - strip.size.y * 0.5;
+            const EPS: f32 = 1e-5;
+            for (_, rect, _) in out.iter_mut() {
+                let top = rect.center.y + rect.size.y * 0.5;
+                let bottom = rect.center.y - rect.size.y * 0.5;
+                if top <= strip_top + EPS && bottom >= strip_bottom - EPS {
+                    rect.center.x -= shift;
+                }
+            }
+        }
+        out
+    }
+
+    /// 同 [`Node::rects`]，但应用条带横向滚动（锚点取 [`PanelId::Transcript`]）。
+    ///
+    /// L3 的键位/滚轮在改完 `scroll` 后可以直接用它算"这一帧每块面板在哪"；
+    /// 容器不算叶子（和 [`Node::rects`] 一样）。
+    pub fn rects_scrolled(&self, area: TileRect, scroll_px: f32) -> Vec<(PanelId, TileRect)> {
+        self.placements_scrolled(area, PanelId::Transcript, scroll_px)
+            .into_iter()
+            .filter_map(|(panel, rect, container)| (!container).then_some((panel, rect)))
+            .collect()
+    }
+
     /// [`Node::placements`] 的递归体。
-    fn walk(&self, area: TileRect, out: &mut Vec<(PanelId, TileRect, bool)>) {
+    ///
+    /// `strip` 非空时顺便记录"包含 `anchor` 的最外层横向 split"的矩形
+    /// （第一次命中就固定，不再被更内层的横向 split 覆盖）。
+    fn walk(
+        &self,
+        area: TileRect,
+        out: &mut Vec<(PanelId, TileRect, bool)>,
+        anchor: Option<PanelId>,
+        strip: &mut Option<TileRect>,
+    ) {
         match self {
             Self::Leaf { panel } => out.push((*panel, area, false)),
             Self::Container { panel, node } => {
                 out.push((*panel, area, true));
-                node.walk(area, out);
+                node.walk(area, out, anchor, strip);
             }
             Self::Split {
                 direction,
@@ -213,6 +318,15 @@ impl Node {
             } => {
                 if children.is_empty() {
                     return;
+                }
+                // 条带 = 包含 `anchor` 的最外层横向 split。第一次命中就固定，
+                // 更内层的横向 split（例如拆窗后转写列内部再横拆）不覆盖它。
+                if anchor.is_some_and(|anchor| {
+                    *direction == Split::Horizontal
+                        && strip.is_none()
+                        && children.iter().any(|child| child.node.leaves().contains(&anchor))
+                }) {
+                    *strip = Some(area);
                 }
                 let horizontal = matches!(direction, Split::Horizontal);
                 let total = if horizontal {
@@ -248,20 +362,29 @@ impl Node {
                     .iter()
                     .filter_map(|child| match child.size {
                         Size::Fixed(px) => Some(px.sanitized() * PX_TO_METERS),
-                        Size::Proportion(_) => None,
+                        Size::Fraction(_) | Size::Proportion(_) => None,
                     })
                     .sum();
                 let proportion_total: f32 = children
                     .iter()
                     .filter_map(|child| match child.size {
                         Size::Proportion(weight) => Some(weight.sanitized()),
-                        Size::Fixed(_) => None,
+                        Size::Fraction(_) | Size::Fixed(_) => None,
                     })
                     .sum();
+                // 含 Fraction 的 split：Fraction 列各拿"视口宽 × f"，不计入
+                // leftover。旧的比例子仍按 available 分（不因为多了 Fraction
+                // 列而缩窄）——这正是"开新列不改已有列"。
+                let has_fraction = children
+                    .iter()
+                    .any(|child| matches!(child.size, Size::Fraction(_)));
+                // Fraction 的长度：区域沿切分轴的长度 × f，和兄弟数量无关。
+                let fraction_length = |fraction: f32| total * fraction.sanitized();
 
                 let mut lengths = vec![0.0f32; count];
                 if proportion_total > 0.0 {
                     // 固定子先拿，比例子分剩下的；固定子总和超了就整体按比例缩。
+                    // Fraction 列在这套分配之外，按视口宽精确取值。
                     let fixed_fit = fixed_total.min(available);
                     let fixed_scale = if fixed_total > 0.0 {
                         fixed_fit / fixed_total
@@ -272,9 +395,25 @@ impl Node {
                     for (index, child) in children.iter().enumerate() {
                         lengths[index] = match child.size {
                             Size::Fixed(px) => px.sanitized() * PX_TO_METERS * fixed_scale,
+                            Size::Fraction(fraction) => fraction_length(fraction),
                             Size::Proportion(weight) => {
                                 leftover * weight.sanitized() / proportion_total
                             }
+                        };
+                    }
+                } else if has_fraction {
+                    // 只有 Fraction（可能还有 Fixed）：列各有自己的宽度，剩余
+                    // 空间空着（niri 的列可以比视口窄），不塞给第一个子。
+                    let fixed_scale = if fixed_total > available && fixed_total > 0.0 {
+                        available / fixed_total
+                    } else {
+                        1.0
+                    };
+                    for (index, child) in children.iter().enumerate() {
+                        lengths[index] = match child.size {
+                            Size::Fixed(px) => px.sanitized() * PX_TO_METERS * fixed_scale,
+                            Size::Fraction(fraction) => fraction_length(fraction),
+                            Size::Proportion(_) => 0.0, // 上面已保证没有比例子
                         };
                     }
                 } else {
@@ -303,17 +442,27 @@ impl Node {
                 } else {
                     area.center.y - area.size.y * 0.5
                 };
+                // 旧的 share 布局（不含 Fraction）仍把最后一个子贴住远端，吃掉
+                // 浮点舍入误差；含 Fraction 的水平条带按累计 x 摆，超出就是超出。
+                let snap_last_to_far = !horizontal || !has_fraction;
                 let mut cursor = near;
                 for (index, child) in children.iter().enumerate() {
-                    // 最后一个子贴住远端：浮点误差不会在区域边上留一条缝。
-                    let end = if index + 1 == count {
+                    let end = if snap_last_to_far && index + 1 == count {
                         far
                     } else if horizontal {
                         cursor + lengths[index]
                     } else {
                         cursor - lengths[index]
                     };
-                    let child_area = if horizontal {
+                    // 一列正好占满视口宽（`Fraction(1.0)`，例如 `append_column`
+                    // 把旧树整块包成一列）时直接复用原区域：不重算 center，
+                    // 已有叶子的矩形才能逐字节不变。
+                    let spans_area = horizontal
+                        && cursor == near
+                        && matches!(child.size, Size::Fraction(f) if f.sanitized() >= 1.0);
+                    let child_area = if spans_area {
+                        area
+                    } else if horizontal {
                         TileRect {
                             center: Vec2::new((cursor + end) * 0.5, area.center.y),
                             size: Vec2::new((end - cursor).max(0.0), area.size.y),
@@ -324,7 +473,7 @@ impl Node {
                             size: Vec2::new(area.size.x, (cursor - end).max(0.0)),
                         }
                     };
-                    child.node.walk(child_area, out);
+                    child.node.walk(child_area, out, anchor, strip);
                     cursor = if horizontal {
                         end + gap
                     } else {
@@ -366,7 +515,7 @@ impl Node {
                 .iter()
                 .filter_map(|index| match children[*index].size {
                     Size::Proportion(weight) => Some(weight.sanitized()),
-                    Size::Fixed(_) => None,
+                    Size::Fraction(_) | Size::Fixed(_) => None,
                 })
                 .sum();
             for index in &proportions {
@@ -499,18 +648,13 @@ impl Node {
 
     /// 在根横向条带的**最右边**追加一列（`column` 可以是叶子，也可以是容器）。
     ///
-    /// 列宽策略：新列拿现有比例权重之和的一半 —— 即条带空间的 **1/3**，对齐
-    /// niri 新窗口的默认列宽（1/3、1/2、2/3 三档里的 1/3）。已有列都乘同一个
-    /// 因子（2/3）等比缩小，彼此的**相对**宽度一个像素都不变；帧宽本身不变，
-    /// 所以叶子仍然精确铺满整屏。
+    /// 列宽策略（niri 第一原则）：新列拿 [`DEFAULT_COLUMN_FRACTION`] 的**视口
+    /// 宽度**，**已有列的宽度和 x 一个字节都不改**。条带内容因此可以比视口宽，
+    /// 多出来的部分等下一步的 `scroll` 滚进来（`NIRI_SCROLL.md` L2）。
     ///
-    /// niri 的第一原则是"开新窗口不改变已有窗口大小"——那是在**无限长**的条带
-    /// 上（视口跟着焦点滚动）。这里的条带就是固定大小的帧，没有滚动的视口，
-    /// 只能在帧内按比例重新分配；等比缩小是"已有列宽只按比例重新分配"的那一
-    /// 种，见 `frame.rs` 的文档。
-    ///
-    /// 根不是横向 split 时把整棵树包成横向：原树 2 份、新列 1 份（新列同样是
-    /// 1/3）。`column` 里的面板已经出现在树上时返回 `false`，不重复加列。
+    /// 根不是横向 split 时把整棵树包成横向：原树当成一整列
+    /// `Fraction(1.0)`（它本来就占满视口），新列接在它右边。`column` 里的面板
+    /// 已经出现在树上时返回 `false`，不重复加列。
     pub fn append_column(&mut self, column: Node) -> bool {
         let present = self.leaves();
         if column
@@ -526,15 +670,7 @@ impl Node {
                 children,
                 ..
             } => {
-                let total: f32 = children
-                    .iter()
-                    .filter_map(|child| match child.size {
-                        Size::Proportion(weight) => Some(weight.sanitized()),
-                        Size::Fixed(_) => None,
-                    })
-                    .sum();
-                let weight = if total > 0.0 { total / 2.0 } else { 1.0 };
-                children.push(Child::new(Size::Proportion(weight), column));
+                children.push(Child::fraction(DEFAULT_COLUMN_FRACTION, column));
                 true
             }
             Self::Split { .. } | Self::Leaf { .. } | Self::Container { .. } => {
@@ -547,8 +683,9 @@ impl Node {
                     },
                 );
                 if let Self::Split { children, .. } = self {
-                    children.push(Child::proportion(2.0, old));
-                    children.push(Child::proportion(1.0, column));
+                    // 旧树原本占满视口：它是一整列，宽度就是 `1.0 × 视口`。
+                    children.push(Child::fraction(1.0, old));
+                    children.push(Child::fraction(DEFAULT_COLUMN_FRACTION, column));
                 }
                 true
             }
@@ -581,15 +718,10 @@ impl Node {
             return false;
         };
         if *direction == Split::Horizontal && here_has_near {
-            let total: f32 = children
-                .iter()
-                .filter_map(|child| match child.size {
-                    Size::Proportion(weight) => Some(weight.sanitized()),
-                    Size::Fixed(_) => None,
-                })
-                .sum();
-            let weight = if total > 0.0 { total / 2.0 } else { 1.0 };
-            children.push(Child::new(Size::Proportion(weight), column.clone()));
+            children.push(Child::fraction(
+                DEFAULT_COLUMN_FRACTION,
+                column.clone(),
+            ));
             return true;
         }
         let mut found = false;
@@ -606,8 +738,9 @@ impl Node {
 
     /// 摘掉根条带里**包含 `panel` 的那一整列**（picker 关闭时用）。
     ///
-    /// 只动根的直接子节点；其余子的尺寸权重原样保留，所以"加列 → 摘列"之后
-    /// 树和加列前逐字节相同。根不是 split、或者没有这一列时返回 `false`。
+    /// 只动根的直接子节点；其余子的尺寸、x 原样保留（`Fraction` 列按视口宽
+    /// 定宽，摘掉别人也不会让它们变宽），所以"加列 → 摘列"之后树和加列前逐
+    /// 字节相同。根不是 split、或者没有这一列时返回 `false`。
     pub fn remove_column(&mut self, panel: PanelId) -> bool {
         // 列可能挂在某个嵌套的横向 split 里（主体那一行就是），所以先递归找
         // "直接子节点里含这个面板"的那一层，在该层摘掉；不要整块把主体行删了。
@@ -701,18 +834,24 @@ impl Sanitized for f32 {
 /// 形状对应 niri 的"转写一大列 + 右边输入列"：
 ///
 /// ```text
-/// Horizontal
-/// ├─ Transcript   Proportion 2   ← 左 2/3
-/// └─ Vertical                   ← 右 1/3
-///    ├─ Complete   Fixed 0 格   ← 补全 tile：关着 0，打开 6 格
-///    ├─ Input      Proportion 1  ← 提示行 + 键位提示行 + 面板装饰，吃掉右列剩余
-///    └─ Status     Fixed 2 格   ← 细条里居中一行
+/// Vertical                         ← 根：主体 / Hints / Status（不变）
+/// ├─ Horizontal                    ← main_row
+/// │  ├─ Transcript   Fraction 0.62 ← 视口宽的 62%
+/// │  └─ Vertical     Fraction 0.38 ← 视口宽的 38%，列内还是竖直 share
+/// │     ├─ Spacer    Proportion 1  ← 吃掉右列剩余高度
+/// │     ├─ Confirm   Fixed 0 格
+/// │     ├─ Complete  Fixed 0 格    ← 补全 tile：关着 0，打开 6 格
+/// │     └─ Input     Fixed 4 格
+/// ├─ Hints          Fixed 1 格
+/// └─ Status         Fixed 2 格
 /// ```
 ///
 /// 数值理由：
-/// * 转写是主区域，给 2 份；输入列 1 份，和 niri 的预设列宽 2/3 + 1/3 对齐。
-/// * 输入是右列的比例子，剩余高度全归它；`28` 行的默认帧里就是 26 行
-///   （原来的 `Fixed 4 格` 靠"第一个子吃剩余"得到同样的几何）。
+/// * 主体行两列**按视口宽**定宽（[`TRANSCRIPT_COLUMN_FRACTION`] /
+///   [`RIGHT_COLUMN_FRACTION`]，相加为 1）：开新列时它们不会像旧的 2:1
+///   share 那样被挤窄。0.62:0.38 接近原来的 2/3 + 1/3。
+/// * 右列内部仍是竖直 share：输入是比例子，剩余高度全归它；`28` 行的默认帧
+///   里就是 26 行（原来的 `Fixed 4 格` 靠"第一个子吃剩余"得到同样的几何）。
 /// * 状态 2 格：一行字在细条里居中，固定贴底。
 /// * 补全 tile 初始 `Fixed(0.0)`：不占高度。打开时 [`crate::complete`] 把它改成
 ///   `Fixed(6 * ROW_HEIGHT)`，输入按比例自然缩短，总高度仍然精确等于右列高度。
@@ -724,7 +863,7 @@ pub fn default_tree() -> Node {
     use crate::transcript::ROW_HEIGHT;
 
     // 条带 = 一根竖着的根：
-    //   主体（转写 2/3 | 右列：留白 / 确认 / 补全 / 输入 4 行）
+    //   主体（转写 0.62 视口宽 | 右列 0.38 视口宽：留白 / 确认 / 补全 / 输入 4 行）
     //   键位提示行（横跨整条，1 行）
     //   状态行（横跨整条，2 行）
     //
@@ -743,6 +882,9 @@ pub fn default_tree() -> Node {
 }
 
 /// 条带主体：左转写、右列（留白 / 确认 / 补全 / 输入）。
+///
+/// 两列都用 [`Size::Fraction`]（相对视口宽），不再按 2:1 分剩余空间：以后
+/// 往这一行末尾加列（picker）时，这两列的宽度一个字节都不会变。
 fn main_row() -> Node {
     use crate::transcript::ROW_HEIGHT;
 
@@ -750,9 +892,12 @@ fn main_row() -> Node {
         Split::Horizontal,
         NO_GAP,
         vec![
-            Child::proportion(2.0, Node::leaf(PanelId::Transcript)),
-            Child::new(
-                Size::Proportion(1.0),
+            Child::fraction(
+                TRANSCRIPT_COLUMN_FRACTION,
+                Node::leaf(PanelId::Transcript),
+            ),
+            Child::fraction(
+                RIGHT_COLUMN_FRACTION,
                 Node::split(
                     Split::Vertical,
                     NO_GAP,
@@ -1126,12 +1271,17 @@ mod tests {
             (leaves - screen).abs() < 1e-3,
             "叶子面积 {leaves} != 区域 {screen}"
         );
-        // 左 2/3、右 1/3；右列从上到下是留白 / 补全 / 输入 / 状态。
+        // 左列 0.62 视口宽、右列 0.38（相加铺满）；右列从上到下是留白 / 补全 / 输入 / 状态。
         let transcript = found.iter().find(|(id, _)| *id == PanelId::Transcript).unwrap().1;
         let input = found.iter().find(|(id, _)| *id == PanelId::Input).unwrap().1;
         let status = found.iter().find(|(id, _)| *id == PanelId::Status).unwrap().1;
         let complete = found.iter().find(|(id, _)| *id == PanelId::Complete).unwrap().1;
-        assert!(close(transcript.size.x, area().size.x * 2.0 / 3.0));
+        assert!(close(
+            transcript.size.x,
+            area().size.x * TRANSCRIPT_COLUMN_FRACTION
+        ));
+        assert!(close(input.size.x, area().size.x * RIGHT_COLUMN_FRACTION));
+        assert!(close(left(&input), right(&transcript)), "两列贴在一起");
         assert!(close(status.size.y, 2.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS));
         assert!(close(bottom(&status), bottom(&area())));
         let hints = found.iter().find(|(id, _)| *id == PanelId::Hints).unwrap().1;
@@ -1341,56 +1491,129 @@ mod tests {
         assert!(close(bottom(&status), bottom(&area())));
     }
 
-    // 21. 条带最右边加一列：新列 1/3，已有列等比缩到 2/3（相对宽度不变）。
+    // 21. 不变量 1 + 4：加列不改已有列的 (left, width)，新列接在旧总宽之后（可超出）。
     #[test]
-    fn appending_a_column_takes_a_third_and_scales_the_old_columns() {
+    fn appending_a_column_keeps_existing_columns_and_overflows_the_area() {
         let mut node = default_tree();
         let before = rects(&node);
-        assert!(node.append_column(Node::container(
-            PanelId::Picker,
-            Node::leaf(PanelId::List)
-        )));
+        let old_total = right(&area()); // 0.62 + 0.38 = 1，主体行正好到视口右边。
+        assert!(node.append_column_at(
+            PanelId::Transcript,
+            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
+        ));
         let after = rects(&node);
 
         assert_eq!(after.len(), before.len() + 1, "只多一个叶子");
-        assert_eq!(after.last().map(|(id, _)| *id), Some(PanelId::List));
-        let column = after.last().expect("新列").1;
-        assert!(close(column.size.x, area().size.x / 3.0), "新列 = 条带的 1/3");
-        assert!(close(right(&column), right(&area())), "新列贴住最右");
-        assert_eq!(node.leaves().last(), Some(&PanelId::List));
-
+        // 已有叶子（含横跨整条的 Hints/Status）的矩形逐字节不变：不是"等比缩"。
         for (id, old) in &before {
             let fresh = after
                 .iter()
                 .find(|(found, _)| found == id)
                 .map(|(_, rect)| *rect)
                 .unwrap_or_else(|| panic!("{id:?} 还在树上"));
-            assert!(
-                close(fresh.size.x, old.size.x * 2.0 / 3.0),
-                "{id:?} 按比例缩到 2/3"
-            );
-            assert!(close(fresh.size.y, old.size.y));
-            assert!(close(top(&fresh), top(old)));
-            if *id == PanelId::Transcript {
-                assert!(close(left(&fresh), left(old)), "最左列左边界不动");
-            }
+            assert_eq!(fresh, *old, "{id:?} 的矩形必须逐字节不变");
         }
-        // 叶子面积仍然铺满整屏。
-        let leaves: f32 = after.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
-        assert!(close(leaves, area().size.x * area().size.y));
+        // 新列的 left = 旧总宽（累计 x），宽度 = 视口的一半，右边界超出区域。
+        let column = after
+            .iter()
+            .find(|(id, _)| *id == PanelId::List)
+            .expect("picker 列")
+            .1;
+        assert!(close(left(&column), old_total), "新列接在旧总宽之后（累计 x）");
+        assert_eq!(column.size.x, area().size.x * DEFAULT_COLUMN_FRACTION);
+        assert!(right(&column) > right(&area()), "Fraction 列可以超出区域右边界");
+        assert_eq!(
+            node.containers(area()).last().map(|(id, _)| *id),
+            Some(PanelId::Picker)
+        );
     }
 
-    // 22. 加列 → 摘列：树逐字节复原；重复摘是空操作。
+    // 22. 不变量 2：Fraction 列宽 = 视口宽 × f，兄弟从 2 个变 3 个也不变。
+    #[test]
+    fn a_fraction_column_keeps_its_viewport_width_when_siblings_grow() {
+        let two = Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(TRANSCRIPT_COLUMN_FRACTION, leaf(PanelId::Transcript)),
+                Child::fraction(RIGHT_COLUMN_FRACTION, leaf(PanelId::Status)),
+            ],
+        );
+        let mut three = two.clone();
+        assert!(three.append_column(Node::leaf(PanelId::Input)));
+        for node in [&two, &three] {
+            let transcript = node
+                .rects(area())
+                .into_iter()
+                .find(|(id, _)| *id == PanelId::Transcript)
+                .unwrap()
+                .1;
+            assert_eq!(
+                transcript.size.x,
+                area().size.x * TRANSCRIPT_COLUMN_FRACTION,
+                "Fraction 列宽只由视口宽决定"
+            );
+            assert_eq!(transcript.size.x, 0.62 * area().size.x);
+        }
+    }
+
+    // 23. Fraction 不参与 leftover：旧 Proportion 子仍然按"去掉固定子后的全部
+    //     空间"分，不因为多了 Fraction 列而变窄（旧 share 语义保留）。
+    #[test]
+    fn fraction_columns_do_not_consume_the_proportion_share() {
+        let alone = Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![Child::proportion(1.0, leaf(PanelId::Status))],
+        );
+        let full = alone.rects(area())[0].1.size.x;
+        let mixed = Node::split(
+            Split::Horizontal,
+            NO_GAP,
+            vec![
+                Child::fraction(0.25, leaf(PanelId::Transcript)),
+                Child::proportion(1.0, leaf(PanelId::Status)),
+            ],
+        );
+        let found = mixed.rects(area());
+        let transcript = found
+            .iter()
+            .find(|(id, _)| *id == PanelId::Transcript)
+            .unwrap()
+            .1;
+        let status = found
+            .iter()
+            .find(|(id, _)| *id == PanelId::Status)
+            .unwrap()
+            .1;
+        assert_eq!(transcript.size.x, area().size.x * 0.25);
+        assert!(close(status.size.x, full), "比例子仍拿全部 leftover（不变窄）");
+        assert!(close(left(&status), right(&transcript)), "累计 x 相接");
+        assert!(right(&status) > right(&area()), "比例子 + Fraction 超出区域");
+    }
+
+    // 24. 加列 → 摘列：树逐字节复原，其它列在中间状态里也不动。
     #[test]
     fn removing_the_appended_column_restores_the_tree() {
         let before = default_tree();
         let mut node = before.clone();
+        let rects_before = rects(&node);
         assert!(node.append_column(Node::container(
             PanelId::Picker,
             Node::leaf(PanelId::List)
         )));
+        let with_column = rects(&node);
+        for (id, old) in &rects_before {
+            let fresh = with_column
+                .iter()
+                .find(|(found, _)| found == id)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{id:?} 还在树上"));
+            assert_eq!(fresh, *old, "摘列前 {id:?} 也不动");
+        }
         assert!(node.remove_column(PanelId::List));
         assert_eq!(node, before, "加列再摘列不改树的其它部分");
+        assert_eq!(rects(&node), rects_before, "几何也逐字节复原");
         assert!(!node.remove_column(PanelId::List), "没有这一列时返回 false");
         assert_eq!(node, before);
     }
@@ -1427,8 +1650,7 @@ mod tests {
 
     // 24. 自定义尺寸的拆叶子：2:1 竖直拆分；摘掉 preview 后树精确复原。
     #[test]
-    fn splitting_a_leaf_with_custom_sizes_can_be_undone() {
-        let before = three_leaf_tree();
+    fn splitting_a_leaf_with_custom_sizes_can_be_undone() {        let before = three_leaf_tree();
         let mut node = before.clone();
         let input_before = rects(&node)
             .into_iter()
@@ -1462,5 +1684,84 @@ mod tests {
         assert!(node.remove_leaf(PanelId::Preview));
         assert_eq!(node, before, "摘掉 preview 后精确复原");
         assert!(!node.remove_leaf(PanelId::Preview));
+    }
+
+    // 25. 条带 = 包含转写列的最外层横向 split：默认树里它就是主体行，
+    //     Hints/Status 在它下面（不属于条带）。
+    #[test]
+    fn the_strip_is_the_horizontal_row_that_holds_the_transcript() {
+        let node = default_tree();
+        let strip = node.strip_area(area(), PanelId::Transcript).expect("默认树有主体行");
+        let (strip_top, strip_bottom) = (top(&strip), bottom(&strip));
+        assert!(close(strip_top, top(&area())), "主体行贴顶");
+        assert!(
+            close(
+                strip_bottom,
+                bottom(&area()) + 3.0 * crate::transcript::ROW_HEIGHT * PX_TO_METERS
+            ),
+            "主体行底部在 Hints/Status 之上"
+        );
+        assert!(node.strip_area(area(), PanelId::Status).is_none(), "Status 不在横向条带里");
+    }
+
+    // 26. 横向滚动只动条带里的矩形：转写/右列/picker 一起左移，Hints/Status 不动，
+    //     面板尺寸一个字节都不改。
+    #[test]
+    fn scrolling_moves_the_strip_but_not_hints_or_status() {
+        let mut node = default_tree();
+        assert!(node.append_column_at(
+            PanelId::Transcript,
+            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
+        ));
+        let before = node.placements(area());
+        let scroll_px = 200.0;
+        let after = node.placements_scrolled(area(), PanelId::Transcript, scroll_px);
+        let shift = scroll_px * PX_TO_METERS;
+
+        assert_eq!(after.len(), before.len(), "滚动不增删面板");
+        for ((id, old, old_container), (fresh_id, fresh, fresh_container)) in
+            before.iter().zip(after.iter())
+        {
+            assert_eq!(id, fresh_id, "顺序不变");
+            assert_eq!(old_container, fresh_container);
+            assert_eq!(old.size, fresh.size, "{id:?} 尺寸不能被滚动改小");
+            let moved = match id {
+                PanelId::Hints | PanelId::Status => 0.0,
+                _ => -shift,
+            };
+            assert!(
+                close(fresh.center.x - old.center.x, moved),
+                "{id:?} 的 x 位移是 {}（期望 {moved}）",
+                fresh.center.x - old.center.x
+            );
+            assert_eq!(fresh.center.y, old.center.y, "{id:?} 不该上下动");
+        }
+
+        // scroll = 0 时与普通 placements 逐字节相同（回归）。
+        let still = node.placements_scrolled(area(), PanelId::Transcript, 0.0);
+        assert_eq!(still, before);
+        let negative = node.placements_scrolled(area(), PanelId::Transcript, -50.0);
+        assert_eq!(negative, before, "负滚动量夹到 0");
+    }
+
+    // 27. 完全滚出视口的面板仍然在树上（不 despawn），只是矩形在视口外。
+    #[test]
+    fn a_fully_scrolled_out_column_stays_in_the_tree() {
+        let mut node = default_tree();
+        assert!(node.append_column_at(
+            PanelId::Transcript,
+            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
+        ));
+        let strip = node.strip_area(area(), PanelId::Transcript).unwrap();
+        let after = node.placements_scrolled(area(), PanelId::Transcript, 1200.0);
+        let picker = after
+            .iter()
+            .find(|(id, _, _)| *id == PanelId::Picker)
+            .expect("容器还在");
+        assert!(
+            right(&picker.1) < left(&strip),
+            "picker 列完全滚到条带左边界之外"
+        );
+        assert_eq!(after.len(), node.placements(area()).len(), "面板一个都没少");
     }
 }

@@ -801,7 +801,8 @@ fn apply_scroll(
 /// 有 picker 就在条带最右边加一列；没有就关掉。顺便按过滤词和折叠状态算可见行。
 ///
 /// 开：根 `Split::Horizontal` 末尾追加 `Child`（`Picker` 容器 + 列内 `List`，
-/// 列宽 = 条带的 1/3，见 [`Node::append_column`]），spawn 容器 + 列表 panel。
+/// 列宽 = 视口的一半（[`crate::layout::DEFAULT_COLUMN_FRACTION`]，见
+/// [`Node::append_column`]），spawn 容器 + 列表 panel。
 /// 关：摘掉这一列、despawn 三块面板、清 `PanelRoots` / `PanelRows` / `PanelSpawned`。
 ///
 /// 多个 picker 同时存在时，只有 [`PickerQueue`] 的队首显示在这一列里；队首关闭 /
@@ -2013,27 +2014,24 @@ mod tests {
         rect.center.y - rect.size.y * 0.5
     }
 
-    /// 叶子精确铺满帧、互不重叠。
-    fn assert_tiles(rects: &[(PanelId, TileRect)], frame: TileRect) {
-        let mut area = 0.0;
+    /// 各列两两不重叠（L1 里 Fraction 列可以伸出视口，所以不检查"是否铺满"）。
+    ///
+    /// `TileRect` 用中心 + 尺寸表示，相邻列共边的浮点误差 < 1e-6，按这个容差判。
+    fn assert_columns_are_disjoint(rects: &[(PanelId, TileRect)]) {
         for (index, (id, a)) in rects.iter().enumerate() {
-            area += a.size.x * a.size.y;
             if a.size.x <= 0.0 || a.size.y <= 0.0 {
-                // 默认树里补全 tile 关着时就是 0 高度：允许，只是不参与铺满。
+                // 默认树里补全 tile 关着时就是 0 高度：不参与重叠判断。
                 continue;
             }
             for (other, b) in rects.iter().skip(index + 1) {
-                let overlap_x = left(a) < right(b) - 1e-9 && left(b) < right(a) - 1e-9;
-                let overlap_y = bottom(a) < top(b) - 1e-9 && bottom(b) < top(a) - 1e-9;
+                if b.size.x <= 0.0 || b.size.y <= 0.0 {
+                    continue;
+                }
+                let overlap_x = left(a) < right(b) - 1e-6 && left(b) < right(a) - 1e-6;
+                let overlap_y = bottom(a) < top(b) - 1e-6 && bottom(b) < top(a) - 1e-6;
                 assert!(!(overlap_x && overlap_y), "{id:?} 和 {other:?} 重叠");
             }
-            assert!(left(a) >= left(&frame) - 1e-9 && right(a) <= right(&frame) + 1e-9);
-            assert!(bottom(a) >= bottom(&frame) - 1e-9 && top(a) <= top(&frame) + 1e-9);
         }
-        assert!(
-            close(area, frame.size.x * frame.size.y),
-            "叶子面积之和 {area} != 帧面积"
-        );
     }
 
     fn press(app: &mut App, key_code: KeyCode, logical: Key) {
@@ -2196,9 +2194,12 @@ mod tests {
         picker
     }
 
-    /// 打开 picker：条带最右边多一列（叶子 +1），列宽 1/3、已有列等比缩到 2/3。
+    /// 打开 picker：主体行末尾多一列（叶子 +1），列宽 = 视口的一半，
+    /// **已有列的矩形一个字节都不动**（niri 第一原则）。
     #[test]
-    fn opening_a_picker_appends_a_third_width_column_at_the_right() {
+    fn opening_a_picker_appends_a_half_viewport_column_at_the_right() {
+        use crate::layout::DEFAULT_COLUMN_FRACTION;
+
         let mut app = tiled_app();
         let before = app.world().resource::<FrameTree>().0.clone();
         let frame = frame_tile(96, 28);
@@ -2213,40 +2214,29 @@ mod tests {
         let after = tree.rects(frame);
 
         assert_eq!(after.len(), before_rects.len() + 1, "只多一列");
-        // 列挂在主体那一行的末尾；整棵树后面还有提示行/状态行，所以按 PanelId 找。
+        // 已有列（含横跨整条的 Hints/Status）逐字节不变。
+        for (id, old) in &before_rects {
+            let fresh = after
+                .iter()
+                .find(|(found, _)| found == id)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{id:?} 还在树上"));
+            assert_eq!(fresh, *old, "{id:?} 加列前后必须逐字节相同");
+        }
+        // 新列接在主体行旧总宽之后（= 视口右边界），向右超出视口。
         let column = after
             .iter()
             .find(|(id, _)| *id == PanelId::List)
             .expect("picker 列")
             .1;
-        assert!(close(right(&column), right(&frame)), "列在主体行最右");
-        assert!(close(column.size.x, frame.size.x / 3.0), "新列占 1/3");
-        assert!(close(right(&column), right(&frame)), "新列贴住条带最右");
+        assert!(close(left(&column), right(&frame)), "新列从视口右边界开始");
+        assert_eq!(column.size.x, frame.size.x * DEFAULT_COLUMN_FRACTION);
+        assert!(right(&column) > right(&frame), "Fraction 列可以超出视口");
         assert_eq!(
             tree.containers(frame).last().map(|(id, _)| *id),
             Some(PanelId::Picker),
             "容器面板在列的位置"
         );
-        assert_tiles(&after, frame);
-
-        // 主体行里的列全部乘同一个因子 2/3（相对宽度不变），高度不变。
-        // 注意 Hints / Status 是横跨整条的独立行（不在主体行里），它们不缩。
-        for (id, old) in &before_rects {
-            if matches!(*id, PanelId::Hints | PanelId::Status) {
-                continue;
-            }
-            let new = after
-                .iter()
-                .find(|(found, _)| found == id)
-                .map(|(_, rect)| *rect)
-                .unwrap_or_else(|| panic!("{id:?} 还在树上"));
-            assert!(
-                close(new.size.x, old.size.x * 2.0 / 3.0),
-                "{id:?} 按比例缩到 2/3（{old:?} → {new:?}）"
-            );
-            assert!(close(new.size.y, old.size.y));
-            assert!(close(top(&new), top(old)));
-        }
 
         // 面板实体登记齐全；行槽只建列表那一块。
         let (column, list, preview) = column_entities(&app);
@@ -2259,9 +2249,10 @@ mod tests {
             .contains_key(&PanelId::List));
     }
 
-    /// 打开 picker 后 rects() 仍然精确铺满、不重叠（容器不参与叶子铺满）。
+    /// 打开 picker 后各列互不重叠；除 picker 列外都还在视口内，picker 列向右
+    /// 伸出（滚动/裁剪是 L2，这一层只保证几何累计正确）。
     #[test]
-    fn the_strip_still_tiles_exactly_after_the_picker_column() {
+    fn the_strip_columns_stay_disjoint_after_the_picker_column() {
         let mut app = tiled_app();
         let _picker = spawn_picker(
             &mut app,
@@ -2269,19 +2260,39 @@ mod tests {
         );
         let tree = app.world().resource::<FrameTree>().0.clone();
         let frame = frame_tile(96, 28);
-        assert_tiles(&tree.rects(frame), frame);
-        // 容器面板和列表区域完全重合（容器垫在后面）。
-        let column = tree.containers(frame).last().expect("容器").1;
-        let list = tree
-            .rects(frame)
-            .into_iter()
+        let rects = tree.rects(frame);
+        let list = rects
+            .iter()
             .find(|(id, _)| *id == PanelId::List)
             .expect("列表")
             .1;
+
+        for (id, rect) in &rects {
+            if *id == PanelId::List {
+                continue;
+            }
+            assert!(
+                left(rect) >= left(&frame) - 1e-6 && right(rect) <= right(&frame) + 1e-6,
+                "{id:?} 仍然在视口内"
+            );
+        }
+        assert!(left(&list) >= right(&frame) - 1e-6, "picker 列在视口右边");
+        assert!(right(&list) > right(&frame) + 1e-6, "Fraction 列伸出视口");
+        assert_columns_are_disjoint(&rects);
+
+        // 容器面板和列表区域完全重合（容器垫在后面）。
+        let column = tree.containers(frame).last().expect("容器").1;
         assert!(close(left(&column), left(&list)));
         assert!(close(right(&column), right(&list)));
         assert!(close(top(&column), top(&list)));
         assert!(close(bottom(&column), bottom(&list)));
+
+        // 面积 = 视口面积 + picker 列伸出的面积（列挂在主体行，高度 = 列表高）。
+        let area: f32 = rects.iter().map(|(_, rect)| rect.size.x * rect.size.y).sum();
+        assert!(close(
+            area,
+            frame.size.x * frame.size.y + list.size.x * list.size.y
+        ));
     }
 
     /// 关闭：列摘掉、叶子数回到原值、三块面板实体 despawn、行槽没有残留。
@@ -2385,7 +2396,8 @@ mod tests {
             .1;
         let container = tree.containers(frame).last().expect("容器").1;
         assert!(close(right(&list), right(&container)));
-        assert!(close(right(&container), right(&frame)), "列贴条带最右");
+        assert!(close(left(&container), right(&frame)), "列从视口右边界开始");
+        assert!(right(&container) > right(&frame), "Fraction 列伸出视口");
         assert!(close(list.size.x, container.size.x));
         assert!(close(preview.size.x, container.size.x));
         assert!(close(list.size.y, container.size.y * 2.0 / 3.0), "列表 2/3");
@@ -2393,7 +2405,7 @@ mod tests {
         assert!(close(bottom(&list), top(&preview)), "上下相接、没有缝");
         assert!(close(top(&list), top(&container)));
         assert!(close(bottom(&preview), bottom(&container)));
-        assert_tiles(&rects, frame);
+        assert_columns_are_disjoint(&rects);
 
         // 收起来的那棵树以后能恢复（preview 关掉时对比）。
         app.world_mut().entity_mut(picker).remove::<PickPreview>();
@@ -2430,7 +2442,8 @@ mod tests {
             .find(|(id, _)| *id == PanelId::List)
             .expect("列表")
             .1;
-        assert!(close(right(&list), right(&frame)), "列表占满整列、贴条带最右");
+        assert!(close(right(&list), right(&container)), "列表占满整列");
+        assert!(close(left(&container), right(&frame)), "列从视口右边界开始");
         assert!(close(left(&list), left(&container)));
         assert!(close(right(&list), right(&container)));
         assert!(close(top(&list), top(&container)));

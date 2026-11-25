@@ -87,6 +87,86 @@ pub struct Workspace {
     pub order: usize,
 }
 
+/// 一个工作区条带的**横向滚动量**（组件，挂在工作区实体上）。
+///
+/// 为什么不是 [`Workspace`] 的字段：`Workspace` 在 `picker.rs` 的测试里用结构体
+/// 字面量直接构造（`Workspace { session, tree, pose, order }`），加字段会让那些
+/// 收编路径编译不过；而 scroll 是"条带视口"的运行时状态，和 session/tree/pose
+/// 不同生命周期，独立组件更合适（也是 `NIRI_SCROLL.md` §3.5 说的"每个工作区
+/// 各自持有自己的 scroll"）。
+///
+/// 单位是 **UI 像素**（和 [`crate::layout::Size::Fixed`] 一致），`0` = 最左；
+/// 正值把条带内容往左推。只有横向条带（含转写列的那条）会应用它，
+/// Hints/Status 这类横跨整条、位于条带之外的 chrome 行不动。
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorkspaceScroll {
+    /// 当前滚动量（UI 像素，`>= 0`）。
+    pub scroll: f32,
+}
+
+impl WorkspaceScroll {
+    /// 负值 / NaN 夹到 0；上界由 [`clamp_scroll`] 在内容宽度已知时再夹。
+    pub fn new(scroll: f32) -> Self {
+        Self {
+            scroll: finite_px(scroll).max(0.0),
+        }
+    }
+}
+
+/// f32 的"有限值"清洗：NaN / ±∞ → 0。
+fn finite_px(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// 滚动量的合法上界：`[0, max(0, total_width - viewport_width)]`。
+///
+/// 入参和返回都是 **UI 像素**。总宽比视口窄、或总宽是 NaN/负数时返回 `0.0`
+/// （不滚动）；视口是 NaN/∞ 时也返回 `0.0`（∞ 视口等于"全都看得见"）。
+/// L3 的动作做完一次滚动后用它夹住；L2 只导出，不做交互。
+pub fn clamp_scroll(total_width: f32, viewport_width: f32) -> f32 {
+    // 视口本身是 NaN/∞ 时没有可滚动的窗口：∞ 视口等于"全都看得见"。
+    if !viewport_width.is_finite() {
+        return 0.0;
+    }
+    let total = finite_px(total_width).max(0.0);
+    let viewport = viewport_width.max(0.0);
+    (total - viewport).max(0.0)
+}
+
+/// 把 `[x, x + width)` 滚进 `[scroll, scroll + viewport_width)`。
+///
+/// 语义照 niri：
+/// * 列比视口宽 → **左贴边**（`scroll = x`，此时右边必然超出，只能牺牲右边）；
+/// * 否则**左边优先**：列在视口左边就滚到 `x`；只在右边超出时才往右多滚
+///   `x + width - viewport`；
+/// * 结果不小于 0（不滚出内容最左端）；NaN/负的视口/宽度按 0 处理。
+///
+/// 上界不在这里夹——调用方拿到结果后再用 [`clamp_scroll`]（它需要总宽）。
+/// 入参/返回都是 **UI 像素**。
+pub fn scroll_to_visible(scroll: f32, x: f32, width: f32, viewport_width: f32) -> f32 {
+    let viewport = finite_px(viewport_width).max(0.0);
+    if viewport <= 0.0 {
+        return 0.0;
+    }
+    let scroll = finite_px(scroll).max(0.0);
+    let x = finite_px(x);
+    let width = finite_px(width).max(0.0);
+    // 比视口宽：左贴边（也只能这样）。
+    if width >= viewport {
+        return x.max(0.0);
+    }
+    // 左边优先。
+    if x < scroll {
+        return x.max(0.0);
+    }
+    // 右边夹紧：列的右边界超过视口右边界时把 scroll 往右补。
+    let right = x + width;
+    if right > scroll + viewport {
+        return (right - viewport).max(0.0);
+    }
+    scroll
+}
+
 /// 所有工作区。
 ///
 /// `focused` 现在决定内容写入口径（内容系统只写它）；第 3 批再让它决定可见性
@@ -201,6 +281,7 @@ pub fn spawn_workspace_with_tree(
                 pose,
                 order,
             },
+            WorkspaceScroll::default(),
         ))
         .id();
     let (roots, rows) = crate::frame::default_screen_panels(commands, Some(workspace));
@@ -405,6 +486,7 @@ fn bootstrap_workspaces(
                     pose: Transform::IDENTITY,
                     order: 0,
                 },
+                WorkspaceScroll::default(),
                 WorkspacePanels {
                     rows: rows.as_deref().cloned().unwrap_or_default(),
                     roots: roots.as_deref().cloned().unwrap_or_default(),
@@ -1313,7 +1395,8 @@ mod tests {
             .expect("WorldPanel")
             .anchor
             .translation;
-        let want_x = -16.0 * CELL.x * UNITS_TO_WORLD;
+        // 转写宽 0.62 × 96 = 59.52 列，中心 = 59.52/2 - 48 = -18.24 列。
+        let want_x = -18.24 * CELL.x * UNITS_TO_WORLD;
         assert!(
             (anchor.x - want_x).abs() < 1e-5,
             "默认工作区的转写锚点 x = {}",
@@ -1827,7 +1910,8 @@ mod tests {
             .unwrap()
             .anchor
             .translation;
-        let want_x = -16.0 * CELL.x * UNITS_TO_WORLD;
+        // 转写宽 0.62 × 96 = 59.52 列，中心 = 59.52/2 - 48 = -18.24 列。
+        let want_x = -18.24 * CELL.x * UNITS_TO_WORLD;
         assert!((anchor.x - want_x).abs() < 1e-5, "anchor.x = {}", anchor.x);
         // 转写只占条带上半部分（下面还有提示行/状态行两条横跨的 tile），
         // 所以它的锚点 y 是"上半部分的中心"，不再等于 0。
@@ -2343,6 +2427,207 @@ mod tests {
             anchors,
             "相机移动不改面板锚点"
         );
+    }
+
+    // ---- L2：每工作区一个横向 scroll + 条带视口裁剪 ----
+
+    /// 工作区里每块面板这一帧的**精确**中心（UI 像素，相对帧中心）。
+    fn area_centers(app: &App, workspace: Entity) -> HashMap<PanelId, Vec2> {
+        let panels = app
+            .world()
+            .get::<WorkspacePanels>(workspace)
+            .expect("WorkspacePanels");
+        let mut out = HashMap::new();
+        for id in [
+            PanelId::Transcript,
+            PanelId::Input,
+            PanelId::Status,
+            PanelId::Complete,
+            PanelId::Hints,
+            PanelId::Confirm,
+        ] {
+            let Some(root) = panels.roots.entity(id) else {
+                continue;
+            };
+            let area = panels.area(root).unwrap_or_else(|| panic!("{id:?} 有区域"));
+            out.insert(id, area.center.unwrap_or_else(|| panic!("{id:?} 有精确中心")));
+        }
+        out
+    }
+
+    /// 面板 `Node` 上的像素尺寸（`place_panels` 每帧写入）。
+    fn panel_px(app: &App, root: Entity) -> Vec2 {
+        let node = app.world().get::<Node>(root).expect("Node");
+        let px = |value: bevy::ui::Val| match value {
+            bevy::ui::Val::Px(value) => value,
+            _ => 0.0,
+        };
+        Vec2::new(px(node.width), px(node.height))
+    }
+
+    /// 面板在世界里的轴对齐矩形（米）：锚点是中心，`Node` 像素 × units。
+    fn panel_rect(app: &App, root: Entity) -> (feathers_in_3d::WorldPanel, bevy::math::Rect) {
+        let world = *app
+            .world()
+            .get::<feathers_in_3d::WorldPanel>(root)
+            .expect("WorldPanel");
+        let size = panel_px(app, root) * world.units_to_world;
+        (world, feathers_in_3d::panel_world_rect(&world.anchor, size))
+    }
+
+    // 28. `clamp_scroll` / `scroll_to_visible` 的边界：左、右、比视口宽、负值。
+    #[test]
+    fn scroll_helpers_clamp_to_the_valid_range() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // clamp：总宽 <= 视口 → 0；否则 total - viewport。
+        assert_eq!(clamp_scroll(0.0, 0.0), 0.0);
+        assert_eq!(clamp_scroll(1200.0, 1200.0), 0.0);
+        assert!(near(clamp_scroll(1200.0, 748.8), 451.2));
+        assert_eq!(clamp_scroll(100.0, 748.8), 0.0, "内容比视口窄：不滚");
+        assert_eq!(clamp_scroll(-5.0, 100.0), 0.0, "负总宽当 0");
+        assert_eq!(clamp_scroll(f32::NAN, 100.0), 0.0, "NaN 当 0");
+        assert_eq!(clamp_scroll(100.0, f32::INFINITY), 0.0, "∞ 视口 = 全可见");
+
+        // 已经在视口里：一个像素都不动。
+        assert_eq!(scroll_to_visible(40.0, 100.0, 200.0, 748.8), 40.0);
+        // 列在视口左边：滚到列的左边（左边优先）。
+        assert_eq!(scroll_to_visible(300.0, 120.0, 200.0, 748.8), 120.0);
+        // 列在视口右边：滚到列右边界贴视口右边界。
+        assert!(near(
+            scroll_to_visible(0.0, 700.0, 200.0, 748.8),
+            151.2
+        ));
+        // 列比视口宽：左贴边（右边界必然超出）。
+        assert_eq!(scroll_to_visible(500.0, 300.0, 1200.0, 748.8), 300.0);
+        // 负 scroll / 负 x 夹到 0；0 宽视口不滚。
+        assert_eq!(scroll_to_visible(-50.0, 100.0, 200.0, 748.8), 0.0);
+        assert_eq!(scroll_to_visible(0.0, -50.0, 200.0, 748.8), 0.0);
+        assert_eq!(scroll_to_visible(50.0, 100.0, 200.0, 0.0), 0.0);
+        // 夹过的结果再交给 clamp：不超过内容末端。
+        let target = scroll_to_visible(0.0, 1000.0, 200.0, 748.8);
+        assert!(near(clamp_scroll(1400.0, 748.8), 651.2));
+        assert!(target <= clamp_scroll(1400.0, 748.8));
+    }
+
+    // 29. 给工作区设 scroll=200px：转写列左移 200px，Hints/Status（chrome）不动，
+    //     面板尺寸不变；另一个工作区一个像素都不动。
+    #[test]
+    fn scrolling_a_workspace_moves_the_strip_but_not_the_chrome_rows() {
+        const SCROLL: f32 = 200.0;
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let before_a = area_centers(&app, a);
+        let before_b = area_centers(&app, b);
+        let sizes_before = panel_sizes(&app, a);
+        let anchor_before = app
+            .world()
+            .get::<feathers_in_3d::WorldPanel>(root_of(&app, a, PanelId::Transcript))
+            .expect("WorldPanel")
+            .anchor
+            .translation;
+
+        app.world_mut()
+            .get_mut::<WorkspaceScroll>(a)
+            .expect("工作区带 WorkspaceScroll")
+            .scroll = SCROLL;
+        app.update();
+
+        let after_a = area_centers(&app, a);
+        for id in [PanelId::Transcript, PanelId::Input, PanelId::Complete] {
+            assert!(
+                (after_a[&id].x - (before_a[&id].x - SCROLL)).abs() < 1e-3,
+                "{id:?} 在条带里，应该左移 {SCROLL}px：{} -> {}",
+                before_a[&id].x,
+                after_a[&id].x
+            );
+            assert_eq!(after_a[&id].y, before_a[&id].y, "{id:?} 不上下动");
+        }
+        for id in [PanelId::Hints, PanelId::Status] {
+            assert_eq!(
+                after_a[&id], before_a[&id],
+                "{id:?} 是横跨整条的 chrome，固定在视口里"
+            );
+        }
+        // 3D 锚点同样左移 200px（世界米）：这是"转写列 rect 左移"的直接证据。
+        let anchor_after = app
+            .world()
+            .get::<feathers_in_3d::WorldPanel>(root_of(&app, a, PanelId::Transcript))
+            .expect("WorldPanel")
+            .anchor
+            .translation;
+        assert!(
+            (anchor_after.x - (anchor_before.x - SCROLL * UNITS_TO_WORLD)).abs() < 1e-5,
+            "转写锚点 x：{} -> {}（期望左移 {SCROLL}px）",
+            anchor_before.x,
+            anchor_after.x
+        );
+        // 尺寸不因滚动而改（裁剪不是把面板改小）。
+        assert_eq!(panel_sizes(&app, a), sizes_before);
+        // 非聚焦工作区不受影响。
+        assert_eq!(area_centers(&app, b), before_b);
+    }
+
+    // 30. scroll = 0（默认）：每个工作区面板都挂条带视口，但有效裁剪矩形 == 自身矩形。
+    #[test]
+    fn without_scroll_every_panel_clips_to_its_own_rect() {
+        let app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        for workspace in [a, b] {
+            let panels = app
+                .world()
+                .get::<WorkspacePanels>(workspace)
+                .expect("WorkspacePanels");
+            let mut seen = 0;
+            for id in [
+                PanelId::Transcript,
+                PanelId::Input,
+                PanelId::Status,
+                PanelId::Complete,
+                PanelId::Hints,
+                PanelId::Confirm,
+            ] {
+                let Some(root) = panels.roots.entity(id) else {
+                    continue;
+                };
+                let (world, rect) = panel_rect(&app, root);
+                let clip = world.clip.unwrap_or_else(|| panic!("{id:?} 要有条带视口"));
+                let effective = feathers_in_3d::effective_clip(rect, Some(clip));
+                assert!(
+                    (effective.min - rect.min).length() < 1e-4
+                        && (effective.max - rect.max).length() < 1e-4,
+                    "{id:?} 的裁剪矩形必须等于面板自身：{effective:?} vs {rect:?}"
+                );
+                seen += 1;
+            }
+            assert!(seen >= 6, "六块面板都要检查（实际 {seen}）");
+        }
+    }
+
+    // 31. 面板整个滚出视口：仍然存在（不 despawn），有效裁剪矩形为空、不 panic。
+    #[test]
+    fn a_panel_fully_outside_the_viewport_stays_alive_with_an_empty_clip() {
+        let mut app = app_with_two_workspaces();
+        let (a, _) = workspaces(&app);
+        app.world_mut()
+            .get_mut::<WorkspaceScroll>(a)
+            .expect("WorkspaceScroll")
+            .scroll = 10_000.0;
+        app.update();
+
+        let root = root_of(&app, a, PanelId::Transcript);
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "滚出视口不 despawn 面板"
+        );
+        let (world, rect) = panel_rect(&app, root);
+        let clip = world.clip.expect("条带视口还在");
+        let effective = feathers_in_3d::effective_clip(rect, Some(clip));
+        assert!(
+            effective.is_empty(),
+            "完全在视口外：交集为空（{effective:?}）"
+        );
+        // 空交集也算得出材质 uniform（宽/高 0），没有 panic。
+        assert!(effective.width() == 0.0 || effective.height() == 0.0);
     }
 
     // 26. 整理会把拖过的位置重置回 order 对应的竖直序列。

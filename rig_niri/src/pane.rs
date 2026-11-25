@@ -2298,6 +2298,7 @@ mod tests {
                 WorldPanel {
                     units_to_world: crate::frame::UNITS_TO_WORLD,
                     anchor: Transform::default(),
+                    clip: None,
                 },
                 // 800px 宽、没有边框/内边距：行首在面板局部 x = -400。
                 ComputedNode {
