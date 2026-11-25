@@ -32,6 +32,7 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, Window};
+use bevy_feathers::theme::{ThemeBackgroundColor, ThemeBorderColor, ThemeToken, UiTheme};
 use bevy_ui::{BorderRadius, Node, UiRect, px};
 use feathers_in_3d::{MirrorRoot, WorldLayer, WorldPanel};
 
@@ -39,6 +40,10 @@ use crate::layout::{self, Node as LayoutNode};
 use crate::niri::TileRect;
 use crate::pane::{ActiveTranscript, TranscriptPane};
 use crate::panels::{PanelId, PanelRows};
+use crate::theme::{
+    BAR_BG, CONFIRM_BG, FOCUS_BORDER, INPUT_BG, PANEL_BG, PANEL_BORDER as PANEL_BORDER_TOKEN,
+    PANEL_RADIUS,
+};
 use crate::workspaces::{Workspace, WorkspacePanel, WorkspacePanels, WorkspaceSet};
 
 pub use crate::panels::PanelRoots;
@@ -47,8 +52,17 @@ pub use crate::panels::PanelRoots;
 pub const CELL: Vec2 = Vec2::new(7.8, crate::transcript::ROW_HEIGHT);
 
 /// 面板默认装饰（内边距 + 边框）。
+///
+/// feathers 目前只把**颜色**做成 design token（`bevy_feathers::tokens`），
+/// 间距/边框宽度还没有 token：`containers::pane` 的 body padding 是 6px、
+/// `group` 的边框是 1px。这里先集中成两个常量（不要散落到 `PanelInset`
+/// 的字面量里），等 feathers 出 spacing/border token 后由 token 覆盖。
 pub const PANEL_PADDING: f32 = 8.0;
 pub const PANEL_BORDER: f32 = 2.0;
+
+/// 细条（状态行 / 键位提示）的内边距与边框：同样等 feathers token。
+pub const THIN_PADDING: f32 = 4.0;
+pub const THIN_BORDER: f32 = 1.0;
 
 /// UI 像素 → 世界米的换算（与 rig_niri 里各面板一致）。
 pub const UNITS_TO_WORLD: f32 = 0.0018;
@@ -245,6 +259,10 @@ impl FrameEnv {
 pub struct FrameSizePinned(pub bool);
 
 /// 文字区能从面板里拿到的大小：面板尺寸减掉装饰。
+///
+/// `pad`/`border` 的单位是 UI 像素，数值来自 [`PANEL_PADDING`]/[`PANEL_BORDER`]
+/// （细条用 [`THIN_PADDING`]/[`THIN_BORDER`]）——这几个常量是唯一的来源，
+/// 不要在别处再写字面量。feathers 的间距 token 落地后，只改这几个常量。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PanelInset {
     pub pad: u16,
@@ -252,10 +270,17 @@ pub struct PanelInset {
 }
 
 impl PanelInset {
-    /// 默认：内边距 8px、边框 2px。
-    pub const DEFAULT: Self = Self { pad: 8, border: 2 };
-    /// 细条（状态行）：内边距 4px、边框 1px。
-    pub const THIN: Self = Self { pad: 4, border: 1 };
+    /// 默认：内边距 8px、边框 2px（[`PANEL_PADDING`] / [`PANEL_BORDER`]）。
+    pub const DEFAULT: Self = Self {
+        pad: PANEL_PADDING as u16,
+        border: PANEL_BORDER as u16,
+    };
+    /// 细条（状态行 / 键位提示）：内边距 4px、边框 1px
+    /// （[`THIN_PADDING`] / [`THIN_BORDER`]）。
+    pub const THIN: Self = Self {
+        pad: THIN_PADDING as u16,
+        border: THIN_BORDER as u16,
+    };
 
     /// 上下（或左右）各吃掉的像素。
     pub fn total(&self) -> f32 {
@@ -742,27 +767,19 @@ pub(crate) fn default_screen_panels(
         entity
     };
     // 输入：右列的比例子，吃掉补全 tile 和状态行之外的全部高度。
+    // 表面用 feathers 的 field 底，边框用 focus ring（composer 是常驻焦点）。
     let input = spawn(
         commands,
         PanelId::Input,
         FramePanel::tree(),
-        Look::new(
-            Color::srgb(0.05, 0.06, 0.09),
-            Color::srgb(0.30, 0.55, 0.85),
-            8.0,
-        ),
+        Look::panel(INPUT_BG, FOCUS_BORDER),
     );
     // 状态行：右列底部固定 2 格，细条里居中放 1 行字。
     let status = spawn(
         commands,
         PanelId::Status,
         FramePanel::tree().inset(PanelInset::THIN),
-        Look {
-            bg: Color::srgb(0.035, 0.045, 0.065),
-            border: Color::srgb(0.16, 0.22, 0.32),
-            radius: 6.0,
-            justify: JustifyContent::Center,
-        },
+        Look::panel(BAR_BG, PANEL_BORDER_TOKEN).justify(JustifyContent::Center),
     );
     // 转写：左列（Proportion 2，占 2/3 宽）。
     let transcript = spawn(
@@ -777,11 +794,7 @@ pub(crate) fn default_screen_panels(
         commands,
         PanelId::Complete,
         FramePanel::tree().inset(PanelInset::THIN),
-        Look::new(
-            Color::srgb(0.05, 0.07, 0.10),
-            Color::srgb(0.35, 0.45, 0.60),
-            8.0,
-        ),
+        Look::panel(BAR_BG, PANEL_BORDER_TOKEN),
     );
     // 键位提示行：固定 1 行，窄条（THIN inset），内容由 `hints::hint_panel_rows` 写。
     let hints = spawn(
@@ -789,23 +802,14 @@ pub(crate) fn default_screen_panels(
         PanelId::Hints,
         // 无内边距：这一格只有 1 行高，任何 padding 都会把字裁掉。
         FramePanel::tree().inset(PanelInset { pad: 0, border: 0 }),
-        Look {
-            bg: Color::srgb(0.035, 0.045, 0.065),
-            border: Color::srgb(0.16, 0.22, 0.32),
-            radius: 4.0,
-            justify: JustifyContent::FlexStart,
-        },
+        Look::panel(BAR_BG, PANEL_BORDER_TOKEN).justify(JustifyContent::FlexStart),
     );
     // 确认行（Ask）：没有待确认时树里是 0 高度，有就长成 n 行。
     let confirm = spawn(
         commands,
         PanelId::Confirm,
         FramePanel::tree().inset(PanelInset::THIN),
-        Look::new(
-            Color::srgb(0.07, 0.06, 0.04),
-            Color::srgb(0.55, 0.45, 0.20),
-            6.0,
-        ),
+        Look::panel(CONFIRM_BG, PANEL_BORDER_TOKEN),
     );
     roots.0.insert(PanelId::Input, input);
     roots.0.insert(PanelId::Status, status);
@@ -863,23 +867,114 @@ fn spawn_default_screen(
     rows.0.extend(screen_rows.0);
 }
 
+/// 面板底色/边框的来源。
+///
+/// F1 之后默认屏幕走 [`Paint::Token`]（feathers 的 design token）；另一个变体
+/// 留给还没迁移的调用点（picker 列、niri 默认屏幕、测试里的透明叠加面板）：
+/// 它们传的是 `Color`，行为与换皮前完全一样。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Paint {
+    /// 直接颜色：不挂 theme 组件，`UiTheme` 换了它不跟着变。
+    Color(Color),
+    /// feathers 设计 token：颜色由 `UiTheme` 解析（没有资源时用 feathers 暗色
+    /// 主题兜底），并挂 [`ThemeBackgroundColor`]/[`ThemeBorderColor`] 组件。
+    Token(ThemeToken),
+}
+
+impl From<Color> for Paint {
+    fn from(color: Color) -> Self {
+        Self::Color(color)
+    }
+}
+
+impl From<ThemeToken> for Paint {
+    fn from(token: ThemeToken) -> Self {
+        Self::Token(token)
+    }
+}
+
 /// 一块面板的观感（底色、边框、圆角）。
-#[derive(Clone, Copy, Debug)]
+///
+/// `bg`/`border` 可以是 feathers 的 [`ThemeToken`]（[`Look::panel`]）或直接
+/// `Color`（[`Look::new`]，旧调用点）。圆角没有 feathers token，用
+/// [`crate::theme::PANEL_RADIUS`]。
+#[derive(Clone, Debug)]
 pub struct Look {
-    pub bg: Color,
-    pub border: Color,
+    pub bg: Paint,
+    pub border: Paint,
     pub radius: f32,
     /// 内容比面板矮时怎么放（状态行居中，转写从顶）。
     pub justify: JustifyContent,
 }
 
 impl Look {
-    pub fn new(bg: Color, border: Color, radius: f32) -> Self {
+    /// 直接给颜色：不挂 theme 组件，`UiTheme` 变了不跟着变。
+    ///
+    /// 参数是 `impl Into<Paint>`，所以老的 `Look::new(Color, Color, radius)`
+    /// 调用点（picker / niri / 测试）不用改。
+    pub fn new(bg: impl Into<Paint>, border: impl Into<Paint>, radius: f32) -> Self {
         Self {
-            bg,
-            border,
+            bg: bg.into(),
+            border: border.into(),
             radius,
             justify: JustifyContent::FlexStart,
+        }
+    }
+
+    /// 面板 chrome 全部走 feathers token：底色/边框挂 theme 组件，圆角用
+    /// [`crate::theme::PANEL_RADIUS`]（feathers `containers::pane`/`group` 的 4px）。
+    pub fn panel(bg: ThemeToken, border: ThemeToken) -> Self {
+        Self::new(bg, border, PANEL_RADIUS)
+    }
+
+    /// 内容比面板矮时怎么放（状态行居中）。
+    pub fn justify(mut self, justify: JustifyContent) -> Self {
+        self.justify = justify;
+        self
+    }
+}
+
+/// 面板 chrome 由 feathers token 驱动（挂了 `ThemeBackgroundColor`/`ThemeBorderColor`）。
+///
+/// [`sync_panel_chrome`] 只刷这些实体：直接给颜色的旧面板不归它管。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PanelChrome;
+
+/// 把一个 [`Paint`] 解析成当前颜色：有 tokens 走主题，没主题走 feathers 暗色兜底。
+fn resolve_paint(paint: &Paint) -> Color {
+    match paint {
+        Paint::Color(color) => *color,
+        Paint::Token(token) => crate::theme::ui_theme_or_default(None).color(token),
+    }
+}
+
+/// 每帧把面板根上的 token 解析成真实颜色。
+///
+/// * 有 `UiTheme` 资源：用资源里的颜色（测试可断言 `== UiTheme.color(token)`）；
+/// * 没有资源（headless / 最小 App）：退到 [`crate::theme::default_ui_theme`]，
+///   不 panic；
+/// * 只在颜色真的变了才写 `BackgroundColor`/`BorderColor`，不每帧触发
+///   change detection。
+///
+/// 装了 `bevy_feathers::FeathersPlugins` 时它的 `theme::update_theme` 也会刷
+/// 同样的组件（PostUpdate，带 `ThemeContext`）；两边解析的是同一个 token，
+/// 结果一致，先后无所谓。
+fn sync_panel_chrome(
+    theme: Option<Res<UiTheme>>,
+    mut backgrounds: Query<(&ThemeBackgroundColor, &mut BackgroundColor), With<PanelChrome>>,
+    mut borders: Query<(&ThemeBorderColor, &mut BorderColor), With<PanelChrome>>,
+) {
+    let theme = crate::theme::ui_theme_or_default(theme.as_deref());
+    for (ThemeBackgroundColor(token), mut background) in &mut backgrounds {
+        let color = theme.color(token);
+        if background.0 != color {
+            background.0 = color;
+        }
+    }
+    for (ThemeBorderColor(token), mut border) in &mut borders {
+        let color = theme.color(token);
+        if border.top != color {
+            border.set_all(color);
         }
     }
 }
@@ -892,6 +987,10 @@ pub fn spawn_panel(
     look: Look,
 ) -> Entity {
     let inset = panel.inset;
+    // 先按"没有主题资源"的 feathers 暗色主题给一个初值；有 `UiTheme` 时
+    // `sync_panel_chrome` 在同一帧的 Update 里会刷成资源里的颜色。
+    let background = resolve_paint(&look.bg);
+    let border = resolve_paint(&look.border);
     let mut entity = commands.spawn((
         Name::new(format!("panel:{id:?}")),
         id,
@@ -911,8 +1010,8 @@ pub fn spawn_panel(
             justify_content: look.justify,
             ..default()
         },
-        BackgroundColor(look.bg),
-        BorderColor::all(look.border),
+        BackgroundColor(background),
+        BorderColor::all(border),
         WorldPanel {
             units_to_world: UNITS_TO_WORLD,
             anchor: Transform::default(),
@@ -920,6 +1019,19 @@ pub fn spawn_panel(
         WorldLayer(panel.layer),
         MirrorRoot,
     ));
+    // token 版 chrome：挂 feathers 的 theme 组件，并标记给 `sync_panel_chrome`。
+    let mut themed = false;
+    if let Paint::Token(token) = &look.bg {
+        entity.insert(ThemeBackgroundColor(token.clone()));
+        themed = true;
+    }
+    if let Paint::Token(token) = &look.border {
+        entity.insert(ThemeBorderColor(token.clone()));
+        themed = true;
+    }
+    if themed {
+        entity.insert(PanelChrome);
+    }
     // 转写类窗格带逐窗格状态（来源/标题/滚动/选中）；其余面板没有。
     if matches!(id, PanelId::Transcript | PanelId::Pane2) {
         entity.insert(TranscriptPane::default());
@@ -928,12 +1040,10 @@ pub fn spawn_panel(
 }
 
 /// 转写类面板的观感（主转写和拆出来的第二个窗格用同一套）。
+///
+/// 表面/边框走 feathers pane token（比状态行亮一档的 pane body）；圆角 4px。
 fn transcript_look() -> Look {
-    Look::new(
-        Color::srgb(0.045, 0.055, 0.08),
-        Color::srgb(0.25, 0.62, 0.95),
-        14.0,
-    )
+    Look::panel(PANEL_BG, PANEL_BORDER_TOKEN)
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1147,12 @@ impl Plugin for FramePlugin {
                 )
                     .chain()
                     .in_set(crate::FeathersSystems::Layout),
+            )
+            // chrome 的 token → 颜色解析：布局之后、渲染之前（没有 `UiTheme`
+            // 资源时用 feathers 暗色主题兜底，headless 测试也跑这条路）。
+            .add_systems(
+                Update,
+                sync_panel_chrome.in_set(crate::FeathersSystems::Render),
             );
         add_split_key(app);
     }
@@ -1887,6 +2003,220 @@ mod tests {
         match app.world().get::<Node>(entity).expect("面板 Node").width {
             bevy_ui::Val::Px(width) => width,
             other => panic!("Node 宽度应当是像素：{other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // F1：面板 chrome 走 feathers token（底/边框/圆角）
+    // -----------------------------------------------------------------------
+
+    /// 一份把 feathers 暗色主题里两个 surface 换成测试色的 `UiTheme`。
+    fn theme_with_surfaces(bg: Color, border: Color) -> UiTheme {
+        let mut theme = crate::theme::dark_ui_theme();
+        theme
+            .0
+            .semantic_base
+            .insert(bevy_feathers::tokens::semantic::SURFACE_PANE_BODY, bg);
+        theme
+            .0
+            .semantic_base
+            .insert(bevy_feathers::tokens::semantic::SURFACE_SUBPANE_HEADER, border);
+        theme
+    }
+
+    /// 只装 `FramePlugin`（默认屏幕 + chrome 解析），不建窗口/UI 插件。
+    fn chrome_app(theme: Option<UiTheme>) -> App {
+        let mut app = App::new();
+        app.init_resource::<PanelRoots>()
+            .init_resource::<PanelRows>()
+            .add_plugins(FramePlugin);
+        if let Some(theme) = theme {
+            app.insert_resource(theme);
+        }
+        app
+    }
+
+    /// 面板根的底色/边框 = `UiTheme.color(token)`，不是硬编码值；
+    /// 根上挂着 feathers 的 `ThemeBackgroundColor`/`ThemeBorderColor`。
+    #[test]
+    fn panel_chrome_comes_from_the_ui_theme_tokens() {
+        if std::env::var("RF_NIRI_LAYOUT").is_ok() {
+            return; // Niri 模式接管时默认屏幕不 spawn。
+        }
+        let bg = Color::srgb(0.11, 0.22, 0.33);
+        let border = Color::srgb(0.44, 0.55, 0.66);
+        let mut app = chrome_app(Some(theme_with_surfaces(bg, border)));
+        app.update();
+
+        let theme = app.world().resource::<UiTheme>();
+        // 测试色确实落到了这两个 token 上（防止断言的是同一份错误值）。
+        assert_eq!(theme.color(&crate::theme::PANEL_BG), bg);
+        assert_eq!(theme.color(&crate::theme::PANEL_BORDER), border);
+
+        let roots = app.world().resource::<PanelRoots>();
+        let transcript = roots.entity(PanelId::Transcript).expect("转写面板");
+        let input = roots.entity(PanelId::Input).expect("输入面板");
+        let status = roots.entity(PanelId::Status).expect("状态面板");
+        for entity in [transcript, input, status] {
+            let background = app
+                .world()
+                .get::<BackgroundColor>(entity)
+                .expect("面板根有 BackgroundColor");
+            let token = app
+                .world()
+                .get::<ThemeBackgroundColor>(entity)
+                .expect("token 版面板要挂 ThemeBackgroundColor");
+            assert_eq!(
+                background.0,
+                theme.color(&token.0),
+                "底色必须等于 UiTheme.color({})",
+                token.0
+            );
+            let border_color = app
+                .world()
+                .get::<BorderColor>(entity)
+                .expect("面板根有 BorderColor");
+            let border_token = app
+                .world()
+                .get::<ThemeBorderColor>(entity)
+                .expect("token 版面板要挂 ThemeBorderColor");
+            assert_eq!(
+                border_color.top,
+                theme.color(&border_token.0),
+                "边框必须等于 UiTheme.color({})",
+                border_token.0
+            );
+            // 转写/输入/状态各用自己那档 token，不是同一个写死的颜色。
+            assert_eq!(
+                token.0,
+                match entity {
+                    e if e == transcript => crate::theme::PANEL_BG,
+                    e if e == input => crate::theme::INPUT_BG,
+                    _ => crate::theme::BAR_BG,
+                }
+            );
+        }
+        // 圆角来自 feathers 的 pane/group 常量（集中成 theme::PANEL_RADIUS）。
+        let node = app.world().get::<Node>(transcript).expect("Node");
+        assert_eq!(
+            node.border_radius,
+            BorderRadius::all(px(crate::theme::PANEL_RADIUS))
+        );
+    }
+
+    /// 没有 `UiTheme` 资源（headless / 最小 App）：退到 feathers 暗色主题，
+    /// 不 panic，解析出来的就是 `dark_theme` 里的颜色。
+    #[test]
+    fn panel_chrome_falls_back_to_the_dark_theme_without_a_ui_theme() {
+        if std::env::var("RF_NIRI_LAYOUT").is_ok() {
+            return;
+        }
+        let mut app = chrome_app(None);
+        app.update();
+        assert!(
+            app.world().get_resource::<UiTheme>().is_none(),
+            "这条路径故意不插 UiTheme"
+        );
+
+        let fallback = crate::theme::default_ui_theme();
+        let roots = app.world().resource::<PanelRoots>();
+        let mut seen = 0;
+        for entity in roots.0.values() {
+            let Some(ThemeBackgroundColor(token)) = app.world().get::<ThemeBackgroundColor>(*entity)
+            else {
+                continue;
+            };
+            let background = app
+                .world()
+                .get::<BackgroundColor>(*entity)
+                .expect("面板根有 BackgroundColor");
+            assert_eq!(background.0, fallback.color(token));
+            seen += 1;
+        }
+        assert!(seen >= 4, "默认屏幕的面板应当都走 token（实际 {seen} 块）");
+    }
+
+    /// 换主题后同一帧内重刷：`UiTheme` 是 chrome 的唯一颜色来源。
+    #[test]
+    fn changing_the_ui_theme_repaints_the_panel_chrome() {
+        if std::env::var("RF_NIRI_LAYOUT").is_ok() {
+            return;
+        }
+        let first = Color::srgb(0.10, 0.20, 0.30);
+        let second = Color::srgb(0.60, 0.50, 0.40);
+        let mut app = chrome_app(Some(theme_with_surfaces(first, first)));
+        app.update();
+
+        let roots = app.world().resource::<PanelRoots>();
+        let transcript = roots.entity(PanelId::Transcript).expect("转写面板");
+        let background = |app: &App| {
+            app.world()
+                .get::<BackgroundColor>(transcript)
+                .expect("BackgroundColor")
+                .0
+        };
+        assert_eq!(background(&app), first);
+
+        app.world_mut()
+            .resource_mut::<UiTheme>()
+            .0
+            .semantic_base
+            .insert(bevy_feathers::tokens::semantic::SURFACE_PANE_BODY, second);
+        app.update();
+        assert_eq!(background(&app), second, "换主题要重新解析 token");
+    }
+
+    /// 换皮不动几何：两种主题下 `PanelAreas` 的 rect/尺寸、`Node` 的
+    /// 宽高/padding/border 完全一致（裁剪、行点击、滚动都靠这些）。
+    #[test]
+    fn feathers_chrome_does_not_change_panel_geometry() {
+        if std::env::var("RF_NIRI_LAYOUT").is_ok() {
+            return;
+        }
+        let mut plain = chrome_app(None);
+        plain.update();
+        let mut themed = chrome_app(Some(theme_with_surfaces(
+            Color::srgb(0.11, 0.22, 0.33),
+            Color::srgb(0.44, 0.55, 0.66),
+        )));
+        themed.update();
+
+        let ids = [
+            PanelId::Transcript,
+            PanelId::Input,
+            PanelId::Status,
+            PanelId::Complete,
+            PanelId::Hints,
+            PanelId::Confirm,
+        ];
+        for id in ids {
+            let a = plain
+                .world()
+                .resource::<PanelRoots>()
+                .entity(id)
+                .unwrap_or_else(|| panic!("{id:?} 面板"));
+            let b = themed
+                .world()
+                .resource::<PanelRoots>()
+                .entity(id)
+                .unwrap_or_else(|| panic!("{id:?} 面板"));
+            let area_a = plain.world().resource::<PanelAreas>().get(a).expect("区域");
+            let area_b = themed.world().resource::<PanelAreas>().get(b).expect("区域");
+            assert_eq!(area_a, area_b, "{id:?} 的面板区域不能因换肤而变");
+
+            let node_a = plain.world().get::<Node>(a).expect("Node");
+            let node_b = themed.world().get::<Node>(b).expect("Node");
+            assert_eq!(node_a.width, node_b.width, "{id:?} 宽度");
+            assert_eq!(node_a.height, node_b.height, "{id:?} 高度");
+            assert_eq!(node_a.padding, node_b.padding, "{id:?} padding");
+            assert_eq!(node_a.border, node_b.border, "{id:?} border");
+            // inset 仍然来自该面板自己的 `PanelInset`（文字区/裁剪的输入）。
+            let inset = themed
+                .world()
+                .get::<FramePanel>(b)
+                .expect("FramePanel")
+                .inset;
+            assert_eq!(node_a.padding, UiRect::all(px(f32::from(inset.pad))));
         }
     }
 }

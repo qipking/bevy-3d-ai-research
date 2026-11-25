@@ -77,7 +77,8 @@ pub mod prelude {
     };
     pub use crate::editor::{Editor, PromptSubmitted, SubmittedPrompts};
     pub use crate::frame::{
-        CellRect, FramePanel, FrameSize, FrameGeometry, FramePlugin, Placement,
+        CellRect, FramePanel, FrameSize, FrameGeometry, FramePlugin, Look, Paint, PanelChrome,
+        Placement,
     };
     pub use crate::frame::FrameTree;
     pub use crate::frame::{add_split_key, split_binding, split_transcript};
@@ -142,6 +143,20 @@ pub struct FeathersViewPlugin;
 
 impl Plugin for FeathersViewPlugin {
     fn build(&self, app: &mut App) {
+        // feathers 的 `UiTheme`：面板 chrome（底/边框）的颜色来源。
+        //
+        // `bevy_feathers::FeathersPlugins` 会 `init_resource::<UiTheme>()` 插一个
+        // **空** `ThemeProps`（所有 token 查不到 → fuchsia）。这里只在"缺失或
+        // 空"时换成 `dark_theme::create_dark_theme()`：调用方自己配好的主题
+        // 不会被覆盖；没装 UI 库的最小 App 也有一份能查的暗色主题。
+        let configured = app
+            .world()
+            .get_resource::<bevy_feathers::theme::UiTheme>()
+            .is_some_and(|ui_theme| !theme::is_unconfigured(ui_theme));
+        if !configured {
+            app.insert_resource(theme::dark_ui_theme());
+        }
+
         app.configure_sets(
             Update,
             (
@@ -194,3 +209,54 @@ impl Plugin for FeathersViewPlugin {
 
 /// 旧名字，保留以免破坏已有调用。
 pub type FeathersFrontPlugin = FeathersViewPlugin;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_feathers::theme::UiTheme;
+
+    /// 只跑 `Plugin::build`，不 `update`：这条测试只关心 `UiTheme` 的装配。
+    fn view_app(ui_theme: Option<UiTheme>) -> App {
+        let mut app = App::new();
+        if let Some(ui_theme) = ui_theme {
+            app.insert_resource(ui_theme);
+        }
+        app.add_plugins(FeathersViewPlugin);
+        app
+    }
+
+    /// F1：空/缺失的 `UiTheme` 由插件补成 feathers 暗色主题，面板 token 查得到颜色。
+    #[test]
+    fn the_view_plugin_installs_the_feathers_dark_theme() {
+        // 缺失：插一份 dark theme。
+        let app = view_app(None);
+        let theme = app.world().resource::<UiTheme>();
+        assert!(!crate::theme::is_unconfigured(theme));
+
+        // `FeathersPlugins` 插的空主题：也补成 dark theme（否则 token 返回 fuchsia）。
+        let app = view_app(Some(UiTheme::default()));
+        let theme = app.world().resource::<UiTheme>();
+        assert!(!crate::theme::is_unconfigured(theme));
+        assert_eq!(
+            theme.color(&crate::theme::PANEL_BG),
+            crate::theme::dark_ui_theme().color(&crate::theme::PANEL_BG)
+        );
+    }
+
+    /// 调用方自己配好的 `UiTheme` 不被插件覆盖。
+    #[test]
+    fn the_view_plugin_keeps_a_configured_ui_theme() {
+        let custom = Color::srgb(0.13, 0.57, 0.91);
+        let mut ui = crate::theme::dark_ui_theme();
+        ui.0.semantic_base
+            .insert(bevy_feathers::tokens::semantic::SURFACE_PANE_BODY, custom);
+        let app = view_app(Some(ui));
+        assert_eq!(
+            app.world()
+                .resource::<UiTheme>()
+                .color(&crate::theme::PANEL_BG),
+            custom,
+            "调用方配好的主题不能被 dark theme 盖掉"
+        );
+    }
+}

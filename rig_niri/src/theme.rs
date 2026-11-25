@@ -42,8 +42,11 @@
 //! [`Theme::from_env`]（只认 `NO_COLOR`）。
 
 use std::ffi::OsStr;
+use std::sync::OnceLock;
 
 use bevy::prelude::*;
+use bevy_feathers::theme::{ThemeToken, UiTheme};
+use bevy_feathers::{dark_theme, tokens};
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style, Stylize};
 use rig_tui::ratatui::text::{Line, Span};
 use rig_tui::ratatui::widgets::{Block, Padding};
@@ -76,6 +79,74 @@ pub const UPSTREAM_BANDS: [&str; 17] = [
 /// 一个只有一个底色的 band。
 const fn band(r: u8, g: u8, b: u8) -> Style {
     Style::new().bg(RColor::Rgb(r, g, b))
+}
+
+// ---------------------------------------------------------------------------
+// 面板 chrome：feathers 的设计 token（F1）
+// ---------------------------------------------------------------------------
+//
+// 17 个语义 band 管的是**内容**（转写行/代码块/diff/调用状态）的颜色，它们继续
+// 由 [`Theme`] 提供；这一节管的是**面板表面**（底、边框、圆角）——改用
+// `bevy_feathers` 的 `UiTheme`。两套并存的原因见 `docs/design/FEATHERS_UI.md`：
+// band 是终端时代的语义色带，feathers token 是标准 UI 的表面层级，各自负责一层。
+//
+// 取 token 的规则：面板体 = feathers 的 pane body，细条 = pane header（比
+// body 深一档），输入框 = text input 的 field 底，确认 tile = subpane header
+// （高亮一档），边框 = subpane body border（= feathers 的 `border.default`）。
+
+/// 面板表面：feathers `pane.body.bg`。
+pub const PANEL_BG: ThemeToken = tokens::PANE_BODY_BG;
+/// 细条（状态行 / 键位提示 / 补全 tile）表面：feathers `pane.header.bg`。
+pub const BAR_BG: ThemeToken = tokens::PANE_HEADER_BG;
+/// 输入框表面：feathers `textinput.bg`（field 底，比 pane body 亮一档）。
+pub const INPUT_BG: ThemeToken = tokens::TEXT_INPUT_BG;
+/// 确认/待确认 tile 表面：feathers `subpane.header.bg`（比 body 亮一档）。
+pub const CONFIRM_BG: ThemeToken = tokens::SUBPANE_HEADER_BG;
+/// 面板边框：feathers `subpane.body.border`（= `border.default`）。
+pub const PANEL_BORDER: ThemeToken = tokens::SUBPANE_BODY_BORDER;
+/// 输入框的焦点环：feathers `focus.ring`（强调色半透明）。
+pub const FOCUS_BORDER: ThemeToken = tokens::FOCUS_RING;
+
+/// 面板圆角（UI 像素）。
+///
+/// feathers 只有颜色是 design token，圆角/间距在 `bevy_feathers::constants` 里
+/// 是普通常量（或者直接写在 `containers::pane`/`group` 的 4px）。这里对齐
+/// `bevy_feathers::containers::{pane, group}` 的 4px，集中成**一个**常量：
+/// 等 feathers 出圆角 token 时只改这里。
+pub const PANEL_RADIUS: f32 = 4.0;
+
+/// 一份 feathers 标准暗色主题（`dark_theme::create_dark_theme`）。
+///
+/// `FeathersViewPlugin` 用它初始化 `UiTheme`；没有 UI 库/没插资源的最小 App
+/// 也用同一份兜底，保证 headless 测试里 token 查得到颜色而不是 fuchsia。
+pub fn dark_ui_theme() -> UiTheme {
+    UiTheme(dark_theme::create_dark_theme())
+}
+
+/// 进程内唯一的兜底主题：没有 `UiTheme` 资源时（headless 测试、最小 App）用它。
+///
+/// `create_dark_theme` 要建几张 HashMap，逐帧重建太浪费；`OnceLock` 只建一次。
+/// 测试想验证"没有资源也不 panic"时直接读它。
+pub fn default_ui_theme() -> &'static UiTheme {
+    static DEFAULT: OnceLock<UiTheme> = OnceLock::new();
+    DEFAULT.get_or_init(dark_ui_theme)
+}
+
+/// 取当前主题：有 `UiTheme` 资源用资源，没有就退到 [`default_ui_theme`]。
+///
+/// 这是面板 chrome 的唯一取色入口：面板系统全部经它读 token，所以测试里
+/// 没插 `UiTheme` 也只拿到 feathers 的暗色值，不会 panic。
+pub fn ui_theme_or_default(theme: Option<&UiTheme>) -> &UiTheme {
+    theme.unwrap_or_else(|| default_ui_theme())
+}
+
+/// `UiTheme` 是不是"没配过"的空主题。
+///
+/// `bevy_feathers::FeathersPlugins` 会 `init_resource::<UiTheme>()` 插一个
+/// 空 `ThemeProps`（所有 token 查不到、返回 fuchsia）。`FeathersViewPlugin`
+/// 只在"缺失或空"时把它换成 [`dark_ui_theme`]，不覆盖调用方自己配好的主题。
+pub(crate) fn is_unconfigured(theme: &UiTheme) -> bool {
+    theme.0.token_assignments.is_empty()
 }
 
 #[derive(Clone, Copy, Debug, Resource)]
@@ -522,5 +593,71 @@ mod tests {
             RColor::Reset,
             "无色版的面板表面不该有底色"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F1：面板 chrome 的 feathers token
+    // -----------------------------------------------------------------------
+
+    /// 面板表面/边框用的就是 feathers 的设计 token（不是本地自造的名字）。
+    #[test]
+    fn panel_chrome_tokens_are_the_feathers_design_tokens() {
+        assert_eq!(PANEL_BG, tokens::PANE_BODY_BG);
+        assert_eq!(BAR_BG, tokens::PANE_HEADER_BG);
+        assert_eq!(INPUT_BG, tokens::TEXT_INPUT_BG);
+        assert_eq!(CONFIRM_BG, tokens::SUBPANE_HEADER_BG);
+        assert_eq!(PANEL_BORDER, tokens::SUBPANE_BODY_BORDER);
+        assert_eq!(FOCUS_BORDER, tokens::FOCUS_RING);
+        // 圆角没有 token：对齐 feathers containers::pane/group 的 4px。
+        assert_eq!(PANEL_RADIUS, 4.0);
+    }
+
+    /// 每个 chrome token 在 feathers 暗色主题里都查得到，不会退到错误色 fuchsia。
+    #[test]
+    fn every_panel_token_resolves_in_the_feathers_dark_theme() {
+        let theme = dark_ui_theme();
+        let error: Color = bevy::color::palettes::basic::FUCHSIA.into();
+        for token in [
+            PANEL_BG,
+            BAR_BG,
+            INPUT_BG,
+            CONFIRM_BG,
+            PANEL_BORDER,
+            FOCUS_BORDER,
+        ] {
+            let color = theme.color(&token);
+            assert_ne!(color, error, "{token} 没有在主题里赋值");
+        }
+        // 细条（pane header）与面板体（pane body）不是同一个表面色。
+        assert_ne!(theme.color(&BAR_BG), theme.color(&PANEL_BG));
+        // 输入框（field 底）比面板体亮一档。
+        assert_ne!(theme.color(&INPUT_BG), theme.color(&PANEL_BG));
+    }
+
+    /// 没有 `UiTheme` 时退到 feathers 暗色主题；有资源时用资源的颜色。
+    #[test]
+    fn theme_lookup_falls_back_to_the_feathers_dark_theme() {
+        assert!(!is_unconfigured(default_ui_theme()));
+        for token in [PANEL_BG, PANEL_BORDER, BAR_BG] {
+            assert_eq!(
+                ui_theme_or_default(None).color(&token),
+                default_ui_theme().color(&token)
+            );
+        }
+        assert!(!is_unconfigured(&dark_ui_theme()));
+
+        // 空 `ThemeProps`（FeathersPlugins 的 init_resource）会被认成"没配过"。
+        let empty = UiTheme::default();
+        assert!(is_unconfigured(&empty));
+
+        // 自定义过的主题：按资源里的颜色解析，不被默认值盖掉。
+        let custom = Color::srgb(0.12, 0.34, 0.56);
+        let mut ui = dark_ui_theme();
+        ui.0.semantic_base
+            .insert(tokens::semantic::SURFACE_PANE_BODY, custom);
+        assert_eq!(ui_theme_or_default(Some(&ui)).color(&PANEL_BG), custom);
+        // 17 个 band 的语义不受 chrome token 影响（两套并存，各管一层）。
+        assert_eq!(Theme::default().band, RColor::Rgb(20, 26, 38));
+        assert_eq!(Theme::default().code, band(39, 44, 55));
     }
 }

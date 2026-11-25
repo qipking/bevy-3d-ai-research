@@ -1238,6 +1238,9 @@ pub fn picker_rows(
             row = row.picker_choice(picker_entity, *index);
         }
         if selected {
+            // 当前项用 `Row::band` 当标记（`Row` 的公开结构不动）：
+            // `transcript` 的按钮样式把有 band 的 picker 行换成
+            // `BUTTON_PRIMARY_*` 并画 focus ring，不再用它当行底色。
             row = row.band(theme.band);
         }
         rows.push(keyed(key_of(&["row", &row_index.to_string()]), key_hash, row));
@@ -1551,6 +1554,25 @@ mod tests {
         let entity = app.world_mut().spawn(picker).id();
         app.update();
         entity
+    }
+
+    /// 只要行实体（不要 picker 逻辑）的 App：在 [`tiled_app`] 上装 `PanelsPlugin`。
+    fn tiled_app_with_rows() -> App {
+        let mut app = tiled_app();
+        app.add_plugins(crate::panels::PanelsPlugin)
+            .insert_resource(crate::transcript::TranscriptFont(
+                bevy::text::FontSource::default(),
+            ));
+        app
+    }
+
+    /// 列表 tile 下生成的行实体。
+    fn spawned_list_rows(app: &App) -> Vec<Entity> {
+        let list = column_entities(app).1.expect("列表面板");
+        app.world()
+            .get::<Children>(list)
+            .map(|children| children.iter().collect())
+            .unwrap_or_default()
     }
 
     fn titled_picker(title: &str, label: &str) -> Picker {
@@ -1977,6 +1999,80 @@ mod tests {
         assert!(
             rows.0.get(&PanelId::Picker).is_none(),
             "容器面板不产行（没有 Overlay 那一层）"
+        );
+    }
+
+    /// F2：picker 当前项的按钮外观与 focus ring 都来自 `UiTheme` token；
+    /// 移动选中项时（同一行实体原地改字）环和底色跟着走。
+    #[test]
+    fn the_current_picker_row_gets_a_focus_ring_from_the_token() {
+        let mut app = tiled_app_with_rows();
+        spawn_picker(&mut app, picker(&[("gpt", None), ("claude", None)], false));
+        give_list_an_area(&mut app);
+        app.update();
+
+        let row_of = |app: &App, index: usize| -> Entity {
+            spawned_list_rows(app)
+                .into_iter()
+                .find(|entity| {
+                    app.world()
+                        .get::<PickerChoice>(*entity)
+                        .is_some_and(|choice| choice.index == index)
+                })
+                .unwrap_or_else(|| panic!("没有条目 {index} 的行实体"))
+        };
+        let theme = crate::theme::default_ui_theme();
+        let ring = theme.color(&bevy_feathers::tokens::FOCUS_RING);
+        let primary = theme.color(&bevy_feathers::tokens::BUTTON_PRIMARY_BG);
+        let normal = theme.color(&bevy_feathers::tokens::BUTTON_PLAIN_BG);
+
+        let first = row_of(&app, 0);
+        assert_eq!(
+            app.world().get::<BorderColor>(first).expect("边框").top,
+            ring,
+            "当前项的焦点环颜色 == FOCUS_RING token"
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(first).expect("底色").0,
+            primary,
+            "当前项用 Primary 按钮底色"
+        );
+        let second = row_of(&app, 1);
+        assert_eq!(
+            app.world().get::<BorderColor>(second).expect("边框").top,
+            Color::NONE,
+            "非当前项没有环"
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(second).expect("底色").0,
+            normal
+        );
+
+        // ↓：环移到第二项；第一项回到 Normal，且不需要重建行实体。
+        let first_entity = first;
+        press(&mut app, KeyCode::ArrowDown, Key::ArrowDown);
+        app.update();
+        let second = row_of(&app, 1);
+        assert_eq!(
+            app.world().get::<BorderColor>(second).expect("边框").top,
+            ring,
+            "选中项移动后环跟着走"
+        );
+        assert_eq!(
+            app.world().get::<BackgroundColor>(second).expect("底色").0,
+            primary
+        );
+        assert_eq!(
+            app.world().get::<BorderColor>(first_entity).expect("边框").top,
+            Color::NONE,
+            "旧选中项的环收起"
+        );
+        assert_eq!(
+            app.world()
+                .get::<BackgroundColor>(first_entity)
+                .expect("底色")
+                .0,
+            normal
         );
     }
 

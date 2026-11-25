@@ -24,12 +24,17 @@
 
 use std::collections::HashMap;
 
+use bevy::picking::hover::PickingInteraction;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
 use bevy::text::{
     FontSource, LineBreak, Strikethrough, StrikethroughColor, TextBackgroundColor, TextLayout,
     Underline, UnderlineColor,
 };
+// `Interaction` 是 bevy_ui 的旧名字（0.20 已标 deprecated）；这里要的正是它的
+// hover/pressed 状态机，所以直接用底层类型 `DeprecatedInteraction`，不引 deprecation。
+use bevy::ui::{DeprecatedInteraction as Interaction, Outline, UiRect};
+use bevy_feathers::tokens;
 use bevy_ui::{BorderRadius, Node, percent, px};
 use rig_tui::LookLine;
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
@@ -37,7 +42,8 @@ use rig_tui::ratatui::text::Line;
 use rig_tui::wrap::wrap;
 use rig_tui::{RenderBatch, RenderKey, RenderRequest};
 
-use crate::panels::KeyedRow;
+use crate::panels::{KeyedRow, RowLayout};
+use crate::selection::Selection;
 use crate::style;
 use crate::theme::Theme;
 
@@ -47,6 +53,199 @@ pub struct RowText(pub String);
 
 pub const ROW_HEIGHT: f32 = 18.0;
 pub const FONT_SIZE: f32 = 13.0;
+
+// ---------------------------------------------------------------------------
+// 可点击行的按钮外观（F2）
+// ---------------------------------------------------------------------------
+//
+// `Row::choice`（Ask 选项）和 `Row::picker`（picker 条目）是**可点击的文本行**。
+// 交互仍由现有的点击 observer / 键盘处理，这里只借用 `feathers` 按钮的视觉语言：
+// 圆角、水平内边距、`UiTheme` token 的底/悬停/按下色，以及 picker 当前项的一圈
+// focus ring。**不**换成 `bevy_feathers::controls::button`：它自己装 `Button`/
+// `Hovered`/`Pressed`/`TabIndex`，会和我们的 picking、选区、键盘冲突。
+//
+// 状态机（和 `feathers::controls::button::{ButtonVariant,set_button_styles}` 同一条）：
+//
+// | 状态 | Ask 选项（Normal） | picker 条目（Plain） | picker 当前项（Primary） |
+// |---|---|---|---|
+// | 常态 | `BUTTON_BG` | `BUTTON_PLAIN_BG`（透明） | `BUTTON_PRIMARY_BG` |
+// | 悬停 | `BUTTON_BG_HOVER` | `BUTTON_PLAIN_BG_HOVER` | `BUTTON_PRIMARY_BG_HOVER` |
+// | 按下 | `BUTTON_BG_PRESSED` | `BUTTON_PLAIN_BG_PRESSED` | `BUTTON_PRIMARY_BG_PRESSED` |
+//
+// picker 条目用 Plain 变体（列表里不该每行一块实心灰底），当前项升成 Primary
+// ——和 feathers `ButtonVariant::selected(bool)` 对 toggle/radio 的用法一致。
+// `Interaction` 由 bevy_ui 的
+// `ui_focus_system` 更新（实体已有 `Pickable`，拾取照旧）；[`update_row_button_styles`]
+// 只读它，不自己轮询指针。
+
+/// [Button scene](bevy_feathers::controls::button::FeathersButton) 的圆角：
+/// `RoundedCorners::All.to_border_radius(4.0)`。feathers 的圆角还不是 token，
+/// 和 F1 的 `theme::PANEL_RADIUS` 用同一个 4px。
+pub const ROW_BUTTON_RADIUS: f32 = 4.0;
+/// 按钮 scene 的水平内边距：`UiRect::horizontal(px(8))`。
+pub const ROW_BUTTON_PADDING: f32 = 8.0;
+/// focus ring 的边框宽度：feathers `FocusIndicator` 是 `px(2)`。
+pub const ROW_FOCUS_WIDTH: f32 = 2.0;
+
+/// 可点击行是哪种按钮（决定用哪组 token）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowButtonKind {
+    /// Ask 的选项行（`Row::choice`）：Normal 按钮。
+    Choice,
+    /// picker 的条目行（`Row::picker`）：Plain；当前项用 Primary。
+    Picker,
+}
+
+/// 可点击行的按钮视觉状态。
+///
+/// `selected` 只由 picker 用：`picker_rows` 给当前项 `Row::band(..)`，这里把
+/// "有 band 的 picker 行"认成当前项（Ask 行没有选中态）。渲染层据此把该行
+/// 换成 `BUTTON_PRIMARY_*` 并画 focus ring；`Row` 的公开结构不变。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowButton {
+    pub kind: RowButtonKind,
+    pub selected: bool,
+}
+
+/// 取一个 feathers token 的颜色：`UiTheme` 里配了就用它，否则退回 feathers
+/// 暗色主题（[`crate::theme::default_ui_theme`]）。
+///
+/// 逐 token 判断（而不是整个资源）：`FeathersPlugins` 会插一个**空**的
+/// `UiTheme`，缺 token 时 `UiTheme::color` 会返回 fuchsia 并 warning。
+fn token_color(
+    theme: Option<&bevy_feathers::theme::UiTheme>,
+    token: &bevy_feathers::theme::ThemeToken,
+) -> Color {
+    match theme.filter(|theme| theme.0.token_assignments.contains_key(token)) {
+        Some(theme) => theme.color(token),
+        None => crate::theme::default_ui_theme().color(token),
+    }
+}
+
+/// 一行该用哪个 `UiTheme` token 当底色。
+fn row_button_token(
+    button: &RowButton,
+    interaction: Interaction,
+) -> bevy_feathers::theme::ThemeToken {
+    match (button.kind, button.selected, interaction) {
+        (_, true, Interaction::Pressed) => tokens::BUTTON_PRIMARY_BG_PRESSED,
+        (_, true, Interaction::Hovered) => tokens::BUTTON_PRIMARY_BG_HOVER,
+        (_, true, Interaction::None) => tokens::BUTTON_PRIMARY_BG,
+        (RowButtonKind::Choice, false, Interaction::Pressed) => tokens::BUTTON_BG_PRESSED,
+        (RowButtonKind::Choice, false, Interaction::Hovered) => tokens::BUTTON_BG_HOVER,
+        (RowButtonKind::Choice, false, Interaction::None) => tokens::BUTTON_BG,
+        (RowButtonKind::Picker, false, Interaction::Pressed) => tokens::BUTTON_PLAIN_BG_PRESSED,
+        (RowButtonKind::Picker, false, Interaction::Hovered) => tokens::BUTTON_PLAIN_BG_HOVER,
+        (RowButtonKind::Picker, false, Interaction::None) => tokens::BUTTON_PLAIN_BG,
+    }
+}
+
+/// 这一行要不要当按钮画；picker 的 `Row::band` 只表示"当前项"。
+fn row_button(row: &Row) -> Option<RowButton> {
+    match (&row.choice, &row.picker) {
+        (Some(_), _) => Some(RowButton {
+            kind: RowButtonKind::Choice,
+            selected: false,
+        }),
+        (None, Some(_)) => Some(RowButton {
+            kind: RowButtonKind::Picker,
+            selected: row.band.is_some(),
+        }),
+        (None, None) => None,
+    }
+}
+
+/// 把 bevy_ui 的 `Interaction` 和 bevy_picking 的 `PickingInteraction` 折成一个
+/// 按钮状态（pressed > hovered > none）。
+fn effective_interaction(
+    interaction: Interaction,
+    picking: Option<&PickingInteraction>,
+) -> Interaction {
+    match (interaction, picking) {
+        (Interaction::Pressed, _) | (_, Some(PickingInteraction::Pressed)) => Interaction::Pressed,
+        (Interaction::Hovered, _) | (_, Some(PickingInteraction::Hovered)) => Interaction::Hovered,
+        _ => Interaction::None,
+    }
+}
+
+/// 每帧把 `Interaction` + 选中态折成 token 颜色。
+///
+/// 这是 feathers `update_button_styles` 的本地版：只改视觉，不装它的交互组件。
+/// 实体缺 `UiTheme` 资源时用 [`crate::theme::default_ui_theme`]（feathers 暗色
+/// 主题），所以 headless 测试也查得到颜色，不会出 fuchsia。
+pub fn update_row_button_styles(
+    theme: Option<Res<bevy_feathers::theme::UiTheme>>,
+    mut rows: Query<(
+        &RowButton,
+        &Interaction,
+        Option<&PickingInteraction>,
+        &mut BackgroundColor,
+        &mut BorderColor,
+    )>,
+) {
+    for (button, interaction, picking, mut background, mut border) in &mut rows {
+        // `Interaction` 是 bevy_ui 的状态机；3D 镜像走的是 feathers_in_3d 的
+        // picking 后端，它更新的是 bevy_picking 的聚合态 `PickingInteraction`。
+        // 两个都读：标准 UI 用前者，世界空间面板用后者，仍然不轮询指针。
+        let interaction = effective_interaction(*interaction, picking);
+        let color = token_color(theme.as_deref(), &row_button_token(button, interaction));
+        if background.0 != color {
+            background.0 = color;
+        }
+        // focus ring 用边框换色（`Outline` 不被 3D 镜像支持；2px 边框一直留着，
+        // 只换颜色，所以选中/取消不会让行内容跳位）。
+        let ring = match button.selected {
+            true => token_color(theme.as_deref(), &tokens::FOCUS_RING),
+            false => Color::NONE,
+        };
+        if border.top != ring {
+            border.set_all(ring);
+        }
+    }
+}
+
+/// 键盘选中的转写条目（`Selection::item`，Alt+↑/↓）画一圈 feathers focus ring。
+///
+/// 用 bevy_ui 的 `Outline`（feathers `FocusIndicator` 的同一套值：2px + 2px
+/// offset）。鼠标拖选不是条目选中（`item()` 是 `None`），所以不会每行都套环。
+pub fn update_row_focus_rings(
+    theme: Option<Res<bevy_feathers::theme::UiTheme>>,
+    selection: Option<Res<Selection>>,
+    mut commands: Commands,
+    mut rows: Query<(Entity, &RowLayout, Option<&mut Outline>)>,
+) {
+    let ring = token_color(theme.as_deref(), &tokens::FOCUS_RING);
+    let selection = selection
+        .as_deref()
+        .filter(|selection| selection.item().is_some());
+    for (entity, layout, outline) in &mut rows {
+        let focused = selection.is_some_and(|selection| {
+            selection.panel() == Some(layout.panel)
+                && layout.index >= selection.start().row
+                && layout.index < selection.end().row
+        });
+        match (focused, outline) {
+            (true, Some(mut outline)) => {
+                if outline.color != ring {
+                    outline.color = ring;
+                }
+            }
+            (true, None) => {
+                commands.entity(entity).insert(Outline::new(
+                    px(ROW_FOCUS_WIDTH),
+                    px(ROW_FOCUS_WIDTH),
+                    ring,
+                ));
+            }
+            (false, Some(mut outline)) => {
+                if outline.color != Color::NONE {
+                    outline.color = Color::NONE;
+                }
+            }
+            (false, None) => {}
+        }
+    }
+}
 
 /// 转写里的一行：样式行 + 可选色带。
 ///
@@ -132,6 +331,11 @@ pub fn fill_row_text_themed(
         .entity(row_entity)
         .entry::<Node>()
         .and_modify(move |mut node| node.justify_content = justify);
+    // 同一行原地改字时，选中态（picker 当前项）也可能变了：只更新按钮状态，
+    // 交互组件（`Interaction`/`Pickable`/`AskChoice`/`PickerChoice`）原样不动。
+    if let Some(button) = row_button(row) {
+        commands.entity(row_entity).insert(button);
+    }
     let font = font.clone();
     commands.entity(row_entity).with_children(|parent| {
         spawn_text_line(parent, &row.line, &font, theme);
@@ -158,7 +362,8 @@ pub fn spawn_row_themed(
     theme: &Theme,
 ) -> Entity {
     let font = font.clone();
-    let mut entity = parent.spawn(Node {
+    let button = row_button(row);
+    let mut node = Node {
         width: percent(100.0),
         height: px(ROW_HEIGHT),
         // 行高固定：不让 flex 压缩（否则面板变矮时行会被挤到一起而不是溢出）
@@ -169,10 +374,29 @@ pub fn spawn_row_themed(
             true => JustifyContent::SpaceBetween,
             false => JustifyContent::FlexStart,
         },
-        border_radius: BorderRadius::all(px(3.0)),
+        border_radius: BorderRadius::all(px(match button.is_some() {
+            true => ROW_BUTTON_RADIUS,
+            false => 3.0,
+        })),
         ..default()
-    });
-    if let Some(band) = row.band {
+    };
+    if button.is_some() {
+        // 按钮 scene 的水平内边距 + 一条常驻的 2px 边框（平时透明，选中时只换色）。
+        node.padding = UiRect::horizontal(px(ROW_BUTTON_PADDING));
+        node.border = UiRect::all(px(ROW_FOCUS_WIDTH));
+    }
+    let mut entity = parent.spawn(node);
+    if let Some(button) = button {
+        // 没装 UI 库 / 没插 `UiTheme` 的最小 App：先用 feathers 暗色主题的 token
+        // 兜底；真正的主题由 `update_row_button_styles` 每帧解析。
+        let background = token_color(None, &row_button_token(&button, Interaction::None));
+        entity.insert((
+            button,
+            Interaction::None,
+            BackgroundColor(background),
+            BorderColor::all(Color::NONE),
+        ));
+    } else if let Some(band) = row.band {
         entity.insert(BackgroundColor(color_with_alpha(band, 0.55)));
     }
     let mut plain: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1554,5 +1778,239 @@ mod span_style_tests {
         assert!((blue.red - on_blue.red).abs() < 1e-4);
         assert!((blue.green - on_blue.green).abs() < 1e-4);
         assert!((blue.blue - on_blue.blue).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod button_row_tests {
+    //! F2：可点击行（Ask 选项 / picker 条目）的按钮外观与 focus ring。
+    use super::*;
+    use crate::panels::{PanelId, PanelRoots, PanelRows, PanelsPlugin, KeyedRow};
+    use crate::picker::PickerChoice;
+    use crate::theme::default_ui_theme;
+    use bevy::text::FontSource;
+    use bevy_feathers::tokens;
+
+    /// 一个只装 `PanelsPlugin` 的 App：没有 `UiTheme`、没有窗口，
+    /// 行同步与按钮样式系统照常跑（生产里 `FeathersViewPlugin` 会插主题）。
+    fn app_with_rows(panel: PanelId, rows: Vec<Row>) -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(PanelsPlugin)
+            .insert_resource(TranscriptFont(FontSource::default()));
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(panel, root);
+        let keyed = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| KeyedRow {
+                key: index as u64,
+                hash: row_hash(&row),
+                row,
+            })
+            .collect();
+        app.world_mut().resource_mut::<PanelRows>().set(panel, keyed);
+        app.update();
+        (app, root)
+    }
+
+    fn row_entities(app: &App, root: Entity) -> Vec<Entity> {
+        app.world()
+            .get::<Children>(root)
+            .map(|children| children.iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn background(app: &App, entity: Entity) -> Color {
+        app.world()
+            .get::<BackgroundColor>(entity)
+            .expect("行要有底色")
+            .0
+    }
+
+    fn border(app: &App, entity: Entity) -> Color {
+        app.world()
+            .get::<BorderColor>(entity)
+            .expect("按钮行要有边框")
+            .top
+    }
+
+    #[test]
+    fn an_ask_choice_row_is_a_token_colored_button() {
+        let ask = Entity::from_raw_u32(7).expect("合法实体");
+        let row = Row::new(Line::from("    [1] Yes")).ask_choice(ask, "yes".into());
+        let (mut app, root) = app_with_rows(PanelId::Confirm, vec![row]);
+        let entity = row_entities(&app, root)[0];
+
+        let node = app.world().get::<Node>(entity).expect("行节点");
+        assert_eq!(
+            node.border_radius,
+            BorderRadius::all(px(ROW_BUTTON_RADIUS)),
+            "圆角用按钮 scene 的 4px"
+        );
+        assert_eq!(
+            node.padding,
+            UiRect::horizontal(px(ROW_BUTTON_PADDING)),
+            "水平内边距用按钮 scene 的 8px"
+        );
+        assert_eq!(node.border, UiRect::all(px(ROW_FOCUS_WIDTH)));
+        assert_eq!(node.height, px(ROW_HEIGHT), "行高不变");
+
+        let theme = default_ui_theme();
+        assert_eq!(background(&app, entity), theme.color(&tokens::BUTTON_BG));
+        assert_eq!(border(&app, entity), Color::NONE, "Ask 选项没有当前项");
+        assert!(
+            app.world().get::<Interaction>(entity).is_some(),
+            "悬停/按下由 Interaction 驱动"
+        );
+        // 点击语义原样保留。
+        assert_eq!(
+            app.world().get::<AskChoice>(entity).map(|choice| choice.choice.clone()),
+            Some("yes".to_owned())
+        );
+        assert!(app.world().get::<Pickable>(entity).is_some());
+
+        // 直接改 Interaction 再跑一帧：底色按 token 变。
+        *app.world_mut()
+            .get_mut::<Interaction>(entity)
+            .expect("Interaction") = Interaction::Hovered;
+        app.update();
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_BG_HOVER),
+            "悬停用 BUTTON_BG_HOVER"
+        );
+        *app.world_mut()
+            .get_mut::<Interaction>(entity)
+            .expect("Interaction") = Interaction::Pressed;
+        app.update();
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_BG_PRESSED),
+            "按下用 BUTTON_BG_PRESSED"
+        );
+    }
+
+    /// 3D 世界面板走 feathers_in_3d 的 picking 后端：它更新的是
+    /// `PickingInteraction`，没有窗口版 `ui_focus_system` 的 `Interaction`。
+    /// 悬停/按下视觉在两条通路下都要一样。
+    #[test]
+    fn picking_interaction_also_drives_the_button_colors() {
+        let ask = Entity::from_raw_u32(3).expect("合法实体");
+        let row = Row::new(Line::from("[1] ok")).ask_choice(ask, "ok".into());
+        let (mut app, root) = app_with_rows(PanelId::Confirm, vec![row]);
+        let entity = row_entities(&app, root)[0];
+        let theme = default_ui_theme();
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(PickingInteraction::Hovered);
+        app.update();
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_BG_HOVER),
+            "3D picking 的 Hovered 也要亮"
+        );
+        app.world_mut()
+            .entity_mut(entity)
+            .insert(PickingInteraction::Pressed);
+        app.update();
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_BG_PRESSED),
+            "3D picking 的 Pressed 也要压暗"
+        );
+    }
+
+    #[test]
+    fn a_picker_current_row_gets_the_primary_fill_and_a_focus_ring() {
+        let picker = Entity::from_raw_u32(9).expect("合法实体");
+        let row = Row::new(Line::from("gpt"))
+            .picker_choice(picker, 0)
+            .band(RColor::Rgb(20, 26, 38));
+        let (app, root) = app_with_rows(PanelId::List, vec![row]);
+        let entity = row_entities(&app, root)[0];
+        let theme = default_ui_theme();
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_PRIMARY_BG),
+            "当前项 = Primary 变体"
+        );
+        assert_eq!(
+            border(&app, entity),
+            theme.color(&tokens::FOCUS_RING),
+            "当前项的 focus ring 用 FOCUS_RING token"
+        );
+        assert!(app.world().get::<PickerChoice>(entity).is_some());
+
+        // 非当前项：Normal 按钮，没有环。
+        let plain = Row::new(Line::from("claude")).picker_choice(picker, 1);
+        let (app, root) = app_with_rows(PanelId::List, vec![plain]);
+        let entity = row_entities(&app, root)[0];
+        assert_eq!(
+            background(&app, entity),
+            theme.color(&tokens::BUTTON_PLAIN_BG)
+        );
+        assert_eq!(border(&app, entity), Color::NONE);
+    }
+
+    #[test]
+    fn no_ui_theme_falls_back_to_the_feathers_dark_tokens() {
+        let ask = Entity::from_raw_u32(1).expect("合法实体");
+        let row = Row::new(Line::from("ok")).ask_choice(ask, "ok".into());
+        let (mut app, root) = app_with_rows(PanelId::Confirm, vec![row]);
+        let entity = row_entities(&app, root)[0];
+        let dark = bevy_feathers::dark_theme::create_dark_theme();
+        let want = dark.color(&tokens::BUTTON_BG);
+        assert_eq!(background(&app, entity), want);
+        assert_ne!(
+            background(&app, entity),
+            Color::from(bevy::color::palettes::basic::FUCHSIA),
+            "缺 token 时必须退到暗色主题，不能是 fuchsia"
+        );
+
+        // `FeathersPlugins` 那种空 `UiTheme` 资源：逐 token 兜底，不能 fuchsia。
+        app.insert_resource(bevy_feathers::theme::UiTheme(Default::default()));
+        app.update();
+        assert_eq!(background(&app, entity), want);
+    }
+
+    #[test]
+    fn keyboard_item_selection_draws_a_focus_ring_instead_of_only_reverse_video() {
+        use crate::selection::Selection;
+
+        let ask = Entity::from_raw_u32(2).expect("合法实体");
+        let row = Row::new(Line::from("hello"))
+            .ask_choice(ask, "yes".into());
+        let (mut app, root) = app_with_rows(PanelId::Confirm, vec![row]);
+        let entity = row_entities(&app, root)[0];
+        assert!(
+            app.world().get::<Outline>(entity).is_none(),
+            "没有键盘条目选中时不画环"
+        );
+
+        // 键盘选中第 0 行这一块条目（`Selection::item` 有值）。
+        let mut selection = Selection::new();
+        selection.select_item(PanelId::Confirm, 0, 1, 0);
+        app.insert_resource(selection);
+        app.update();
+
+        let outline = app
+            .world()
+            .get::<Outline>(entity)
+            .expect("键盘条目选中要画 focus ring");
+        assert_eq!(
+            outline.color,
+            default_ui_theme().color(&tokens::FOCUS_RING),
+            "环色来自 FOCUS_RING token"
+        );
+        assert_eq!(outline.width, px(ROW_FOCUS_WIDTH));
+
+        // 清掉选区：环收起。
+        app.world_mut().resource_mut::<Selection>().clear();
+        app.update();
+        let outline = app.world().get::<Outline>(entity).expect("组件保留、颜色隐藏");
+        assert_eq!(outline.color, Color::NONE);
     }
 }

@@ -108,6 +108,12 @@ impl PanelRows {
 ///
 /// 第 2 批之后：聚焦工作区的全局工作副本；每个工作区自己的根表在
 /// [`WorkspacePanels::roots`](crate::workspaces::WorkspacePanels) 里。
+///
+/// 面板根的**表面/边框/圆角**不归本模块：`frame::spawn_panel` 生成根时按
+/// `Look` 挂 [`ThemeBackgroundColor`](bevy_feathers::theme::ThemeBackgroundColor) /
+/// [`ThemeBorderColor`](bevy_feathers::theme::ThemeBorderColor)（feathers token），
+/// 再由 `frame::sync_panel_chrome` 按当前的 `UiTheme` 解析成颜色。本模块只维护
+/// 根表，不碰 chrome。
 #[derive(Resource, Default, Clone)]
 pub struct PanelRoots(pub HashMap<PanelId, Entity>);
 
@@ -335,6 +341,10 @@ impl Plugin for PanelsPlugin {
                     mirror_transcript_rows,
                     commit_focused_panels,
                     sync_panels,
+                    // F2：可点击行（Ask 选项 / picker 条目）的按钮态与 focus ring，
+                    // 排在行同步之后（`chain` 会插入 deferred，能看到这一帧 spawn 的行）。
+                    crate::transcript::update_row_button_styles,
+                    crate::transcript::update_row_focus_rings,
                     publish_focused_spawned,
                 )
                     .chain()
