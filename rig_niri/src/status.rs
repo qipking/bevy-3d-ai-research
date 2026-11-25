@@ -15,18 +15,18 @@
 //! | turn 的 items（`:404`） | [`status_rows`] | 从 `ShownAgent` 指向的 agent 上的 `ActiveTurn` 找到 turn 实体，再取它的 `StatusItems` |
 //! | `StatusSettings.hide`（`:272`） | [`StatusSettings`] | `[status] hide`；只在装配层已有 `rig_harness::prelude::Settings` 时读（可选依赖），没有就全显示 |
 //! | `StatusParts` / `AppStatusPartsExt`（`:329`/`:347`） | [`StatusParts`] / [`AppStatusPartsExt`] | 最小可用版：资源里存画出来的条目，同名替换、空文本隐藏；不逐字照抄上游“只记名字给 `/plugins`”的元数据语义 |
-//! | `StatusLine` 组件（`:382`） | 不做 | 见下面“没做的部分” |
+//! | `StatusLine` 组件（`:382`） | 切片 2（设计见 `docs/design/PANEL_CANVAS.md` §3.5） | 组件/绘制都还没写 |
 //! | `StatusSystems::{Show, Edit}`（`:216`） | 不做 | 见下面“没做的部分” |
 //!
 //! ## 没做的部分
 //!
 //! * **`StatusLine` 组件**：上游它是 `TuiPanel` 的兄弟组件，任意实体挂上就在自己
-//!   `PanelCanvas` 的一行里画一条（可以是别的 agent 的）。我们的面板不是“实体 +
-//!   画布”，而是 [`PanelRows`] 里按 [`PanelId`]（固定枚举）索引的行值，再由
-//!   `panels` 同步成 `bevy_ui` 节点；要支持任意实体自己画一条，得让面板行归属
-//!   从 `PanelId` 扩成“实体 → 画布”，也就是改 `panels.rs` / `frame.rs` 的面板
-//!   画布契约（本轮不归这里改）。所以状态行仍然只有 [`PanelId::Status`] 一条，
-//!   也没有 `StatusLine.agent` 的“画别的 agent”入口。
+//!   `PanelCanvas` 的一行里画一条（可以是别的 agent 的）。切片 1 的
+//!   [`crate::panel`] 已经让插件能拿到任意面板根；切片 2 会在这个根上挂
+//!   `StatusLine` 组件，并在面板底部画一个绝对定位的状态行子节点（复用本模块的
+//!   来源合并/裁剪，不复制逻辑，见 `docs/design/PANEL_CANVAS.md` §3.5）。所以
+//!   状态行仍然只有 [`PanelId::Status`] 一条，也还没有 `StatusLine.agent` 的
+//!   “画别的 agent”入口。
 //! * **`StatusSystems::{Show, Edit}` 阶段**：上游的状态行条目是**缓存**在
 //!   `StatusItems` 组件里、由插件在 `PostUpdate` 按阶段写，视图最后再画；我们的
 //!   状态行每帧在 [`crate::FeathersSystems::Draw`] 里从 `AppStatus` / agent / turn

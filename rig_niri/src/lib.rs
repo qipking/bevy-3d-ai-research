@@ -41,6 +41,7 @@ pub mod keys;
 pub mod layout;
 pub mod niri;
 pub mod pane;
+pub mod panel;
 pub mod panels;
 pub mod picker;
 pub mod rich;
@@ -119,7 +120,11 @@ pub mod prelude {
     pub use crate::rich::{
         diff_rows, highlight_rows, markdown_rows, tool_result_rows, upstream_theme,
     };
-    pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots};
+    pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots, PluginPanel};
+    pub use crate::panel::{
+        DrawnRow, PanelRegistry, PanelRegistryExt, add_panel_column, drawn_row, drawn_rows,
+        reveal_panel_column,
+    };
     pub use crate::workspaces::{
         ColumnBounds, WORKSPACE_GAP, Workspace, WorkspaceDrag, WorkspacePanel, WorkspacePanels,
         WorkspaceScroll, WorkspaceScrollFocus, WorkspaceSet, WorkspacesPlugin, active_panel,

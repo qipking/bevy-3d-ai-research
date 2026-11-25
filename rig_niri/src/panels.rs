@@ -28,7 +28,40 @@ pub struct KeyedRow {
     pub row: Row,
 }
 
+/// 插件自定义面板的句柄（由 [`crate::panel::PanelRegistry`] 分配）。
+///
+/// 句柄很小、`Copy`，可以直接存进插件自己的资源/组件里；它只是身份，
+/// 不持有实体，也不决定面板放在哪。换工作区/重建工作区时同一个句柄仍然
+/// 指“同一个插件面板”，根实体由 [`crate::workspaces::WorkspacePanels::roots`]
+/// 按 `PanelId::Plugin(handle)` 查。
+///
+/// 字段故意不公开：句柄只能从注册表拿，避免插件自己造一个没人登记过的 id。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginPanel(pub(crate) u64);
+
+impl PluginPanel {
+    /// 注册表分配的原始 id（日志/测试用；不要拿它当稳定格式）。
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// 它对应的 [`PanelId`]：树叶子、`PanelRows` / `PanelRoots` 的键都用这个。
+    pub fn id(self) -> PanelId {
+        PanelId::Plugin(self)
+    }
+}
+
+impl std::fmt::Debug for PluginPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PluginPanel#{}", self.0)
+    }
+}
+
 /// 面板身份（决定行来源）。
+///
+/// 内置面板是封闭的枚举**变体**（行为不变）；插件面板统一走
+/// [`PanelId::Plugin`]，由 [`crate::panel::PanelRegistry`] 分配句柄。所以
+/// “加一块面板”不再需要改这个枚举，也不会让内置面板的分支多一步判断。
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PanelId {
     Transcript,
@@ -59,6 +92,12 @@ pub enum PanelId {
     /// 行由 [`crate::complete`] 产（候选 + 官方提示行），这里只当普通面板走
     /// [`PanelRows`] / [`PanelRoots`]，不写特殊情况。
     Complete,
+    /// 插件注册的自定义面板（见 [`crate::panel`]）。
+    ///
+    /// 它在树里就是一个普通叶子：`layout` / `frame` / `PanelsPlugin` 都按
+    /// “叶子 + 根表 + 行表”处理，不需要给插件加特例。内置面板的代码路径
+    /// 完全不变。
+    Plugin(PluginPanel),
 }
 
 /// 行实体在它所属面板里的位置：行是从 0 数的**可见行下标**（滚动后按窗口顶算）。
@@ -319,6 +358,9 @@ impl Plugin for PanelsPlugin {
         app.init_resource::<PanelRows>()
             .init_resource::<PanelRoots>()
             .init_resource::<PanelSpawned>()
+            // 插件面板的句柄表（`crate::panel`）。单独 init 而不是另装一个
+            // 插件：`PanelRows`/`PanelRoots` 已经是这里初始化的。
+            .init_resource::<crate::panel::PanelRegistry>()
             .add_systems(
                 Update,
                 (

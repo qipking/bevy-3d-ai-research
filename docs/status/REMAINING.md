@@ -356,36 +356,47 @@
 
 ## 10. 插件扩展点：画自己的面板、自己的状态行、绑命令、读"画了什么"
 
-- **用户会看到什么**：这不是"用户直接看到"，但决定这个前端能不能被别人当 rig 的前端用：
-  插件**不能**新增一块自己的面板（除非改 `PanelId` 枚举）、不能在任意面板上画状态行、
-  不能把键位绑到斜杠命令、不能读"第 n 行现在在屏幕哪里"（截图/测试/远程同步类插件都要）。
+- **状态（2026-11-26）**：**面板注册 + 条带列 + 行读回已完成（切片 1）**，设计见
+  [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)。插件现在能
+  `app.register_panel("git")` 拿 `PluginPanel` 句柄、用
+  `add_panel_column(world, workspace, handle, fraction)` 把它作为 `Fraction` 列放进指定
+  工作区的条带、拿根实体 spawn `Node`/`Text`/`ImageNode`（3D 镜像直接可见），并用
+  `drawn_row(world, workspace, panel, n)` 读回第 n 行的世界矩形。内置 `PanelId` 面板的
+  行为/几何不变（`rig_niri` lib 测试 580 → 587）。
+- **还没做**：`StatusLine` 组件（任意面板底部一条状态行）留在切片 2；活动列/自动滚动、
+  “注册后自动装进所有工作区”的策略、插件命令绑定入口也未做。
 - **上游 API / 我们的落点**：上游 `panel::{TuiPanel, PanelCanvas, RequestRedraw, RedrawArea}`
-  （`panel.rs:106`/`:160`/`:82`/`:91`）、`status::{StatusLine, StatusParts, AppStatusPartsExt}`
-  （`status.rs:382`/`:296`/`:329`）、`render::TuiFrame`（`render.rs:1196`）、
-  `render::TranscriptLayout`（`:437`）、`view::DrawnTranscript`（`view.rs:316`）、
-  `keys::run_command`（`keys.rs:455`）、`add_view`（`lib.rs:260`）。我们：封闭 `PanelId`
-  （`panels.rs:33`）与 `PanelRows`；状态行只有固定 `PanelId::Status`，每帧在
-  `status_rows`（`status.rs:186`）里现算，插件能加**条目**（`StatusParts` `:113`）但不能给
-  任意面板挂 `StatusLine` 组件；`grep -rnE 'TuiFrame|TranscriptLayout|DrawnTranscript|add_view|StatusLine'
-  rig_niri/src` 只剩 `status.rs` 的说明文字；`run_command` 已移植（`keys.rs:488`）；
-  `BatchPlugin` 还要应用层手动加（`lib.rs:239`–`:256` 的插件元组里没有，
+  （`reference/.../panel.rs:106`/`:160`/`:82`/`:91`）、
+  `status::{StatusLine, StatusParts, AppStatusPartsExt}`（同目录 `status.rs:382`/`:296`/`:329`）、
+  `render::TuiFrame`（`render.rs:1196`）、`view::DrawnTranscript`（`view.rs:316`）、
+  `keys::run_command`（`keys.rs:455`）、`add_view`（`lib.rs:260`）。我们：`PanelId` 仍是
+  内置封闭枚举，但多了一个 `PanelId::Plugin(PluginPanel)` 变体（`panels.rs:66`），
+  插件身份/注册/放置/读回在 `rig_niri/src/panel.rs`；状态行仍只有固定
+  `PanelId::Status`（每帧在 `status_rows` `status.rs:186` 里现算），插件能加**条目**
+  （`StatusParts` `:113`）但不能给任意面板挂 `StatusLine`；`TuiFrame`/`DrawnTranscript`
+  没有移植（3D 里读回是 `DrawnRow` 的世界矩形，不需要终端屏幕格），也没有
+  `RequestRedraw` 门控（bevy_ui + `sync_mirror` 每帧重排）；`run_command` 已移植
+  （`keys.rs:488`）；`BatchPlugin` 仍要应用层手动加（`lib.rs:239`–`:256` 的插件元组里没有，
   `rig_harness_in_3d/src/main.rs:68` 自己加）。
-- **工作量**：**L**（开放画布是架构改动：`PanelId` → 实体标识 + 每工作区根表；`TuiFrame`
-  依赖工作区的世界位姿反算）。和 §11 的 F6 是同一件事，先做 §11 的 `StatusLine` 级小件。
-- **依赖**：`TuiFrame`/`DrawnTranscript` 依赖 §6/§7 的条目身份（§7 的身份已有，公开 API 还没）；
-  其余独立。
+- **工作量**：切片 1 已完成；**切片 2 约 M**（`StatusLine` S/M + 注册策略 S + 活动列 S/M +
+  命令绑定 M）。不需要“`PanelId` → 实体标识”的架构改写了：`PanelId::Plugin` 只扩了一个变体，
+  `layout`/`frame`/`workspaces` 的键空间原样复用。
+- **依赖**：`StatusLine` 依赖现在这套面板画布（根/区域/行），无 §6 依赖；命令绑定独立；
+  `DrawnRow` 的几何只依赖 `RowLayout` + `PanelAreas`（已有）。
+
 
 ---
 
 ## 11. UI 重组（feathers）：F6 以后
 
-> F1–F5 已完成（[`FEATHERS_UI.md`](../design/FEATHERS_UI.md) §2）；这一节只列**还没做**的
-> 候选，不阻塞功能移植。布局的 L1–L5 在 [`NIRI_SCROLL.md`](../design/NIRI_SCROLL.md)，
-> L1 进行中，不在本节重复。
+> F1–F5 已完成（[`FEATHERS_UI.md`](../design/FEATHERS_UI.md) §2）；**F6 切片 1 已完成**
+> （插件面板注册/条带列/行读回，见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）。
+> 这一节只列**还没做**的候选，不阻塞功能移植。布局的 L1–L5 在
+> [`NIRI_SCROLL.md`](../design/NIRI_SCROLL.md)，L1 进行中，不在本节重复。
 
 | 步 | 内容 | 工作量 | 依赖 / 现状 |
 |---|---|---|---|
-| **F6** | 开放面板画布：面板行从封闭 `PanelId`（`panels.rs:33`）扩成"实体 → 画布"，插件能挂自己的面板；同批补 `StatusLine` 级组件（任意面板一行状态） | **L** | 同 §10；先做只读 `StatusLine`，再动 `PanelId` 键空间 |
+| **F6** | 开放面板画布：**切片 1 已完成（2026-11-26）**——注册表 + `PanelId::Plugin(..)` + `add_panel_column` + `drawn_row`（见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）；**切片 2 未做**：`StatusLine` 组件（任意面板一行状态）、自动装进所有工作区的策略、活动列自动滚动 | **L → 切片 2 M** | 同 §10；切片 1 只扩了 `PanelId` 一个变体，内置面板行为不变（`rig_niri` 580 → 587 测试） |
 | **F7** | 主题切换 UI：`/theme` 与持久化（浅色/高对比），`UiTheme` 已是资源、面板/行/滚动条都按 token 解析（`theme.rs:98`–`:141`、`lib.rs:151`–`:159`），缺入口与 `[view] theme` 设置 | **S** | 无；`Settings`/`add_setting` 的先例已在（`status.rs:64`/`:281`） |
 | **F8** | 3D 镜像图标/图片：feathers 组件里的 `ImageNode` 现在不镜像，按钮只能文字（`FEATHERS_UI.md` §5）；要做就得给 `feathers_in_3d` 加图片/图标层 | **M** | 无；影响所有带图标的 feathers 控件 |
 | **F9** | 过渡/补间：动作现在当帧生效，niri 的 `scroll` 插值与面板切换没有动画 | **S–M** | 依赖 L1/L5；先做 `scroll` 插值再谈按钮过渡 |
