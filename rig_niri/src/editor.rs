@@ -1131,6 +1131,9 @@ pub fn keys(
             action: action.copied(),
         })
         .collect();
+    // `KeyPressed.agent` 和动作分支里的 `agent` 是同一事实来源：显示中的
+    // `ShownAgent`（应用层切工作区时更新），没有就是 `None`。
+    let shown_agent = shown.as_deref().and_then(|shown| shown.0);
     let mut modifiers = Modifiers::from_held(&held);
     for event in input.read() {
         // 修饰键自己更新状态；同一帧里先按修饰键的事件也因此正确。
@@ -1154,7 +1157,7 @@ pub fn keys(
             if let Some(entity) = keys::released(&rows, &press, scope) {
                 commands.trigger(KeyPressed {
                     entity,
-                    agent: None,
+                    agent: shown_agent,
                     released: true,
                 });
             }
@@ -1256,7 +1259,7 @@ pub fn keys(
                     }
                     None => commands.trigger(KeyPressed {
                         entity,
-                        agent: None,
+                        agent: shown_agent,
                         released: false,
                     }),
                 }

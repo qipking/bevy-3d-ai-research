@@ -9,6 +9,8 @@
 //! 键位和上游 `pick::choice_key` 对齐的部分：Alt+1..9 直接选并确认第 n 个可见项
 //! （Alt+0 取消，和 Esc 一样），但只在 picker 显示时由 [`picker_keys`] 接管；没有
 //! picker 时这些键仍归输入框（Ask 的 [`crate::keys::InlineKey`]）/ 插件绑定。
+//! 插件用 [`ChoiceKeys`]（上游 `pick.rs:51`）给**显示中的** picker 登记自己的键，
+//! 命中时发 [`ChoiceKeyPressed`]；它和 Alt+数字同一层、优先于内置键与过滤输入。
 //! 非树 picker 的 → 展开选中项的完整说明（`PickItem::more`，没有就用 `detail`；
 //! 再按一次收起，← 也收起），↑↓/PgUp/PgDn 移动时列表体跟着滚动；过滤/重新填充
 //! 后按条目身份（标签，其次条目下标）把选中项找回来。
@@ -43,6 +45,95 @@ use crate::FeathersSystems;
 
 /// rig-tui 的 `PAGE`：PgUp/PgDn 一次跳几个。
 const PAGE: usize = 10;
+
+/// 插件给 picker 加的键（上游 `pick.rs:51` 的收窄版）：挂在 `Picker` 实体上，
+/// **只在这个 picker 显示时**由 [`picker_keys`] 处理；没有 picker 显示时这些
+/// 键一行都不读，照旧归输入框 / 插件绑定。
+///
+/// 优先于 picker 自己的键和过滤输入（和 Alt+1..9 同一层），所以插件可以给
+/// "按 `e` 编辑选中项 / 按 `x` 删除"这类动作留键。命中时发一条
+/// [`ChoiceKeyPressed`]（插件监听它做自己的事）；[`ChoiceAction::Choose`] /
+/// [`ChoiceAction::Cancel`] 还会替插件交 `Pick`。
+///
+/// ```
+/// use bevy::input::keyboard::Key;
+/// use rig_niri::picker::{ChoiceAction, ChoiceKey, ChoiceKeys};
+///
+/// let keys = ChoiceKeys::new([
+///     ChoiceKey::new(Key::Character("e".into()), "Edit", ChoiceAction::Message("edit".into())),
+///     ChoiceKey::new(Key::Character("x".into()), "Delete", ChoiceAction::Message("delete".into())),
+/// ]);
+/// # drop(keys);
+/// ```
+#[derive(Component, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChoiceKeys(pub Vec<ChoiceKey>);
+
+impl ChoiceKeys {
+    /// 一次登记一组键。
+    pub fn new(keys: impl IntoIterator<Item = ChoiceKey>) -> Self {
+        Self(keys.into_iter().collect())
+    }
+
+    /// 再登记一个键。
+    pub fn push(&mut self, key: ChoiceKey) {
+        self.0.push(key);
+    }
+}
+
+/// [`ChoiceKeys`] 里的一条：按哪个键、说明，以及做什么。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChoiceKey {
+    /// 逻辑键（和 `editor::keys` 用同一个 [`Key`] 类型）。
+    pub key: Key,
+    /// 几个词，说明这个键做什么（给插件自己用）。
+    pub label: String,
+    /// 按下时做什么。
+    pub action: ChoiceAction,
+}
+
+impl ChoiceKey {
+    /// `key` 绑到 `action`，`label` 说明它做什么。
+    pub fn new(key: Key, label: impl Into<String>, action: ChoiceAction) -> Self {
+        Self {
+            key,
+            label: label.into(),
+            action,
+        }
+    }
+}
+
+/// [`ChoiceKeys`] 的一个键做什么（上游 `ChoiceAction` 的收窄版：只有三类）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChoiceAction {
+    /// 选第 `n` 个**可见项**并关闭：`n` 从 1 起，和 Alt+1..9 同编号。
+    /// 第 `n` 行不存在或不是条目（`free_text` 的作答行）时什么都不做。
+    Choose(usize),
+    /// 取消：和 Esc / Alt+0 一样交 `Pick::person(picker, None)`。
+    Cancel,
+    /// 自定义消息：只发 [`ChoiceKeyPressed`]，由插件监听后自己处理
+    /// （例如"编辑选中项 / 删除选中项"）。
+    Message(String),
+}
+
+/// 插件登记的 [`ChoiceKeys`] 键被按下时发出：插件监听它执行自己的动作。
+///
+/// 只在 picker 显示、且这个键属于显示中的 picker 时发；`selected` 是按下时
+/// 选中的可见行，`item` 是它对应的条目下标（作答行是 `None`）。
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub struct ChoiceKeyPressed {
+    /// 显示中的 picker。
+    pub picker: Entity,
+    /// 按下的键（[`ChoiceKeys`] 里登记的那个）。
+    pub key: Key,
+    /// 登记的说明。
+    pub label: String,
+    /// 登记的动作。
+    pub action: ChoiceAction,
+    /// 按下时选中的是第几行（可见行，从 0 起）。
+    pub selected: usize,
+    /// 选中行对应的条目下标；`free_text` 的作答行是 `None`。
+    pub item: Option<usize>,
+}
 
 /// 一行就是一个选项：点它回答这个 picker。
 #[derive(Component, Clone)]
@@ -818,15 +909,17 @@ fn choice_key(number: u8, state: &PickerInput) -> Option<Option<Chosen>> {
 
 /// picker 显示时的键位：打字过滤、↑↓ 选、PgUp/PgDn 翻页、←/→（树里折叠，
 /// 平表里展开/收起说明）、Tab 打勾、回车、Esc，以及 Alt+1..9 直接选第 n 项、
-/// Alt+0 取消。
+/// Alt+0 取消；插件用 [`ChoiceKeys`] 登记在这个 picker 上的键也在这里处理，
+/// 优先于上面的内置键与过滤输入。
 ///
-/// 整个系统只在 `state.picker` 有值时跑：没有 picker 时 Alt+1..9/Alt+0 的
-/// 事件一行都不读，仍由 `editor::keys` 交给 Ask 的内联绑定或插件绑定
-/// （和 `keys::arm_inline_keys` 同一条边界）。
+/// 整个系统只在 `state.picker` 有值时跑：没有 picker 时 Alt+1..9/Alt+0 与
+/// `ChoiceKeys` 的事件一行都不读，仍由 `editor::keys` 交给 Ask 的内联绑定或
+/// 插件绑定（和 `keys::arm_inline_keys` 同一条边界）。
 pub fn picker_keys(
     mut input: MessageReader<KeyboardInput>,
     mut state: ResMut<PickerInput>,
     mut pickers: Query<&mut Picker>,
+    choice_keys: Query<&ChoiceKeys>,
     mut commands: Commands,
     held: Option<Res<ButtonInput<KeyCode>>>,
 ) {
@@ -836,6 +929,7 @@ pub fn picker_keys(
     let Ok(mut picker) = pickers.get_mut(picker_entity) else {
         return;
     };
+    let choice_keys = choice_keys.get(picker_entity).ok();
     let tree = tree(&picker);
     // 和 `editor::keys` 一样逐事件跟踪修饰键：同一帧里先按 Alt 再按数字
     // 也能算 Alt+数字，不依赖 `ButtonInput` 的帧尾状态。
@@ -870,8 +964,41 @@ pub fn picker_keys(
             }
             continue;
         }
-        let last = state.rows.len().saturating_sub(1);
+        // 插件登记的 ChoiceKeys：和 Alt+数字同一层（只在 picker 显示时），
+        // 但排在 Alt+数字之后，而且只在没有 Ctrl/Alt/Super、非按住重复时
+        // 匹配，所以不会和 Alt+1..9 打架；命中后连过滤输入也收不到这个键。
         let typing = !modifiers.intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER);
+        if typing
+            && !event.repeat
+            && let Some(choice) = choice_keys
+                .and_then(|keys| keys.0.iter().find(|choice| choice.key == event.logical_key))
+        {
+            let item = state.rows.get(state.selected).copied().flatten();
+            commands.write_message(ChoiceKeyPressed {
+                picker: picker_entity,
+                key: choice.key.clone(),
+                label: choice.label.clone(),
+                action: choice.action.clone(),
+                selected: state.selected,
+                item,
+            });
+            match &choice.action {
+                ChoiceAction::Choose(number) => {
+                    if let Some(index) = number
+                        .checked_sub(1)
+                        .and_then(|row| state.rows.get(row).copied().flatten())
+                    {
+                        commands.trigger(Pick::person(picker_entity, Some(Chosen::item(index))));
+                    }
+                }
+                ChoiceAction::Cancel => {
+                    commands.trigger(Pick::person(picker_entity, None));
+                }
+                ChoiceAction::Message(_) => {}
+            }
+            continue;
+        }
+        let last = state.rows.len().saturating_sub(1);
         match &event.logical_key {
             Key::ArrowUp => {
                 state.selected = state.selected.saturating_sub(1);
@@ -898,8 +1025,7 @@ pub fn picker_keys(
                 dirty = true;
             }
             // 平表：→ 展开选中项的完整说明，再按一次收起；← 也收起。
-            // （上游把它交给插件的 `ChoiceKeys`；本 crate 还没有那套自定义
-            // 键，所以先给 → 一个自带的切换键。）
+            // 插件用 `ChoiceKeys` 登记了 →/← 时上面已经先处理，到不了这里。
             Key::ArrowRight => {
                 state.more = !state.more;
                 dirty = true;
@@ -1248,6 +1374,7 @@ impl Plugin for PickerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PickerInput>()
             .init_resource::<PickerQueue>()
+            .add_message::<ChoiceKeyPressed>()
             .add_systems(
                 Update,
                 (
@@ -2054,6 +2181,191 @@ mod tests {
             !app.world().resource::<Pressed>().0,
             "picker 显示时 Alt+1 不再落到插件绑定"
         );
+    }
+
+    // ---- ChoiceKeys：插件给显示中的 picker 加键 ----
+
+    fn spawn_with_choice_keys(app: &mut App, picker: Picker, keys: ChoiceKeys) -> Entity {
+        let entity = app.world_mut().spawn((picker, keys)).id();
+        app.update();
+        entity
+    }
+
+    fn choice_presses(app: &App) -> Vec<ChoiceKeyPressed> {
+        app.world()
+            .resource::<Messages<ChoiceKeyPressed>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect()
+    }
+
+    fn e_key(action: ChoiceAction) -> ChoiceKeys {
+        ChoiceKeys::new([ChoiceKey::new(
+            Key::Character("e".into()),
+            "Edit",
+            action,
+        )])
+    }
+
+    /// 登记 `e` 后，picker 显示时按 `e` 发 `ChoiceKeyPressed`，而不是打进过滤词。
+    #[test]
+    fn choice_keys_fire_a_message_and_keep_out_of_the_filter() {
+        let mut app = tiled_app();
+        let picker = spawn_with_choice_keys(
+            &mut app,
+            picker(&[("a", None), ("b", None)], false),
+            e_key(ChoiceAction::Message("edit".into())),
+        );
+
+        press(&mut app, KeyCode::KeyE, Key::Character("e".into()));
+        assert_eq!(
+            choice_presses(&app),
+            [ChoiceKeyPressed {
+                picker,
+                key: Key::Character("e".into()),
+                label: "Edit".to_owned(),
+                action: ChoiceAction::Message("edit".into()),
+                selected: 0,
+                item: Some(0),
+            }]
+        );
+        assert_eq!(
+            app.world().resource::<PickerInput>().filter,
+            "",
+            "ChoiceKeys 命中时不把字符打进过滤词"
+        );
+        assert!(
+            app.world().resource::<SeenPicks>().0.is_empty(),
+            "Message 动作只发消息，不自己交 Pick"
+        );
+    }
+
+    /// `Choose(n)` / `Cancel` 和 Alt+数字一样真的交 `Pick`。
+    #[test]
+    fn choice_keys_choose_and_cancel_like_alt_digits() {
+        let mut app = tiled_app();
+        let picker = spawn_with_choice_keys(
+            &mut app,
+            picker(&[("a", None), ("b", None), ("c", None)], false),
+            ChoiceKeys::new([
+                ChoiceKey::new(
+                    Key::Character("2".into()),
+                    "Second",
+                    ChoiceAction::Choose(2),
+                ),
+                ChoiceKey::new(Key::Character("0".into()), "None", ChoiceAction::Cancel),
+            ]),
+        );
+
+        press(&mut app, KeyCode::Digit2, Key::Character("2".into()));
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(1)))),
+            "Choose(2) 交第 2 个可见项"
+        );
+        assert_eq!(choice_presses(&app).len(), 1, "Choose 也发消息");
+        press(&mut app, KeyCode::Digit0, Key::Character("0".into()));
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, None)),
+            "Cancel 和 Esc/Alt+0 一样交 None"
+        );
+        assert_eq!(choice_presses(&app).len(), 1, "Cancel 也发消息");
+    }
+
+    /// 登记同字符的键不会抢走 Alt+1..9：带 Alt 的 1 仍走内置路径。
+    #[test]
+    fn choice_keys_do_not_take_alt_digits_away() {
+        let mut app = tiled_app();
+        let picker = spawn_with_choice_keys(
+            &mut app,
+            picker(&[("a", None), ("b", None)], false),
+            ChoiceKeys::new([ChoiceKey::new(
+                Key::Character("1".into()),
+                "One",
+                ChoiceAction::Message("one".into()),
+            )]),
+        );
+
+        press_alt_digit(&mut app, '1');
+        assert_eq!(
+            app.world().resource::<SeenPicks>().0.last(),
+            Some(&(picker, Some(Chosen::item(0)))),
+            "Alt+1 仍是内置的“选第 1 项”"
+        );
+        assert!(
+            choice_presses(&app).is_empty(),
+            "Alt+1 不该命中只登记了无修饰 1 的 ChoiceKeys"
+        );
+
+        // 不带 Alt 的 1 才归插件登记的键。
+        press(&mut app, KeyCode::Digit1, Key::Character("1".into()));
+        assert_eq!(choice_presses(&app).len(), 1);
+    }
+
+    /// 排在队列里的 picker 的 `ChoiceKeys` 不生效：键照常打进显示中的那个。
+    #[test]
+    fn choice_keys_on_a_queued_picker_do_not_take_the_key() {
+        let mut app = tiled_app();
+        let shown = spawn_picker(&mut app, picker(&[("a", None)], false));
+        let _queued = spawn_with_choice_keys(
+            &mut app,
+            picker(&[("b", None)], false),
+            e_key(ChoiceAction::Message("edit".into())),
+        );
+
+        assert_eq!(app.world().resource::<PickerInput>().picker, Some(shown));
+        press(&mut app, KeyCode::KeyE, Key::Character("e".into()));
+        assert!(
+            choice_presses(&app).is_empty(),
+            "不显示的 picker 的 ChoiceKeys 不读键"
+        );
+        assert_eq!(
+            app.world().resource::<PickerInput>().filter,
+            "e",
+            "键落进显示中的 picker 的过滤词"
+        );
+    }
+
+    /// 完全没有 picker 时，`ChoiceKeys` 不吞键：同样的键仍到插件绑定。
+    #[test]
+    fn choice_keys_without_a_picker_do_not_swallow_the_key() {
+        #[derive(Resource, Default)]
+        struct Pressed(bool);
+
+        use crate::keys::AppKeyBindingsExt;
+
+        let mut app = tiled_app();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<crate::editor::Editor>()
+            .init_resource::<crate::editor::SubmittedPrompts>()
+            .init_resource::<crate::keys::KeyFocus>()
+            .init_resource::<crate::keys::PendingInput>()
+            .add_message::<crate::editor::PromptSubmitted>();
+        crate::keys::add_built_in(&mut app);
+        app.init_resource::<Pressed>();
+        // `ChoiceKeys` 在，但没有显示中的 picker：picker_keys 在读事件前就返回。
+        app.world_mut().spawn(e_key(ChoiceAction::Message("edit".into())));
+        app.add_key_binding(
+            crate::keys::KeyBinding::new(crate::keys::KeyPress::ctrl('g'), "Plugin")
+                .in_scope(crate::keys::KeyScope::Global),
+            |_pressed: On<crate::keys::KeyPressed>, mut seen: ResMut<Pressed>| seen.0 = true,
+        );
+        app.add_systems(
+            Update,
+            (crate::keys::arm_inline_keys, crate::editor::keys).chain(),
+        );
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        press(&mut app, KeyCode::KeyG, Key::Character("g".into()));
+        assert!(
+            app.world().resource::<Pressed>().0,
+            "没有 picker：ChoiceKeys 不读键，插件绑定照常收到 KeyPressed"
+        );
+        assert!(choice_presses(&app).is_empty());
     }
 
     /// 带 `more` 的 picker：第二项有完整说明。

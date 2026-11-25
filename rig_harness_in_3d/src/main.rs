@@ -28,7 +28,7 @@ use crate::kernel::KernelPlugin;
 use rig_niri::batch::{BatchPlugin, CompletedCalls};
 use rig_niri::camera_rig::RigCamera;
 use rig_niri::frame::{CELL, FrameSize, PanelAreas, PanelRoots, UNITS_TO_WORLD};
-use rig_niri::pane::{PaneScroll, TranscriptRows};
+use rig_niri::pane::{TranscriptPane, TranscriptRows};
 use rig_harness::pick::{PickItem, PickPreview};
 use rig_harness::prelude::{Highlighted, Picker};
 use rig_niri::panels::PanelId;
@@ -214,10 +214,10 @@ fn demo_preview(
 /// 滚轮 -> 转写窗格的滚动（按行，和 rig-tui 的 pane 一样是行滚动不是像素滚动）。
 fn scroll_panel(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
-    mut scroll: ResMut<PaneScroll>,
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     rows: Res<TranscriptRows>,
+    mut panes: Query<&mut TranscriptPane>,
 ) {
     let mut delta = 0.0;
     for event in wheel.read() {
@@ -230,19 +230,24 @@ fn scroll_panel(
     if steps == 0 {
         return;
     }
-    let height = roots
-        .entity(PanelId::Transcript)
-        .and_then(|root| areas.get(root))
-        .map_or(0, |area| usize::from(area.rows));
+    // 与改动前一致：这个演示滚轮滚的是主转写（拆窗后的 Pane2 由
+    // `pane::pane_wheel` 按指针所在窗格处理）。
+    let Some(root) = roots.entity(PanelId::Transcript) else {
+        return;
+    };
+    let height = areas.get(root).map_or(0, |area| usize::from(area.rows));
     if height == 0 {
         return;
     }
+    let Ok(mut pane) = panes.get_mut(root) else {
+        return;
+    };
     let max_top = rows.len().saturating_sub(height);
     let rows_moved = usize::try_from(steps.unsigned_abs()).unwrap_or(usize::MAX) * 3;
     if steps > 0 {
-        scroll.up(rows_moved);
+        pane.scroll.up(rows_moved);
     } else {
-        scroll.down(rows_moved, max_top);
+        pane.scroll.down(rows_moved, max_top);
     }
 }
 
@@ -493,7 +498,7 @@ fn run_tour(
     rows: Query<(Entity, &RowText, &GlobalTransform)>,
     selected: Res<Selected>,
     mut clipboard: ResMut<bevy_clipboard::Clipboard>,
-    mut scrolls: Query<&mut PaneScroll>,
+    mut scrolls: Query<&mut TranscriptPane>,
     mut keyboard: MessageWriter<KeyboardInput>,
     size: Res<FrameSize>,
 ) {
@@ -532,15 +537,15 @@ fn run_tour(
         14 if sub == 0 => shoot(&mut runner, &mut commands, "04_text_zoom"),
         15 => {
             set_cam(&mut camera, Vec3::new(0.0, 0.03, home), Vec3::ZERO, 1.0);
-            if let Ok(mut scroll) = scrolls.single_mut() {
-                scroll.follow = false;
-                scroll.top = scroll.top.saturating_sub(4);
+            if let Ok(mut pane) = scrolls.single_mut() {
+                pane.scroll.follow = false;
+                pane.scroll.top = pane.scroll.top.saturating_sub(4);
             }
         }
         16 if sub == 0 => shoot(&mut runner, &mut commands, "05_scrolled"),
         17 => {
-            if let Ok(mut scroll) = scrolls.single_mut() {
-                scroll.follow = true;
+            if let Ok(mut pane) = scrolls.single_mut() {
+                pane.scroll.follow = true;
             }
         }
         // 闸门：此时 create_order 被按住，Ask 已经画在面板里

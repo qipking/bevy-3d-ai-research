@@ -20,8 +20,13 @@
 //!   启用它们；问题答完/被拒后挂回去——和上游 `keys.rs::arm_inline_keys`
 //!   同一条规则。
 //!
-//! 未移植：`run_command`（要 rig-harness 的命令总线）、`Reflect` 与
-//! `tell_refused` 的 Notice 展示；拒绝绑定时只记 [`RefusedKeys`] 并 `warn!`。
+//! 已移植：[`run_command`]（上游 `keys.rs:455`）把绑定到的键变成"对显示中的
+//! agent 跑一条斜杠命令"，内部走 rig-harness 的 `run_chosen`：键按下的命令不
+//! 是用户打的，所以被拒时只写一条错误 [`Notice`](rig_ecs::prelude::Notice)，
+//! 不回填输入（上游 `commands.rs` 对 `run_chosen` 的规则）。
+//!
+//! 未移植：`Reflect` 与 `tell_refused` 的 Notice 展示；拒绝绑定时只记
+//! [`RefusedKeys`] 并 `warn!`。
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,6 +38,7 @@ use bevy::input::keyboard::{Key, KeyCode, KeyboardInput};
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
 use rig_ecs::prelude::{ForAgent, Outcome};
+use rig_harness::commands::run_chosen;
 use rig_harness::main_agent::ShownAgent;
 use rig_harness::prelude::Ask;
 
@@ -417,7 +423,8 @@ impl KeyBinding {
 pub struct KeyPressed {
     /// 绑定的实体。
     pub entity: Entity,
-    /// 显示中的 agent；本 crate 还没有接 agent，先留 `None`。
+    /// 显示中的 agent：按下这一帧 [`ShownAgent`] 指向的实体（应用层在切
+    /// 工作区时更新它），没有就是 `None`。插件据此知道"哪个 agent 的键"。
     pub agent: Option<Entity>,
     /// 是松开而不是按下。
     pub released: bool,
@@ -466,6 +473,27 @@ fn bind(world: &mut World, binding: KeyBinding) -> Option<EntityWorldMut<'_>> {
     }
     let name = Name::new(format!("key:{}", binding.keys));
     Some(world.spawn((name, binding)))
+}
+
+/// [`AppKeyBindingsExt::add_key_binding`] 的观察者：按下时对显示中的 agent
+/// 跑一条斜杠命令 `line`（不带 `/`）。上游 `keys.rs:455`。
+///
+/// 语义与上游一致：
+/// * 只看按下（`released == false`）、且 [`KeyPressed::agent`] 有值；没有
+///   `ShownAgent` 时什么也不做（不 panic）；
+/// * 用 `run_chosen` 而不是 `RunCommand`：这条命令不是用户打的，被拒时
+///   写一条错误 `Notice`（应用层的 notice 桥会显示），输入框保持原样——
+///   上游对"键/列表选中的命令"就是这条规则（上游 `commands.rs` 的
+///   `run_chosen`）；用户按 Enter 打的 `/…` 仍走 `RunCommand`。
+pub fn run_command(
+    line: impl Into<String>,
+) -> impl FnMut(On<KeyPressed>, Commands) + Send + Sync + 'static {
+    let line = line.into();
+    move |pressed: On<KeyPressed>, mut commands: Commands| {
+        if let (Some(agent), false) = (pressed.agent, pressed.released) {
+            commands.queue(run_chosen(agent, line.clone()));
+        }
+    }
 }
 
 /// [`bind`] 拒绝绑定时的原因，供前端展示。
@@ -1453,5 +1481,239 @@ mod tests {
                 |_: On<KeyPressed>| {},
             )
             .is_some());
+    }
+
+    // ---- run_command / KeyPressed.agent：键 -> ShownAgent -> 斜杠命令 ----
+
+    use rig_harness::commands::{AppCommandsExt, CommandArgs};
+    use rig_ecs::prelude::{Notice, NoticeLevel};
+
+    /// 无窗口的最小 App：装了 `editor::keys`，所以插件绑定会真的收到
+    /// `KeyPressed`。`shown` 为 `None` 时**连 `ShownAgent` 资源都不插**，
+    /// 覆盖"没有显示中的 agent"的路径。
+    fn key_app(shown: Option<Entity>) -> App {
+        let mut app = App::new();
+        app.add_message::<KeyboardInput>()
+            .add_message::<crate::editor::PromptSubmitted>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<crate::editor::Editor>()
+            .init_resource::<crate::editor::SubmittedPrompts>()
+            .init_resource::<KeyFocus>()
+            .init_resource::<PendingInput>();
+        add_built_in(&mut app);
+        app.add_systems(Update, (arm_inline_keys, crate::editor::keys).chain());
+        if let Some(agent) = shown {
+            app.insert_resource(ShownAgent(Some(agent)));
+        }
+        app
+    }
+
+    fn send(app: &mut App, key: Key, code: KeyCode) {
+        app.world_mut().write_message(press_event(key, code));
+        app.update();
+    }
+
+    /// Ctrl+G：先按 Ctrl（`editor::keys` 从 `ButtonInput` 读修饰键），再发 G，
+    /// 最后松开。
+    fn press_ctrl_g(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        send(app, Key::Character("g".into()), KeyCode::KeyG);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::ControlLeft);
+    }
+
+    /// 一条命令跑过时的 `(agent, 参数)`。
+    #[derive(Resource, Default)]
+    struct Ran(Vec<(Entity, String)>);
+
+    fn probe_command(In(args): In<CommandArgs>, mut ran: ResMut<Ran>) {
+        ran.0.push((args.agent, args.args.clone()));
+    }
+
+    #[test]
+    fn run_command_runs_the_line_for_the_shown_agent() {
+        let mut app = key_app(None);
+        let agent = app.world_mut().spawn(Name::new("agent")).id();
+        app.insert_resource(ShownAgent(Some(agent)))
+            .init_resource::<Ran>()
+            .add_command("probe", "Probe", probe_command);
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('g'), "Probe").in_scope(KeyScope::Global),
+                run_command("probe hello"),
+            )
+            .is_some()
+        );
+
+        press_ctrl_g(&mut app);
+        assert_eq!(
+            app.world().resource::<Ran>().0,
+            [(agent, "hello".to_owned())],
+            "按键应把 `probe hello` 跑在 ShownAgent 上"
+        );
+        assert_eq!(
+            app.world().resource::<crate::editor::Editor>().text(),
+            "",
+            "键跑的斜杠命令不碰输入框"
+        );
+    }
+
+    #[test]
+    fn run_command_does_nothing_without_a_shown_agent() {
+        let mut app = key_app(None);
+        app.init_resource::<Ran>()
+            .add_command("probe", "Probe", probe_command);
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('g'), "Probe").in_scope(KeyScope::Global),
+                run_command("probe hello"),
+            )
+            .is_some()
+        );
+
+        press_ctrl_g(&mut app);
+        assert!(
+            app.world().resource::<Ran>().0.is_empty(),
+            "没有 ShownAgent：不 panic，也不跑命令"
+        );
+    }
+
+    #[test]
+    fn a_refused_run_command_is_an_error_notice_for_the_agent() {
+        let mut app = key_app(None);
+        let agent = app.world_mut().spawn(Name::new("agent")).id();
+        app.insert_resource(ShownAgent(Some(agent)))
+            .add_message::<Notice>()
+            .add_command("probe", "Probe", probe_command);
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('g'), "Missing").in_scope(KeyScope::Global),
+                run_command("missing"),
+            )
+            .is_some()
+        );
+
+        press_ctrl_g(&mut app);
+        let notices: Vec<Notice> = app
+            .world()
+            .resource::<Messages<Notice>>()
+            .iter_current_update_messages()
+            .cloned()
+            .collect();
+        assert_eq!(notices.len(), 1, "被拒的命令写一条 Notice");
+        assert_eq!(notices[0].agent, Some(agent), "Notice 是关于 ShownAgent 的");
+        assert_eq!(notices[0].level, NoticeLevel::Error);
+        assert!(notices[0].text.contains("/missing"), "{}", notices[0].text);
+        assert_eq!(
+            app.world().resource::<crate::editor::Editor>().text(),
+            "",
+            "键跑的命令被拒也不回填输入"
+        );
+    }
+
+    /// 收到 `KeyPressed.agent` 的观察者。
+    #[derive(Resource, Default)]
+    struct SeenAgents(Vec<Option<Entity>>);
+
+    #[test]
+    fn key_pressed_agent_is_the_shown_agent_and_follows_a_switch() {
+        let mut app = key_app(None);
+        let first = app.world_mut().spawn(Name::new("first")).id();
+        let second = app.world_mut().spawn(Name::new("second")).id();
+        app.insert_resource(ShownAgent(Some(first)))
+            .init_resource::<SeenAgents>()
+            .add_observer(|pressed: On<KeyPressed>, mut seen: ResMut<SeenAgents>| {
+                seen.0.push(pressed.agent);
+            });
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('g'), "Mark").in_scope(KeyScope::Global),
+                |_: On<KeyPressed>| {},
+            )
+            .is_some()
+        );
+
+        press_ctrl_g(&mut app);
+        assert_eq!(app.world().resource::<SeenAgents>().0, [Some(first)]);
+
+        // 切 agent：同一个绑定下一次拿到新的 ShownAgent。
+        app.world_mut().resource_mut::<ShownAgent>().0 = Some(second);
+        press_ctrl_g(&mut app);
+        assert_eq!(
+            app.world().resource::<SeenAgents>().0,
+            [Some(first), Some(second)]
+        );
+
+        // 没有显示中的 agent：字段是 None，观察者照常收到。
+        app.world_mut().resource_mut::<ShownAgent>().0 = None;
+        press_ctrl_g(&mut app);
+        assert_eq!(
+            app.world().resource::<SeenAgents>().0,
+            [Some(first), Some(second), None]
+        );
+    }
+
+    #[test]
+    fn key_pressed_agent_is_also_set_when_the_key_is_released() {
+        /// 松开时收到的 `(agent, released)`。
+        #[derive(Resource, Default)]
+        struct Seen(Vec<(Option<Entity>, bool)>);
+
+        let mut app = key_app(None);
+        let agent = app.world_mut().spawn(Name::new("agent")).id();
+        app.insert_resource(ShownAgent(Some(agent)))
+            .init_resource::<Seen>()
+            .add_observer(|pressed: On<KeyPressed>, mut seen: ResMut<Seen>| {
+                seen.0.push((pressed.agent, pressed.released));
+            });
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('h'), "Hold")
+                    .in_scope(KeyScope::Global)
+                    .with_releases(),
+                |_: On<KeyPressed>| {},
+            )
+            .is_some()
+        );
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ControlLeft);
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::KeyH,
+            logical_key: Key::Character("h".into()),
+            state: ButtonState::Released,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+        assert_eq!(
+            app.world().resource::<Seen>().0,
+            [(Some(agent), true)],
+            "松开也带 ShownAgent，released 为 true"
+        );
+    }
+
+    #[test]
+    fn key_pressed_agent_is_none_without_the_shown_agent_resource() {
+        let mut app = key_app(None);
+        app.init_resource::<SeenAgents>()
+            .add_observer(|pressed: On<KeyPressed>, mut seen: ResMut<SeenAgents>| {
+                seen.0.push(pressed.agent);
+            });
+        assert!(
+            app.add_key_binding(
+                KeyBinding::new(KeyPress::ctrl('g'), "Mark").in_scope(KeyScope::Global),
+                |_: On<KeyPressed>| {},
+            )
+            .is_some()
+        );
+
+        press_ctrl_g(&mut app);
+        assert_eq!(app.world().resource::<SeenAgents>().0, [None]);
     }
 }

@@ -57,7 +57,7 @@
 picker 队列 + 内置 Alt+1..9、窗口缩放（逻辑像素 → 格子）、转写条目选择与 `↓ more below`/`↓ new output`/`[stopped]`。
 剩下的缺口集中在两处：
 ① 视图层的多来源转写与搜索/标记（`TranscriptSource`/`ShowAgent`/`Highlight`/`DrawnTranscript`）
-② 插件用的开放画布与导出（`TuiPanel`/`StatusLine`/`TuiFrame`/`ChoiceKeys`）。逐项排在 [`REMAINING.md`](REMAINING.md)。
+② 插件用的开放画布与导出（`TuiPanel`/`StatusLine`/`TuiFrame`/`ChoiceSystems`）。逐项排在 [`REMAINING.md`](REMAINING.md)。
 
 ---
 
@@ -79,11 +79,11 @@ picker 队列 + 内置 Alt+1..9、窗口缩放（逻辑像素 → 格子）、�
 | 10 | `history.rs`（223） | `history.rs` 733 | ✅ | `PromptHistory`（`:50`）含 `load`（`:65`）/`record`（`:114`）/`seed`（`:126`）/`rewrite`（`:136`）、`Sent`（`:207`）、`HistorySystems::{Seed,Record,Save}`（`:193`）；系统 `load`（`:214`）/`record`（`:235`）/`save`（`:287`）/`seed_shown`（`:328`）；JSONL 一行一个字符串、坏行跳过、去重按最后位置（测试 `:489`–`:714` 共 12 个）。差异：文件路径由插件参数给（`HistoryPlugin` `:374`），不用上游的 `PluginData`/`Files`；`Editor` 自己是历史持有者，所以多一层 `mirror`（`:312`）。 |
 | 11 | `input.rs`（1026） | 分散在 `editor.rs`/`keys.rs`/`pane.rs`/`selection.rs`/`complete.rs` | 🟡 | 有：`PendingInput`（`keys.rs:821`）、按键分派（`editor.rs:1107` `keys`）、作用域/焦点（`keys.rs`）、滚轮 3 行（`pane.rs:592`，`WHEEL_ROWS` `:138`）、拖选/双击/三击（`selection.rs:943` `pointer_selection`）、补全接受（`editor.rs:1031`）。**"键 → 会话"的动作已接**：Enter → `Deliver`（`DeliveryMode::Steer`，`editor.rs:1220`）、turn 跑着时 Tab → `Queue`（`editor.rs:987`）、Esc → `StopTurn`（`editor.rs:1225`）、空输入 Ctrl+D → `AppExit`（`editor.rs:947`/`:1229`）、Alt+1..9 → `answer_ask`（`editor.rs:1198`–`:1203`/`:860`）、Alt+0/Esc → `refuse_ask`（`:1201`/`:1182`–`:1187`/`:875`）。缺：**细粒度**——`InputSystems::{Filter,Dispatch}` / `TuiKeys`（上游 `:111`/`:116`）、`InputContext`（上游 `:130`）都没有；`act` 里的 `SelectUp/SelectDown/Deselect` 仍是空实现（`editor.rs:973`–`:975`），转写区的 Alt+↑/↓ 是 `pane_keys` 直接读物理键做的（`pane.rs:429`–`:442`），不经过绑定表；`Deliver::literal` 的"命令被拒后当普通消息重发"没有（本 crate 没有 `refused`，`editor.rs:1013`–`:1020`）。 |
 | 12 | `jsonl.rs`（75） | `history.rs` | ✅ | "一行一个 JSON 值"的追加/读取落在 `PromptHistory::{load,record,save}`（`history.rs:65`/`:114`/`:287`）里，坏行跳过不 panic。上游的 `tail`（跟随文件）没有；我们没有"跟读历史文件"的需求。 |
-| 13 | `keys.rs`（751） | `keys.rs` 1457 | 🟡 | 有：`KeyPress`（`:145`）、`Keys`（`:279`）、`KeyScope`（`:335`）、`KeyBinding`（`:372`）、`KeyPressed`（`:417`）、`KeyFocus`（`:429`）、`AppKeyBindingsExt`（`:432`）、`InputAction` **32 个**（`:481`）、`built_in()` **43 条**（`:553`）、`add_built_in`（`:641`，另生成转写 Esc + Alt+1..9/Alt+0 共 11 条 → 54 个绑定）、`InlineKey`（`:637`）、`arm_inline_keys`（`:692`）、`ask_is_visible`（`:680`）、`Found`/`find` 多键前缀（`:728`/`:741`）、`released`（`:806`）、冲突拒绝 `RefusedKeys`（`:473`）。缺：`run_command`（上游 `:455`，`keys.rs:23` 自注未移植）；`KeyPressed.agent` 恒 `None`（`editor.rs:1157`/`:1259`，上游填显示中的 agent）；`Reflect` 没有；`tell_refused` 走 `Notice` 的上游行为只降级成 `warn!`（`keys.rs:23`–`:25`）。 |
+| 13 | `keys.rs`（751） | `keys.rs` 1719 | 🟡 | 有：`KeyPress`（`:151`）、`Keys`（`:285`）、`KeyScope`（`:341`）、`KeyBinding`（`:378`）、`KeyPressed`（`:423`）、`KeyFocus`（`:436`）、`AppKeyBindingsExt`（`:439`）、`InputAction` **32 个**（`:509`）、`built_in()` **43 条**（`:581`）、`add_built_in`（`:669`，另生成转写 Esc + Alt+1..9/Alt+0 共 11 条 → 54 个绑定）、`InlineKey`（`:665`）、`arm_inline_keys`（`:720`）、`ask_is_visible`（`:708`）、`Found`/`find` 多键前缀（`:756`/`:769`）、`released`（`:834`）、冲突拒绝 `RefusedKeys`（`:501`）、**`run_command`**（`:488`，上游 `:455`）。`KeyPressed.agent` 已由 `ShownAgent` 填（`editor.rs:1136`/`:1160`/`:1262`）。缺：`Reflect` 没有；`tell_refused` 走 `Notice` 的上游行为只降级成 `warn!`（`keys.rs:28`–`:29`）。 |
 | 14 | `markdown.rs`（193） | `rich.rs:92` + `batch::reply_lines` | ✅ | `markdown_rows` 调 `rig_tui::markdown::render(text,&theme,Some(width))`（`rich.rs:92`）；回复正文直接走上游 render（`batch.rs::reply_lines`），标题/列表/表格/引用/提示块都按上游规则。`render_marked` 没用到——它只服务上游的 `TranscriptRender` 查找标记（上游 `renderers.rs:629`），我们没有搜索高亮，见 `view`。 |
 | 15 | `panel.rs`（344） | `frame.rs` + `layout.rs` + `panels.rs` | 🟡 | 有：布局职责——`lay_out`（`frame.rs:367`）、`lay_out_frame`（`:537`）、`place_panels`（`:617`）、树叶子/容器矩形（`layout.rs:177`/`:195`）、`PanelRows`/`PanelRoots`/`PanelSpawned`（`panels.rs:82`/`:112`/`:130`）、`sync_panels`（`:271`）、`MIN_TRANSCRIPT`（`frame.rs:59`）。`Placement` 从上游 7 种收成 `Tree`/`Rest`（`frame.rs:281`），`Over`/`Within` 按工作区模型删掉（`grep -rE 'Placement::(Over\|Within)' rig_niri/src` 为空，有意）。**尺寸已跟窗口**：`FrameSize`（`:102`）每帧由 `sync_frame_size_to_window`（`:504`）从主窗口逻辑像素换算（`from_window_size` `:165`），`RF_FRAME` 可钉死（`FrameEnv` `:190`/`FrameSizePinned` `:244`）；测试 `frame.rs:1642`/`:1691`/`:1715`。缺：**开放画布**——上游任何实体挂 `TuiPanel`（`panel.rs:106`）就有 `PanelCanvas`（`:160`，`render`/`buffer_mut`/`copy_to`），我们只有封闭枚举 `PanelId`（`panels.rs:33`，10 个变体），插件要加面板必须改核心枚举；`RequestRedraw`/`RedrawArea`（上游 `:82`/`:91`）没有。 |
 | 16 | `pane.rs`（392） | `pane.rs` 1912 | 🟡 | 有：`PaneScroll{top,follow}`（`:130`）、窗口化 `window_transcript`（`:272`）、PgUp/PgDn（`:455`–`:460`）、Shift+↑/↓ 逐行（`:444`–`:451`）、滚轮（`pane_wheel` `:592`）、"下面还有"标记（`BELOW_MARKER` `:238`）——**两种标记都会画**：`BelowSeen` 已是资源（`transcript.rs:812`），`window_transcript` 每帧 `seen.of(...)`（`:296`）判定 `Below::{More,New}`（`:299`–`:309`），`↓ more below` / `↓ new output` 都按宽度裁剪（比窗格宽时整句不画，最后一行仍留空）；**Alt+↑/↓ 选条目**（`select_pane_item` `:333`，入口 `:429`–`:442`；块身份 `item_rows` `:109`，每帧重算 `sync_item_selection` `:479`）、选中后 Esc 清选区并把键交回输入框（`:409`–`:413`/`release_transcript_focus` `:536`）。缺：`TranscriptPane`/`title`/`TranscriptSource::{Shown,Agent,Value}`（上游 `:57`/`:84`）——我们只有全局 `PanelId::Transcript`，不能"看子 agent"或"看已保存会话"，`Pane2` 每帧复制同一份可见行（`panels.rs:143`）；`MainPane`/`PaneKeys`（上游 `:101`/`:125`）——滚动/选择键是物理 `KeyCode` 直读（`:385`–`:392` 自注），插件不能重绑；`DrawnTranscript` 没有。 |
-| 17 | `pick.rs`（1098） | `picker.rs` 2635 | 🟡 | 有：`PickerInput`（`:56`）、标题/说明/过滤（`picker_rows` `:957`）、树折叠 `unfold`（`:359`）、多选打勾 `tick`（`:396`）、`free_text`、`secret` 打码、PgUp/PgDn（`PAGE=10` `:45`）、`PickPreview` 列（`sync_preview_panel` `:697`）、点击行（`answer_picker` `:1223`）、高亮同步（`mark_highlighted` `:744`）。**队列已完成**：`PickerQueue`（`:104`）+ `Add<Picker>` 观察者 `enqueue_picker`（`:553`）+ `sync_picker`（`:568`）。**选项键已落地**：Alt+1..9 直接选第 n 个可见项并确认、Alt+0 取消（`picker_keys` `:826`，测试 `alt_one_picks_the_first_item_like_a_click` `:1950` 等 5 个）；`more`（→ 展开选中项说明）、列表体 `scroll`、`picked`（重新填充后按身份选回）都在 `PickerInput`（`:56`–`:95`）。缺：插件自定义选项键的公开 API `ChoiceKeys`/`ChoiceAction`/`ChoiceSystems`（上游 `:51`/`:55`/`:589`，本仓 0 命中；现在只有内置 Alt+数字）；`in_input`/`draft`（输入框内作答，上游 `:132`）没有，`grep -n 'in_input' rig_niri/src/picker.rs` 为 0。 |
+| 17 | `pick.rs`（1098） | `picker.rs` 2947 | 🟡 | 有：`PickerInput`（`:147`）、标题/说明/过滤（`picker_rows` `:1083`）、树折叠 `unfold`（`:450`）、多选打勾 `tick`（`:487`）、`free_text`、`secret` 打码、PgUp/PgDn（`PAGE=10` `:45`）、`PickPreview` 列（`sync_preview_panel` `:788`）、点击行（`answer_picker` `:1351`）、高亮同步（`mark_highlighted` `:835`）。**队列已完成**：`PickerQueue`（`:195`）+ `Add<Picker>` 观察者 `enqueue_picker`（`:644`）+ `sync_picker`（`:659`）。**选项键已落地**：Alt+1..9 直接选第 n 个可见项并确认、Alt+0 取消（`picker_keys` `:918`，测试 `alt_one_picks_the_first_item_like_a_click` `:2077` 等 5 个）；**`ChoiceKeys`/`ChoiceAction` 已移植（部分）**：`ChoiceKeys`（`:69`）+ `ChoiceKey`（`:85`）+ `ChoiceAction`（`:107`）+ `ChoiceKeyPressed`（`:123`），测试 `:2212`/`:2245`/`:2278`/`:2308`/`:2332`；`more`（→ 展开选中项说明）、列表体 `scroll`、`picked`（重新填充后按身份选回）都在 `PickerInput`（`:147`–`:177`）。缺：上游的 `ChoiceSystems` 调度（上游 `:589`）和 `Tick`/`TickAll`/`TickNone`/`More`/`Answer` 变体（收窄成 `Choose`/`Cancel`/`Message`）；`in_input`/`draft`（输入框内作答，上游 `:132`）没有，`grep -n 'in_input' rig_niri/src/picker.rs` 为 0。 |
 | 18 | `render.rs`（1543） | `frame.rs` + `pane.rs` + `panels.rs` + `picker.rs` + `complete.rs` + `selection.rs` | 🟡 | **绘制管道整体换成 bevy**（有意）：帧布局 `frame.rs:367`、窗口化 `pane.rs:272`、行→节点 `panels.rs::sync_panels`（`:271`）、补全/选择 tile（`complete.rs:1042`/`picker_rows` `picker.rs:955`）、选区反色 `selection.rs:1087`。语义侧有：`CallStates`→`batch::live_state`（`batch.rs:477`）、`ShownConversation`→`batch::{conversation_frame,dialogue_batch}`（`batch.rs:768`/`:734`）、`asides`→`conversation_frame` 的 Slot、`decorate`→`transcript::request_lines`（`:683`）+ `batch::child_calls_look`（`batch.rs:1185`）、`cells_in`→`selection::row_text`。缺：搜索高亮 `light`/`lit`（上游 `:848`/`:899`）与 `view::Highlight` 全链路（0 命中，`grep -rn Highlight rig_niri/src` 只命中 `pick::Highlighted`）；`TuiFrame`（上游 `:1196`，`screen_row`/`area`/`covered`）没有；`TranscriptLayout::lay_out`（上游 `:437`，无终端导出）没有；`Paced` 33ms 流式节流与 `needs_redraw`（上游 `:75`）——我们每帧全跑（bevy 自己驱动，属有意）；`inbox_lines`（上游 `:1520`）没有（没有收件箱 UI）；`compacted_line`（上游 `:797`"N messages above were compacted"）不画（`batch.rs:2166` 注释说明它需要上游 `Replaced`/会话计数；测试 `:2199`–`:2200` 断言这行不出现）。 |
 | 19 | `renderers.rs`（1068） | `batch.rs` 3528 | 🟡 | 有：五类 `RenderKey`（Tool/Streaming/Entry/Content/Aside）与四类 `RenderInput` 全填（`conversation_frame` `:768`/`rebuild_batch` `:504`）；`batch.pane`/`batch.agent` 真的设置；`ToolRender` 的 `theme`/`took`（`record_calls` `:405` 用 `Started` 算）/`output`/`children`（`CallTree` `:208`）/`item` 都填；`RenderOutput.{lines,decorations}`；`RenderSystems::{Render,Decorate,Edit}` 链（`BatchPlugin` `:1847`，`world.run_schedule(TranscriptRender)` `:1197`）；`text_rows` 直接复用上游。缺：`ToolRender.facts` 恒 `None`（TODO `:646`/`:674`/`:920`：内核 `Outcome` 没给 `ToolResultContext`）→ 退出码、`OutputCut`"输出被截断"提示、`FilesChanged` 等事实拿不到，上游 `header()` 的调用状态色带/`exit()` 也就少一半输入；`RenderRevision` 从不推进（`grep -rn RenderRevision rig_niri/src` 为 0）→ 每帧全量重建；模型流参数、调用效应还没出现时的 `RenderKey::Streaming` 预画没做（TODO `:666`）。 |
 | 20 | `selection.rs`（54） | `selection.rs` 2452 | ✅ | 语义比上游多得多且对齐：grapheme 列（不是字节）、CJK/emoji ZWJ 只算一列、`Selection::press/drag/release`（`:260`/`:301`/`:314`）、复制文本的 `trim_end` + `join("\n")` + 整体 `trim_end` 与上游 `Selection::mark` 一致（`:324`）、`ranges_in`/`byte_ranges_in`/`all_ranges`（`:355`/`:386`/`:400`）、`SELECTED_MODIFIER=REVERSED`（`:62`）、鼠标系统 `pointer_selection`（`:943`）、反色绘制 `selected_row`（`:1087`）。**条目级选中**：`item`/`select_item`/`suspend_item`（`:199`/`:212`/`:227`），给 Alt+↑/↓ 用。上游没有的超集：双击选词/三击选行（`ClickKind` `:93`、`apply` `:458`）、窗口 resize 清选区（`clear_selection_on_resize` `:787`）、复制失败写状态行。 |
@@ -109,13 +109,13 @@ picker 队列 + 内置 Alt+1..9、窗口缩放（逻辑像素 → 格子）、�
 | 7 | `front.rs` | 39（39/0） | `lib.rs` 的前端身份 | ✅ | `Front::new("feathers")` + `Answerer` + `ShowsPickers`。 |
 | 8 | `hints.rs` | 241（160/81） | `hints.rs` | 🟡 | 两张键位表 + 裁剪成一行；3 处裁剪行为与上游不同，且恒显示。 |
 | 9 | `history.rs` | 733（432/301） | `history.rs` + `jsonl.rs` | ✅ | 跨会话提示词历史（JSONL、去重、seed/record/save/rewrite）。 |
-| 10 | `keys.rs` | 1457（1076/381） | `keys.rs` | 🟡 | 键位 IR、43 条内置绑定（+11 条）、32 个动作、作用域/焦点/插件绑定、内联回答键开关；缺 `run_command`。 |
+| 10 | `keys.rs` | 1719（1104/615） | `keys.rs` | 🟡 | 键位 IR、43 条内置绑定（+11 条）、32 个动作、作用域/焦点/插件绑定、内联回答键开关、`run_command`、`KeyPressed.agent` 跟 `ShownAgent`；缺 `Reflect`/`tell_refused` 的 Notice 展示。 |
 | 11 | `layout.rs` | 1466（777/689） | ——（替代 `panel.rs::Placement`） | ➕ | niri 分裂树：`Split/Size/Child/Node`、`rects`/`placements`、增删列、`default_tree`。 |
 | 12 | `lib.rs` | 186（186/0） | `lib.rs` | 🟡 | `FeathersSystems` + `FeathersViewPlugin` + prelude；没有一键全套/headless `add_view`。 |
 | 13 | `niri.rs` | 771（575/196） | —— | ➕ | niri 平铺几何：图层/列/瓦片、`place_tiles`、`spawn_niri_screen`。 |
 | 14 | `pane.rs` | 1912（662/1250） | `pane.rs` | 🟡 | 转写窗口化 + 滚动（PgUp/PgDn、Shift+↑↓、滚轮）+ `↓ more below`/`↓ new output` + Alt+↑↓ 选条目；没有多来源窗格。 |
 | 15 | `panels.rs` | 612（345/267） | `panel.rs` 的 `PanelCanvas`/绘制侧 | 🟡 | 行是值：`PanelRows` → bevy_ui 节点（前缀增量 diff）；面板身份是封闭枚举。 |
-| 16 | `picker.rs` | 2635（1270/1365） | `pick.rs` | 🟡 | 列表选择器（过滤/树/多选/填空/secret/preview）+ 队列 + 内置 Alt+1..9，是条带最右一列而不是浮层。 |
+| 16 | `picker.rs` | 2947（1397/1550） | `pick.rs` | 🟡 | 列表选择器（过滤/树/多选/填空/secret/preview）+ 队列 + 内置 Alt+1..9 + 插件 `ChoiceKeys`（`Choose`/`Cancel`/`Message`），是条带最右一列而不是浮层。 |
 | 17 | `rich.rs` | 563（263/300） | `markdown.rs` + `highlight.rs` + `diff.rs` | ✅ | 上游三个纯值渲染器的适配层 + `upstream_theme`（给业务/插件用）。 |
 | 18 | `selection.rs` | 2452（1204/1248） | `selection.rs` + `render::cells_in` + `input::moused` | ✅ | 鼠标拖选/双击/三击、grapheme 级命中、反色、复制、条目级选中身份。 |
 | 19 | `spatial.rs` | 433（364/69） | —— | ➕ | 3D 卡片/漏斗/自由视角（空间 UI 的渲染侧），上游无对应。 |
@@ -209,13 +209,20 @@ picker 队列 + 内置 Alt+1..9、窗口缩放（逻辑像素 → 格子）、�
 
 ### 3.6 `keys.rs`（插件侧）
 
-- **`run_command`**：上游 `keys.rs:455`，把斜杠命令绑到键上。我们没有（`keys.rs:23` 自注）——应用层
-  自己把输入框里 `/` 开头的提交转成 `RunCommand`（`rig_harness_in_3d/src/lib.rs:362`），
-  插件键位到这个链路没有公开入口。
-- **`KeyPressed.agent` 恒 `None`**（`editor.rs:1157`/`:1259`）：上游填显示中的 agent，插件的观察者
-  据此判断"哪个 agent 的键"。
+- **`run_command` 已移植**：`run_command`（`keys.rs:488`）返回 `KeyPressed` 观察者，按下时对
+  `KeyPressed.agent` 跑 `line`；内部用 rig-harness 的 `run_chosen`（键按下的命令不是用户打的，
+  与上游 `keys.rs:455` 同一条），被拒时写一条错误 `Notice`、不回填输入。测试
+  `run_command_runs_the_line_for_the_shown_agent`（`keys.rs:1537`）、
+  `run_command_does_nothing_without_a_shown_agent`（`:1565`）、
+  `a_refused_run_command_is_an_error_notice_for_the_agent`（`:1585`）。应用层把输入框 `/` 开头的
+  提交转成 `RunCommand` 的桥不变（`rig_harness_in_3d/src/lib.rs:362`）。
+- **`KeyPressed.agent` 已填显示中的 agent**：`editor.rs:1136` 从 `ShownAgent` 取（和
+  `batch.rs`/`status.rs` 同一来源），松开（`editor.rs:1160`）与插件绑定（`:1262`）两处都填它；
+  测试 `key_pressed_agent_is_the_shown_agent_and_follows_a_switch`（`keys.rs:1622`）、
+  `key_pressed_agent_is_also_set_when_the_key_is_released`（`:1660`）、
+  `key_pressed_agent_is_none_without_the_shown_agent_resource`（`:1702`）。
 - **`Reflect` / `tell_refused`**：上游这些组件都 `derive(Reflect)` 供 `/plugins`、场景保存；
-  键位冲突我们只 `warn!` + `RefusedKeys`（`keys.rs:473`、`:23`–`:25`），上游还会发 `Notice`。
+  键位冲突我们只 `warn!` + `RefusedKeys`（`keys.rs:501`、`:28`–`:29`），上游还会发 `Notice`。
 
 ### 3.7 `panel.rs` / `panels.rs`（开放画布）
 
@@ -241,17 +248,24 @@ picker 队列 + 内置 Alt+1..9、窗口缩放（逻辑像素 → 格子）、�
 
 ### 3.9 `pick.rs` / `picker.rs`（公开选项键与输入框作答）
 
-- **队列已完成**（不再是缺口）：`PickerQueue`（`picker.rs:104`）+ `Add<Picker>` 观察者
-  `enqueue_picker`（`:553`）+ `sync_picker`（`:568`）；测试 `picker.rs:2356`/`:2438`/`:2473`/`:2505`。
+- **队列已完成**（不再是缺口）：`PickerQueue`（`picker.rs:195`）+ `Add<Picker>` 观察者
+  `enqueue_picker`（`:644`）+ `sync_picker`（`:659`）；测试 `picker.rs:2668`/`:2750`/`:2785`/`:2865`。
 - **内置 Alt+1..9 已落地**（不再是缺口）：Alt+1..9 选第 n 个可见项并确认、Alt+0 取消，
-  只在 picker 显示时由 `picker_keys`（`picker.rs:826`）接管；测试 `alt_one_picks_the_first_item_like_a_click`
-  （`:1950`）、`alt_three_picks_the_third_item`（`:1971`）、`alt_zero_cancels_the_picker`（`:1986`）、
-  `alt_past_the_last_item_answers_nothing`（`:1998`）、`alt_digits_stay_with_the_input_when_no_picker_shows`
-  （`:2009`）。
-- **还缺**：插件自定义选项键的公开 API `ChoiceKeys`/`ChoiceAction`/`ChoiceSystems`
-  （上游 `:51`/`:55`/`:589`，本仓 0 命中）——现在只有内置 Alt+数字，插件加不了自己的键；
-  `in_input`/`draft`（在输入框里作答，上游 `:132`）没有。`scroll`/`more`/`picked` 已进
-  `PickerInput`（`:56`–`:95`）。
+  只在 picker 显示时由 `picker_keys`（`picker.rs:918`）接管；测试 `alt_one_picks_the_first_item_like_a_click`
+  （`:2077`）、`alt_three_picks_the_third_item`（`:2098`）、`alt_zero_cancels_the_picker`（`:2113`）、
+  `alt_past_the_last_item_answers_nothing`（`:2125`）、`alt_digits_stay_with_the_input_when_no_picker_shows`
+  （`:2136`）。
+- **`ChoiceKeys`/`ChoiceAction` 已移植（部分）**：`ChoiceKeys`（`picker.rs:69`）+ `ChoiceKey`
+  （`:85`）+ `ChoiceAction`（`:107`，收窄成 `Choose(n)`/`Cancel`/`Message(String)` 三类）挂在
+  `Picker` 实体上；`picker_keys`（`:918`）在 picker 显示时先于内置键与过滤输入处理，命中发
+  `ChoiceKeyPressed`（`:123`）。测试 `choice_keys_fire_a_message_and_keep_out_of_the_filter`
+  （`:2212`）、`choice_keys_choose_and_cancel_like_alt_digits`（`:2245`）、
+  `choice_keys_do_not_take_alt_digits_away`（`:2278`）、
+  `choice_keys_on_a_queued_picker_do_not_take_the_key`（`:2308`）、
+  `choice_keys_without_a_picker_do_not_swallow_the_key`（`:2332`）。**还缺**：上游的
+  `ChoiceSystems` 调度（上游 `:589`）与 `Tick`/`TickAll`/`TickNone`/`More`/`Answer` 变体
+  （用 `Message` 由插件自己做）；`in_input`/`draft`（在输入框里作答，上游 `:132`）没有。
+  `scroll`/`more`/`picked` 已进 `PickerInput`（`:147`–`:177`）。
 
 ### 3.10 `render.rs`（非绘制部分）
 
@@ -359,7 +373,7 @@ OSC 133 提示符标记、OSC 2 标题、标题栈 push/pop（`PUSH_TITLE`/`POP_
 | "转写 Alt+↑↓ 没有目标：`SelectUp/SelectDown/Deselect` 空实现；`KeyScope::Transcript` 没有系统切进去" | 条目选择已落地：`pane::select_pane_item`（`pane.rs:333`，入口 `:429`–`:442`）+ `Selection::item/select_item`（`selection.rs:199`/`:212`），Esc 清选区并交还键（`pane.rs:409`–`:413`/`:536`）；测试 `alt_down_selects_items_in_order_and_alt_up_walks_back_without_overshooting`（`pane.rs:1306`）等 9 个。仍需注意：它是物理键直读，`act` 里的 `SelectUp/SelectDown` 仍是空实现（`editor.rs:973`–`:975`）。 |
 | "输入补全 … 只差 `.gitignore` 感知与两条抑制"（这条仍然对） | 保持不变：`complete.rs:29`–`:31` 自注不读 `.gitignore`；`complete.rs:24`–`:26` 自注两条抑制没做。 |
 | "`↓ new output` 不画：`window_transcript` 只放 `BELOW_MARKER`，`BelowSeen` 没人持有（`transcript.rs:811`–`:813`）" | 已画：`BelowSeen` 是资源（`transcript.rs:812`），`window_transcript` 每帧 `seen.of(...)`（`pane.rs:296`）在 `Below::{More,New}` 间切换，按窗格宽度裁剪（`pane.rs:299`–`:309`）；测试 `pane.rs:926`/`:975` 断言 `seen`/`scrolled`。 |
-| "picker 不能用 Alt+1..9 选，只能点" | 已落地：`picker_keys`（`picker.rs:826`）在 picker 显示时接管 Alt+1..9（选第 n 个可见项并确认）与 Alt+0（取消），测试 `alt_one_picks_the_first_item_like_a_click`（`:1950`）等 5 个；`more`/`scroll`/`picked` 也进了 `PickerInput`（`:56`–`:95`）。插件自定义键（`ChoiceKeys`）仍没有。 |
+| "picker 不能用 Alt+1..9 选，只能点" | 已落地：`picker_keys`（`picker.rs:918`）在 picker 显示时接管 Alt+1..9（选第 n 个可见项并确认）与 Alt+0（取消），测试 `alt_one_picks_the_first_item_like_a_click`（`:2077`）等 5 个；`more`/`scroll`/`picked` 也进了 `PickerInput`（`:147`–`:177`）。插件自定义键 `ChoiceKeys`/`ChoiceAction` 已移植（部分，`picker.rs:69`/`:107`；`ChoiceSystems` 与 Tick/More 等变体仍缺）。 |
 | "`[stopped]` 不画（`batch.rs:862` TODO）" | 已画：`batch.rs:967`–`:985` 用 `TextId::Message { at, block: usize::MAX }`（`STOPPED_BLOCK` `:196`）画 dim 的 `[stopped]`，来源是 turn 记录 `TurnEnd::Stopped`（`:783`）。没有新增 `TextId` 变体（原因见 `:191`–`:195`）。 |
 | "`rig_niri` **317** 个测试（基线）" | 现在 **`#[test]` 441 个**（§0 有实测口径与时刻），且 `picker.rs` 还在加。 |
 

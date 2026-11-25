@@ -37,6 +37,7 @@ use feathers_in_3d::{MirrorRoot, WorldLayer, WorldPanel};
 
 use crate::layout::{self, Node as LayoutNode};
 use crate::niri::TileRect;
+use crate::pane::{ActiveTranscript, TranscriptPane};
 use crate::panels::{PanelId, PanelRows};
 use crate::workspaces::{Workspace, WorkspacePanel, WorkspacePanels, WorkspaceSet};
 
@@ -891,36 +892,39 @@ pub fn spawn_panel(
     look: Look,
 ) -> Entity {
     let inset = panel.inset;
-    commands
-        .spawn((
-            Name::new(format!("panel:{id:?}")),
-            id,
-            panel,
-            Node {
-                position_type: PositionType::Absolute,
-                // 摆到屏幕外：3D 副本才是可见的那个，2D 层不许画在上面。
-                left: px(-20000.0),
-                top: px(0.0),
-                width: px(0.0),
-                height: px(0.0),
-                padding: UiRect::all(px(f32::from(inset.pad))),
-                border: UiRect::all(px(f32::from(inset.border))),
-                border_radius: BorderRadius::all(px(look.radius)),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(0.0),
-                justify_content: look.justify,
-                ..default()
-            },
-            BackgroundColor(look.bg),
-            BorderColor::all(look.border),
-            WorldPanel {
-                units_to_world: UNITS_TO_WORLD,
-                anchor: Transform::default(),
-            },
-            WorldLayer(panel.layer),
-            MirrorRoot,
-        ))
-        .id()
+    let mut entity = commands.spawn((
+        Name::new(format!("panel:{id:?}")),
+        id,
+        panel,
+        Node {
+            position_type: PositionType::Absolute,
+            // 摆到屏幕外：3D 副本才是可见的那个，2D 层不许画在上面。
+            left: px(-20000.0),
+            top: px(0.0),
+            width: px(0.0),
+            height: px(0.0),
+            padding: UiRect::all(px(f32::from(inset.pad))),
+            border: UiRect::all(px(f32::from(inset.border))),
+            border_radius: BorderRadius::all(px(look.radius)),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(0.0),
+            justify_content: look.justify,
+            ..default()
+        },
+        BackgroundColor(look.bg),
+        BorderColor::all(look.border),
+        WorldPanel {
+            units_to_world: UNITS_TO_WORLD,
+            anchor: Transform::default(),
+        },
+        WorldLayer(panel.layer),
+        MirrorRoot,
+    ));
+    // 转写类窗格带逐窗格状态（来源/标题/滚动/选中）；其余面板没有。
+    if matches!(id, PanelId::Transcript | PanelId::Pane2) {
+        entity.insert(TranscriptPane::default());
+    }
+    entity.id()
 }
 
 /// 转写类面板的观感（主转写和拆出来的第二个窗格用同一套）。
@@ -940,8 +944,10 @@ fn transcript_look() -> Look {
 ///
 /// 这是 niri 分裂树上的最小拆窗操作，**只由用户按键触发**，不自动拆：
 /// 1. [`FrameTree`] 里拆叶子（真实几何由 [`crate::layout::Node::rects`] 推导）；
-/// 2. 给 `Pane2` spawn 一块同样的树面板，登记进 [`PanelRoots`]；
-/// 3. 给 [`PanelRows`] 建好 `Pane2` 的行槽（内容由 `panels` 每帧从转写镜像）。
+/// 2. 给 `Pane2` spawn 一块同样的树面板（[`spawn_panel`] 会给它挂默认
+///    [`TranscriptPane`]），登记进 [`PanelRoots`]；
+/// 3. 给 [`PanelRows`] 建好 `Pane2` 的行槽（S1 内容仍由 `panels` 每帧从转写镜像）；
+/// 4. 把 [`ActiveTranscript`] 指到这块新窗格（键/滚轮从下一帧起作用于它）。
 ///
 /// 已经拆过（`Pane2` 已经在树上或已经登记）时返回 `false`，不改树，也不多
 /// spawn 面板；`Transcript` 找不到时同样返回 `false`。
@@ -963,6 +969,9 @@ pub fn split_transcript(
     let pane2 = spawn_panel(commands, PanelId::Pane2, FramePanel::tree(), transcript_look());
     roots.0.insert(PanelId::Pane2, pane2);
     rows.0.entry(PanelId::Pane2).or_default();
+    // 拆出来的窗格成为活动窗格；`spawn_panel` 已挂好默认 `TranscriptPane`
+    //（来源 `Shown`、无标题、自己的滚动从末尾跟随开始）。
+    commands.insert_resource(ActiveTranscript(Some(pane2)));
     true
 }
 

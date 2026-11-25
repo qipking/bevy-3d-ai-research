@@ -46,6 +46,7 @@
 
 use bevy::picking::events::PointerScroll;
 use bevy::prelude::*;
+use rig_tui::TranscriptSource;
 use rig_tui::ratatui::style::{Color as RColor, Modifier, Style};
 use rig_tui::ratatui::text::{Line, Span};
 
@@ -125,7 +126,13 @@ pub fn item_rows(rows: &[KeyedRow]) -> Vec<ItemRows> {
     items
 }
 
-/// 主转写窗格的滚动：窗顶是第几行，是否跟着末尾（rig-tui 的 `Scroll`）。
+/// 一块转写窗格的滚动：窗顶是第几行，是否跟着末尾（rig-tui 的 `Scroll`）。
+///
+/// S1 之后它主要是 [`TranscriptPane::scroll`] 的字段类型（每块窗格各一份）。
+/// 同时保留 `Resource` 只是为了不逼 `editor.rs` 改：发送消息时它仍然写
+/// [`PaneScroll::follow`]（见 [`window_transcript`] 里的兼容入口）。**资源不是
+/// 状态的第二份副本**：只在资源被改的那一帧把 `top`/`follow` 交给主转写，
+/// 之后由窗格自己的字段负责，没有任何每帧反向同步。
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneScroll {
     /// 窗顶那一行在整段里的下标。
@@ -209,18 +216,98 @@ impl PaneScroll {
     }
 }
 
-/// 转写窗格这一帧能放多少列、多少行（`(cols, rows)`）。
+/// 一块转写窗格（`PanelId::Transcript` / `PanelId::Pane2` 的根实体）的全部
+/// 逐窗格状态。
+///
+/// 上游同名组件（rig-tui `pane.rs:57`）只有 `source`/`title`；我们的滚动与条目
+/// 选中原本是全局 `PaneScroll` + `Selection`，S1 把每块窗格自己的那几份收到这里。
+/// `title`/`selected` 在 S1 还没有读取方（只是先把归属搬对），行为与改动前一致。
+#[derive(Component, Clone, Debug)]
+pub struct TranscriptPane {
+    /// 这块窗格画谁。S1 里两块都是 [`TranscriptSource::Shown`]（`Pane2` 仍由
+    /// [`crate::panels`] 的镜像填行），S2 才按来源产行。
+    pub source: TranscriptSource,
+    /// 窗格第一行的标题。`None` = 不占行（S1 不读它，保证画面零变化）。
+    pub title: Option<String>,
+    /// 这块窗格自己的滚动（窗顶 + 是否跟随末尾）。
+    pub scroll: PaneScroll,
+    /// 这块窗格自己的条目选中（`Selection::item` 的块序号）。
+    pub selected: Option<u32>,
+    /// 这块窗格自己的“下面还有”状态：`Pane2` 与主窗格的滚动位置可以不同，
+    /// 标记文案（more below / new output）也必须各记各的。
+    pub below: BelowSeen,
+}
+
+impl Default for TranscriptPane {
+    fn default() -> Self {
+        Self {
+            source: TranscriptSource::Shown,
+            title: None,
+            scroll: PaneScroll::default(),
+            selected: None,
+            below: BelowSeen::default(),
+        }
+    }
+}
+
+impl TranscriptPane {
+    /// 一块画 `source`、没有标题行的窗格。
+    pub fn new(source: TranscriptSource) -> Self {
+        Self {
+            source,
+            ..Self::default()
+        }
+    }
+
+    /// 同一块窗格，带上标题行（S3 才画）。
+    pub fn titled(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+}
+
+/// 当前活动转写窗格：`pane_keys` / `pane_wheel` / 条目选择作用于它。
+///
+/// `None` 或指向已经不在当前工作副本里的实体时，退回
+/// `PanelRoots[PanelId::Transcript]`（设计 §2.4 的优先级：最近一次拆窗/点击/
+/// Alt+↑↓ → 否则主窗格）。
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActiveTranscript(pub Option<Entity>);
+
+impl ActiveTranscript {
+    /// 在当前工作副本里解析出活动转写根。
+    pub fn root(&self, roots: &PanelRoots) -> Option<Entity> {
+        active_root(Some(self), roots)
+    }
+}
+
+/// 活动窗格解析：优先 `ActiveTranscript`，失效时退回主转写。
+fn active_root(active: Option<&ActiveTranscript>, roots: &PanelRoots) -> Option<Entity> {
+    active
+        .and_then(|active| active.0)
+        .filter(|entity| roots.0.values().any(|root| root == entity))
+        .or_else(|| roots.entity(PanelId::Transcript))
+}
+
+/// 一个根在 [`PanelRoots`] 里的 [`PanelId`]（活动窗格的键要写回它那块面板）。
+fn panel_of(root: Entity, roots: &PanelRoots) -> Option<PanelId> {
+    roots
+        .0
+        .iter()
+        .find_map(|(id, candidate)| (*candidate == root).then_some(*id))
+}
+
+/// 某一块转写根这一帧能放多少列、多少行（`(cols, rows)`）。
 ///
 /// 优先看 Niri 的 `Tile`（新窗口逻辑），没有再退回帧布局的 `PanelAreas`。
 /// 列数只用于宽度裁剪"下面还有"标记（上游 `pane::draw_below` 在窗格比标记
-/// 窄时整句不画）。
-fn pane_size(
+/// 窄时整句不画）。S1 从 `pane_size` 泛化成按根查询：每块窗格用自己的区域。
+fn pane_size_of(
     areas: &PanelAreas,
-    roots: &PanelRoots,
+    root: Entity,
     tiles: &Query<&crate::niri::Tile>,
     tiling: Option<&crate::niri::Tiling>,
 ) -> Option<(usize, usize)> {
-    let root = roots.entity(PanelId::Transcript)?;
     if let Ok(tile) = tiles.get(root)
         && let Some(tiling) = tiling
     {
@@ -260,40 +347,98 @@ fn below_marker(text: &'static str) -> KeyedRow {
     }
 }
 
-/// 把整段的可见窗口写进转写面板（`FeathersSystems::Fit`）。
+/// 把整段的可见窗口写进**每一块**转写窗格（`FeathersSystems::Fit`）。
+///
+/// 遍历**所有**带 [`TranscriptPane`] 的转写根（有工作区时只处理当前工作副本
+/// 里的根），每块用自己的 [`pane_size_of`] 与 [`TranscriptPane::scroll`]
+/// 窗口化，写自己的 `PanelRows[这块的 PanelId]`。S1 里 `Pane2` 随后仍会被
+/// `panels` 的镜像覆盖（拆窗语义不变）；这里先各算各的，S2 删镜像时不用再改
+/// 窗口化。
 ///
 /// 滚上去、下面还有行时，最后一行留给 [`BELOW_MARKER`]（rig-tui 是把标记
-/// 画在最后一行的右端，占掉的是同一行）。标记的文案由 [`BelowSeen`] 判定：
-/// 滚上去那一刻已经存在的行是 `↓ more below`；之后整段又长了，才换成
-/// `↓ new output`（上游 `pane::draw_below` 的 `Below::{More, New}`）。
+/// 画在最后一行的右端，占掉的是同一行）。标记的文案由窗格自己的
+/// [`BelowSeen`] 判定：滚上去那一刻已经存在的行是 `↓ more below`；之后整段
+/// 又长了，才换成 `↓ new output`（上游 `pane::draw_below` 的 `Below::{More, New}`）。
 ///
 /// 宽度裁剪和上游一致：窗格比标记窄时整句不画，但最后一行仍然留空（上游
 /// `draw_below` 里 `area.width < width` 直接 return）。
+// `legacy` 是 `editor.rs` 的兼容入口（见 [`PaneScroll`] 的文档）。
 pub fn window_transcript(
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     full: Res<TranscriptRows>,
-    mut scroll: ResMut<PaneScroll>,
-    mut seen: ResMut<BelowSeen>,
+    legacy: Option<Res<PaneScroll>>,
+    set: Option<Res<crate::workspaces::WorkspaceSet>>,
+    mut panes: Query<(Entity, Option<&PanelId>, &mut TranscriptPane)>,
     mut panels: ResMut<PanelRows>,
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
+    mut first_frame: Local<bool>,
 ) {
-    let Some((width, height)) = pane_size(&areas, &roots, &tiles, tiling.as_deref()) else {
-        return;
-    };
+    // 兼容入口：资源被改的那一帧把请求交给**主转写**（`editor.rs` 发送时设
+    // `follow` 的语义一直是“主窗格跟末尾”；`Pane2` 在 S1 仍镜像主窗格）。
+    // 这里不反向写回资源，所以资源永远只是“最近一次请求”，不是滚动状态的
+    // 第二份副本。第一帧跳过：`PanePlugin` 刚 `init_resource` 的默认值不是
+    // 请求，别拿它覆盖窗格自己带的初始位置。
+    if !*first_frame {
+        *first_frame = true;
+    } else if let Some(legacy) = legacy.as_ref().filter(|legacy| legacy.is_changed())
+        && let Some(root) = roots.entity(PanelId::Transcript)
+        && let Ok((_, _, mut pane)) = panes.get_mut(root)
+    {
+        pane.scroll = **legacy;
+    }
+
+    // 先收集再写 `PanelRows`：查询借用窗格组件，面板资源是另一份容器的借用。
+    // 遍历**所有**带 `TranscriptPane` 的根；`PanelId` 优先从当前工作副本的
+    // `PanelRoots` 反查（旧的无窗口测试只登记了根），没有时用根上挂的
+    // `PanelId`（`spawn_panel` 会挂）。
+    //
+    // 有工作区时只处理当前工作副本里的根：非聚焦工作区的行在它自己的
+    // `WorkspacePanels` 里，不能拿聚焦工作区的 `TranscriptRows` 去写。
+    let workspace_mode = set
+        .as_deref()
+        .is_some_and(|set| !set.items.is_empty());
+    let mut updates: Vec<(PanelId, Vec<KeyedRow>)> = Vec::new();
+    for (entity, component_id, mut pane) in panes.iter_mut() {
+        let Some(id) = panel_of(entity, &roots).or(component_id.copied()) else {
+            continue;
+        };
+        if !matches!(id, PanelId::Transcript | PanelId::Pane2) {
+            continue;
+        }
+        if workspace_mode && roots.entity(id) != Some(entity) {
+            continue;
+        }
+        let Some((width, height)) = pane_size_of(&areas, entity, &tiles, tiling.as_deref()) else {
+            continue;
+        };
+        updates.push((id, window_pane(&full.0, &mut pane, width, height)));
+    }
+    for (id, rows) in updates {
+        panels.set(id, rows);
+    }
+}
+
+/// 一块窗格的窗口化（[`window_transcript`] 的主体；每块窗格各用自己的滚动）。
+fn window_pane(
+    full: &[KeyedRow],
+    pane: &mut TranscriptPane,
+    width: usize,
+    height: usize,
+) -> Vec<KeyedRow> {
     let len = full.len();
     let max_top = len.saturating_sub(height);
-    if scroll.follow {
-        scroll.top = max_top;
+    if pane.scroll.follow {
+        pane.scroll.top = max_top;
     }
-    let top = scroll.top.min(max_top);
-    if top != scroll.top {
-        scroll.top = top;
+    let top = pane.scroll.top.min(max_top);
+    if top != pane.scroll.top {
+        pane.scroll.top = top;
     }
-    // 先让 `BelowSeen` 看到这一帧的 follow/total/top/height：跟随末尾就复位，
-    // 刚离开末尾就记下"已经看到哪里"。
-    let below = seen.of(scroll.follow, len, top, height);
+    // 先让窗格自己的 `BelowSeen` 看到这一帧的 follow/total/top/height：跟随
+    // 末尾就复位，刚离开末尾就记下"已经看到哪里"。
+    let below = pane.below.of(pane.scroll.follow, len, top, height);
     // 只有一行的窗格把那一行留给正文（上游 `text_rows` 的同一个分支）。
     let below = if height > 1 { below } else { Below::Nothing };
     let marker = below.marker();
@@ -303,7 +448,7 @@ pub fn window_transcript(
         Below::More | Below::New => height - 1,
     };
     let end = (top + rows_shown).min(len);
-    let mut rows = full.0[top..end].to_vec();
+    let mut rows = full[top..end].to_vec();
     if below != Below::Nothing {
         rows.push(below_marker(if marker_fits {
             marker.unwrap_or_default()
@@ -311,7 +456,7 @@ pub fn window_transcript(
             ""
         }));
     }
-    panels.set(PanelId::Transcript, rows);
+    rows
 }
 
 /// 窗口这一帧能放几行**正文**：滚上去时最后一行留给 [`BELOW_MARKER`]。
@@ -333,8 +478,9 @@ fn text_rows(follow: bool, top: usize, height: usize, max_top: usize) -> usize {
 fn select_pane_item(
     down: bool,
     full: &[KeyedRow],
-    roots: &PanelRoots,
-    scroll: &mut PaneScroll,
+    panel: PanelId,
+    root: Entity,
+    pane: &mut TranscriptPane,
     selection: &mut Selection,
     focus: Option<&mut KeyFocus>,
     height: usize,
@@ -344,8 +490,11 @@ fn select_pane_item(
     if items.is_empty() {
         return;
     }
+    // 当前身份只认“选区就在这个窗格里”的那一份；切到另一块窗格后不沿用
+    // 上一块的条目（每块窗格的 selected 各记各的）。
     let at = selection
         .item()
+        .filter(|_| selection.panel() == Some(panel))
         .and_then(|item| items.iter().position(|candidate| candidate.ordinal == item));
     let index = match (at, down) {
         (Some(at), true) => (at + 1).min(items.len() - 1),
@@ -354,6 +503,7 @@ fn select_pane_item(
         (None, false) => items.len() - 1,
     };
     let item = items[index];
+    let scroll = &mut pane.scroll;
     let top = scroll.top.min(max_top);
     let shown = text_rows(scroll.follow, top, height, max_top);
     if item.start < top || item.start >= top + shown {
@@ -370,10 +520,9 @@ fn select_pane_item(
         .end
         .min(top.saturating_add(shown))
         .saturating_sub(top);
-    selection.select_item(PanelId::Transcript, from, to, item.ordinal);
-    if let Some(focus) = focus
-        && let Some(root) = roots.entity(PanelId::Transcript)
-    {
+    pane.selected = Some(item.ordinal);
+    selection.select_item(panel, from, to, item.ordinal);
+    if let Some(focus) = focus {
         // 拿住键：这样 `editor.rs` 的 Esc 走的是“面板没绑 Esc -> 交还输入框”
         // 分支，而不是输入框作用域里的 Stop（停 agent）。
         focus.0 = Some(root);
@@ -396,27 +545,43 @@ pub fn pane_keys(
     areas: Res<PanelAreas>,
     roots: Res<PanelRoots>,
     full: Res<TranscriptRows>,
-    mut scroll: ResMut<PaneScroll>,
+    active: Option<Res<ActiveTranscript>>,
+    mut panes: Query<&mut TranscriptPane>,
     mut selection: Option<ResMut<Selection>>,
     mut focus: Option<ResMut<KeyFocus>>,
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
+    // 目标 = 活动窗格（没有/失效时退回主转写）。滚动、条目选中都只改它那一份。
+    let Some(root) = active_root(active.as_deref(), &roots) else {
+        return;
+    };
+    let Some(panel) = panel_of(root, &roots) else {
+        return;
+    };
+    if !matches!(panel, PanelId::Transcript | PanelId::Pane2) {
+        return;
+    }
+    let Ok(mut pane) = panes.get_mut(root) else {
+        return;
+    };
+
     // Esc：清掉条目选区。**不在这里清 KeyFocus**：`editor::keys` 也读同一个
     // Esc，只有看到焦点还在转写根上，它才会走面板作用域的“Esc 交还输入框”
     // 分支；在 Prepare 里先清焦点会把它送回输入作用域，Esc 就被当成 Stop
     // （停 agent）。焦点由 `release_transcript_focus` 在窗口化之后交还。
-    if keys.just_pressed(KeyCode::Escape)
-        && let Some(selection) = selection.as_deref_mut()
-        && selection.item().is_some()
-    {
-        selection.clear();
+    if keys.just_pressed(KeyCode::Escape) {
+        pane.selected = None;
+        if let Some(selection) = selection.as_deref_mut()
+            && selection.item().is_some()
+        {
+            selection.clear();
+        }
     }
 
-    let (_, height) = pane_size(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or((0, 0));
-    if height == 0 {
+    let Some((_, height)) = pane_size_of(&areas, root, &tiles, tiling.as_deref()) else {
         return;
-    }
+    };
     let max_top = full.len().saturating_sub(height);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
@@ -431,8 +596,9 @@ pub fn pane_keys(
             select_pane_item(
                 down,
                 &full.0,
-                &roots,
-                &mut scroll,
+                panel,
+                root,
+                &mut pane,
                 selection,
                 focus.as_deref_mut(),
                 height,
@@ -443,20 +609,20 @@ pub fn pane_keys(
     // `[0, max_top]`；不抢 PgUp/PgDn 的一页。
     } else if shift {
         if up {
-            scroll.up(1);
+            pane.scroll.up(1);
         }
         if down {
-            scroll.down(1, max_top);
+            pane.scroll.down(1, max_top);
         }
     }
 
     // PgUp/PgDn 的原行为不变：一次一页。
-    let page = scroll.page(height);
+    let page = pane.scroll.page(height);
     if keys.just_pressed(KeyCode::PageUp) {
-        scroll.up(page);
+        pane.scroll.up(page);
     }
     if keys.just_pressed(KeyCode::PageDown) {
-        scroll.down(page, max_top);
+        pane.scroll.down(page, max_top);
     }
 }
 
@@ -483,6 +649,9 @@ fn sync_item_selection(
 ) {
     // 先只读：鼠标选区（`item == None`）每帧原样返回，不把 `Selection` 标记成
     // 改过，也不去扫整段行。
+    let Some(panel) = selection.as_deref().and_then(Selection::panel) else {
+        return;
+    };
     let Some(item) = selection.as_deref().and_then(Selection::item) else {
         return;
     };
@@ -496,7 +665,9 @@ fn sync_item_selection(
         }
         return;
     }
-    let visible = item_rows(panels.get(PanelId::Transcript));
+    // 可见窗口用**选区所在那块面板**的行（Pane2 有自己的窗口，不能拿主转写
+    // 的行下标去套）。
+    let visible = item_rows(panels.get(panel));
     let Some(shown) = visible
         .iter()
         .find(|candidate| candidate.ordinal == item)
@@ -512,14 +683,14 @@ fn sync_item_selection(
         return;
     };
     let needs_reselect = selection.as_deref().is_some_and(|selection| {
-        selection.panel() != Some(PanelId::Transcript)
+        selection.panel() != Some(panel)
             || selection.anchor() != Point::new(shown.start, 0)
             || selection.focus() != Point::new(shown.end, 0)
     });
     if needs_reselect
         && let Some(selection) = selection.as_deref_mut()
     {
-        selection.select_item(PanelId::Transcript, shown.start, shown.end, item);
+        selection.select_item(panel, shown.start, shown.end, item);
     }
 }
 
@@ -538,16 +709,20 @@ fn release_transcript_focus(
     selection: Option<Res<Selection>>,
     mut focus: Option<ResMut<KeyFocus>>,
 ) {
-    let Some(root) = roots
-        .as_deref()
-        .and_then(|roots| roots.entity(PanelId::Transcript))
-    else {
+    let Some(roots) = roots.as_deref() else {
         return;
     };
     let Some(focus) = focus.as_deref_mut() else {
         return;
     };
-    if focus.0 != Some(root) {
+    // 焦点可能拿在主转写或拆出来的 Pane2 上（活动窗格是谁就谁）；别的要求
+    // 的焦点（输入面板等）不归这里管。
+    let Some(focused) = focus.0 else {
+        return;
+    };
+    let is_transcript = roots.entity(PanelId::Transcript) == Some(focused)
+        || roots.entity(PanelId::Pane2) == Some(focused);
+    if !is_transcript {
         return;
     }
     // 只有“条目选着、而且高亮真的亮在屏幕上”才继续拿键；`item` 为 `None`
@@ -595,32 +770,63 @@ pub fn pane_wheel(
     layouts: Query<&RowLayout>,
     areas: Res<PanelAreas>,
     full: Res<TranscriptRows>,
-    mut scroll: ResMut<PaneScroll>,
+    mut panes: Query<&mut TranscriptPane>,
     mut selection: Option<ResMut<Selection>>,
     tiles: Query<&crate::niri::Tile>,
     tiling: Option<Res<crate::niri::Tiling>>,
 ) {
-    // 行数每帧从当前区域算（不缓存）：resize 之后这一帧读到的就是新行数。
-    let (_, height) = pane_size(&areas, &roots, &tiles, tiling.as_deref()).unwrap_or((0, 0));
     for event in scrolls.read() {
         // 横向滚轮（触摸板的左右滑）不是转写的滚动。
-        let over_transcript =
-            wheel_panel(event.entity, &roots, &layouts) == Some(PanelId::Transcript);
-        if event.y == 0.0 || !over_transcript {
+        let Some(panel) = wheel_panel(event.entity, &roots, &layouts) else {
+            continue;
+        };
+        if event.y == 0.0 || !matches!(panel, PanelId::Transcript | PanelId::Pane2) {
             continue;
         }
         // 上游 `moused` 的顺序：先收起选区，再看有没有窗格可滚。
         if let Some(selection) = selection.as_deref_mut() {
             selection.clear();
         }
-        if height == 0 {
+        // 滚的是**指针下面那块**窗格（`wheel_panel` 已把行实体/根换算成
+        // PanelId），不是“当前活动窗格”：行数也按那块根自己的区域算。
+        let Some(root) = roots.entity(panel) else {
             continue;
-        }
+        };
+        let Ok(mut pane) = panes.get_mut(root) else {
+            continue;
+        };
+        let Some((_, height)) = pane_size_of(&areas, root, &tiles, tiling.as_deref()) else {
+            continue;
+        };
         let max_top = full.len().saturating_sub(height);
         if event.y > 0.0 {
-            scroll.wheel_up(max_top);
+            pane.scroll.wheel_up(max_top);
         } else {
-            scroll.wheel_down(max_top);
+            pane.scroll.wheel_down(max_top);
+        }
+    }
+}
+
+/// 给已登记但没经过 [`crate::frame::spawn_panel`] 的转写根补上默认
+/// [`TranscriptPane`]。
+///
+/// 生产路径全部由 `spawn_panel` 挂组件；这条只兼容旧的无窗口测试/集成方：
+/// 它们手工 spawn 根实体（没有 `PanelId` 以外的面板构造）再写 `PanelRoots`。
+/// 补默认值与 `spawn_panel` 完全一致，所以不影响正常路径。
+fn hydrate_transcript_panes(
+    mut commands: Commands,
+    roots: Option<Res<PanelRoots>>,
+    panes: Query<(), Without<TranscriptPane>>,
+) {
+    let Some(roots) = roots else {
+        return;
+    };
+    for id in [PanelId::Transcript, PanelId::Pane2] {
+        let Some(root) = roots.entity(id) else {
+            continue;
+        };
+        if panes.get(root).is_ok() {
+            commands.entity(root).insert(TranscriptPane::default());
         }
     }
 }
@@ -630,11 +836,16 @@ pub struct PanePlugin;
 impl Plugin for PanePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TranscriptRows>()
+            .init_resource::<ActiveTranscript>()
+            // 只为 `editor.rs` 的兼容入口保留（见 `PaneScroll` 的文档）；没有
+            // 任何系统把它当滚动状态读。
             .init_resource::<PaneScroll>()
+            // 兼容旧的读取方；窗口化现在用每块窗格自己的 `TranscriptPane::below`。
             .init_resource::<BelowSeen>()
             // 生产里 `PickingPlugin` 已经注册了这个消息；这里补上是为了让不建
             // 窗口的测试 App 也能写 `PointerScroll`（`add_message` 幂等）。
             .add_message::<PointerScroll>()
+            .add_systems(Startup, hydrate_transcript_panes)
             .add_systems(
                 Update,
                 pane_keys
@@ -828,16 +1039,44 @@ mod tests {
     /// 就是一次 resize（[`window_transcript`] 每帧读当前区域，不缓存）。
     fn windowing_app(count: usize, height: u16, top: usize, follow: bool) -> App {
         let mut app = App::new();
-        app.init_resource::<PaneScroll>()
-            .init_resource::<BelowSeen>()
-            .init_resource::<PanelRows>();
-        let root = app.world_mut().spawn_empty().id();
+        app.init_resource::<PanelRows>();
+        let root = app
+            .world_mut()
+            .spawn((
+                PanelId::Transcript,
+                TranscriptPane {
+                    scroll: view(top, follow),
+                    ..default()
+                },
+            ))
+            .id();
         app.insert_resource(PanelRoots(HashMap::from([(PanelId::Transcript, root)])));
         app.insert_resource(PanelAreas(HashMap::from([(root, pane_area(height))])));
         app.insert_resource(TranscriptRows(keyed_rows(count)));
-        app.insert_resource(view(top, follow));
+        // 不插入 `PaneScroll` 资源：它是 `editor.rs` 的兼容入口，插入会被当成
+        // “最近一次请求”而覆盖组件里的初始位置。
         app.add_systems(Update, window_transcript);
         app
+    }
+
+    /// 主转写根。
+    fn transcript_root(app: &App) -> Entity {
+        app.world()
+            .resource::<PanelRoots>()
+            .entity(PanelId::Transcript)
+            .expect("主转写面板根")
+    }
+
+    /// 一块窗格的组件状态。
+    fn pane_of(app: &App, root: Entity) -> &TranscriptPane {
+        app.world()
+            .get::<TranscriptPane>(root)
+            .expect("转写根要挂 TranscriptPane")
+    }
+
+    /// 主转写窗格的“下面还有”状态。
+    fn below(app: &App) -> BelowSeen {
+        pane_of(app, transcript_root(app)).below
     }
 
     /// 转写面板这一帧显示的行文本。
@@ -859,7 +1098,7 @@ mod tests {
         assert_eq!(rows.len(), 10, "视口 10 行就显示 10 行");
         assert_eq!(rows.first().map(String::as_str), Some("row 90"));
         assert_eq!(rows.last().map(String::as_str), Some("row 99"));
-        assert_eq!(app.world().resource::<PaneScroll>().top, 90, "top 被夹到新末尾");
+        assert_eq!(scroll(&app).top, 90, "top 被夹到新末尾");
     }
 
     #[test]
@@ -869,7 +1108,7 @@ mod tests {
         app.update();
         assert_eq!(visible_rows(&app).len(), 5);
         assert_eq!(
-            app.world().resource::<PaneScroll>().top,
+            scroll(&app).top,
             95,
             "跟随末尾 = 100 - 5"
         );
@@ -889,7 +1128,7 @@ mod tests {
         assert_eq!(rows.len(), 10, "面板变高后这一帧就多显示 5 行");
         assert_eq!(rows.first().map(String::as_str), Some("row 90"));
         assert_eq!(rows.last().map(String::as_str), Some("row 99"));
-        assert_eq!(app.world().resource::<PaneScroll>().top, 90);
+        assert_eq!(scroll(&app).top, 90);
     }
 
     // ---- “下面还有”标记：more below / new output（上游 pane::draw_below） ----
@@ -923,8 +1162,8 @@ mod tests {
             Some(" ↓ more below (PgDn) "),
             "滚上去、下面还是旧行：more below"
         );
-        assert_eq!(app.world().resource::<BelowSeen>().seen(), 100);
-        assert!(app.world().resource::<BelowSeen>().scrolled());
+        assert_eq!(below(&app).seen(), 100);
+        assert!(below(&app).scrolled());
 
         append_rows(&mut app, 5);
         app.update();
@@ -960,8 +1199,11 @@ mod tests {
 
         // PgDn 到底 / `Scroll::follow`：窗顶回到 max_top，重新跟随末尾。
         let max_top = 105 - 10;
+        let root = transcript_root(&app);
         app.world_mut()
-            .resource_mut::<PaneScroll>()
+            .get_mut::<TranscriptPane>(root)
+            .expect("主转写")
+            .scroll
             .to(None, max_top);
         app.update();
 
@@ -972,7 +1214,7 @@ mod tests {
             !rows.iter().any(|row| row.contains("PgDn")),
             "回到末尾就不再占一行给标记：{rows:?}"
         );
-        let seen = app.world().resource::<BelowSeen>();
+        let seen = below(&app);
         assert!(!seen.scrolled(), "跟随末尾后 BelowSeen 复位");
         assert_eq!(seen.seen(), 105, "记下的行数跟着整段更新");
     }
@@ -999,7 +1241,7 @@ mod tests {
             !rows.iter().any(|row| row.contains("PgDn")),
             "窗格 8 列放不下整句：{rows:?}"
         );
-        assert!(app.world().resource::<BelowSeen>().scrolled());
+        assert!(below(&app).scrolled());
     }
 
     // ---- 滚轮接线：不建窗口，直接写 PointerScroll 消息 ----
@@ -1008,18 +1250,32 @@ mod tests {
         app: App,
         /// 指针下面那一行（`RowLayout` 指到面板根）。
         row: Entity,
+        /// 主转写根（组件里存着这块窗格的滚动）。
+        root: Entity,
+    }
+
+    /// 摆好主转写的初始滚动（测试里不经过 `window_transcript`）。
+    fn set_view(fixture: &mut WheelFixture, scroll: PaneScroll) {
+        fixture
+            .app
+            .world_mut()
+            .get_mut::<TranscriptPane>(fixture.root)
+            .expect("主转写")
+            .scroll = scroll;
     }
 
     fn wheel_fixture(panel: PanelId, height: u16, count: usize) -> WheelFixture {
         let mut app = App::new();
         app.init_resource::<TranscriptRows>()
-            .init_resource::<PaneScroll>()
             .init_resource::<PanelRoots>()
             .init_resource::<PanelAreas>()
             .init_resource::<Selection>();
         app.add_message::<PointerScroll>()
             .add_systems(Update, pane_wheel.run_if(crate::picker::no_picker));
-        let root = app.world_mut().spawn_empty().id();
+        let root = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
         app.world_mut()
             .resource_mut::<PanelRoots>()
             .0
@@ -1040,7 +1296,7 @@ mod tests {
                 index: 0,
             })
             .id();
-        WheelFixture { app, row }
+        WheelFixture { app, row, root }
     }
 
     fn mouse_pointer() -> Pointer {
@@ -1072,10 +1328,10 @@ mod tests {
     #[test]
     fn a_wheel_over_the_transcript_moves_the_view_three_rows_up() {
         let mut fixture = wheel_fixture(PanelId::Transcript, 10, 100);
-        fixture.app.insert_resource(view(90, true));
+        set_view(&mut fixture, view(90, true));
         wheel(&mut fixture, 1.0);
         fixture.app.update();
-        let scroll = *fixture.app.world().resource::<PaneScroll>();
+        let scroll = scroll(&fixture.app);
         assert_eq!(scroll.top, 87);
         assert!(!scroll.follow);
     }
@@ -1083,10 +1339,10 @@ mod tests {
     #[test]
     fn a_wheel_down_over_the_transcript_follows_again_at_the_bottom() {
         let mut fixture = wheel_fixture(PanelId::Transcript, 10, 100);
-        fixture.app.insert_resource(view(88, false));
+        set_view(&mut fixture, view(88, false));
         wheel(&mut fixture, -1.0);
         fixture.app.update();
-        let scroll = *fixture.app.world().resource::<PaneScroll>();
+        let scroll = scroll(&fixture.app);
         assert_eq!(scroll.top, 90);
         assert!(scroll.follow);
     }
@@ -1095,10 +1351,10 @@ mod tests {
     fn a_wheel_outside_the_transcript_leaves_the_view_alone() {
         // 指针在状态行上：滚轮不归转写管（picker 的列表行同理）。
         let mut fixture = wheel_fixture(PanelId::Status, 10, 100);
-        fixture.app.insert_resource(view(40, false));
+        set_view(&mut fixture, view(40, false));
         wheel(&mut fixture, 1.0);
         fixture.app.update();
-        let scroll = *fixture.app.world().resource::<PaneScroll>();
+        let scroll = scroll(&fixture.app);
         assert_eq!(scroll.top, 40);
         assert!(!scroll.follow);
     }
@@ -1106,14 +1362,14 @@ mod tests {
     #[test]
     fn a_wheel_while_a_picker_is_open_leaves_the_view_alone() {
         let mut fixture = wheel_fixture(PanelId::Transcript, 10, 100);
-        fixture.app.insert_resource(view(90, true));
+        set_view(&mut fixture, view(90, true));
         fixture
             .app
             .world_mut()
             .spawn(rig_harness::prelude::Picker::default());
         wheel(&mut fixture, 1.0);
         fixture.app.update();
-        let scroll = *fixture.app.world().resource::<PaneScroll>();
+        let scroll = scroll(&fixture.app);
         assert_eq!(scroll.top, 90, "picker 打开时滚轮归 picker.rs");
         assert!(scroll.follow);
     }
@@ -1169,15 +1425,16 @@ mod tests {
     fn keys_app_rows(rows: Vec<KeyedRow>, height: u16) -> KeysFixture {
         let mut app = App::new();
         app.init_resource::<TranscriptRows>()
-            .init_resource::<PaneScroll>()
-            .init_resource::<BelowSeen>()
             .init_resource::<PanelRows>()
             .init_resource::<PanelAreas>()
             .init_resource::<PanelRoots>()
             .init_resource::<Selection>()
             .init_resource::<KeyFocus>()
             .init_resource::<ButtonInput<KeyCode>>();
-        let root = app.world_mut().spawn_empty().id();
+        let root = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
         app.world_mut()
             .resource_mut::<PanelRoots>()
             .0
@@ -1252,7 +1509,7 @@ mod tests {
     }
 
     fn scroll(app: &App) -> PaneScroll {
-        *app.world().resource::<PaneScroll>()
+        pane_of(app, transcript_root(app)).scroll
     }
 
     fn focus(app: &App) -> KeyFocus {
@@ -1623,7 +1880,10 @@ mod tests {
         .init_resource::<PanelAreas>()
         .add_message::<KeyboardInput>();
 
-        let transcript_root = app.world_mut().spawn_empty().id();
+        let transcript_root = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
         let input_root = app
             .world_mut()
             .spawn((
@@ -1906,6 +2166,377 @@ mod tests {
             selection(&fixture.app).item(),
             Some(items[1].ordinal),
             "第二下选第二个调用（不是同一块里的下一行）"
+        );
+    }
+
+    // ---- S1：逐窗格状态 + 活动窗格（`Pane2` 仍镜像） ----
+
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::text::FontSource;
+
+    use crate::panels::PanelsPlugin;
+    use crate::transcript::TranscriptFont;
+
+    const SPLIT_ROWS: usize = 100;
+    const SPLIT_HEIGHT: u16 = 10;
+
+    /// 一块转写面板 + 默认树里的主转写，然后拆一次窗（走真的 `split_transcript`）。
+    fn spawn_split_panes(
+        mut commands: Commands,
+        mut tree: ResMut<crate::frame::FrameTree>,
+        mut roots: ResMut<PanelRoots>,
+        mut rows: ResMut<PanelRows>,
+        mut areas: ResMut<PanelAreas>,
+        mut full: ResMut<TranscriptRows>,
+    ) {
+        let transcript = crate::frame::spawn_panel(
+            &mut commands,
+            PanelId::Transcript,
+            crate::frame::FramePanel::tree(),
+            crate::frame::Look::new(Color::BLACK, Color::WHITE, 0.0),
+        );
+        roots.0.insert(PanelId::Transcript, transcript);
+        areas.0.insert(transcript, pane_area(SPLIT_HEIGHT));
+        assert!(crate::frame::split_transcript(
+            &mut commands,
+            &mut tree,
+            &mut roots,
+            &mut rows
+        ));
+        let pane2 = roots.entity(PanelId::Pane2).expect("拆窗要 spawn Pane2");
+        areas.0.insert(pane2, pane_area(SPLIT_HEIGHT));
+        full.0 = keyed_rows(SPLIT_ROWS);
+    }
+
+    struct SplitFixture {
+        app: App,
+        transcript: Entity,
+        pane2: Entity,
+    }
+
+    /// 两块转写 + 真的 `window_transcript`（Fit）与 `mirror_transcript_rows`
+    /// （Render）；不建窗口。
+    fn split_app() -> SplitFixture {
+        let mut app = App::new();
+        // 生产里由 `FeathersViewPlugin::build` 排好的阶段顺序（键在 Prepare、
+        // 窗口化在 Fit、镜像在 Render）。
+        app.configure_sets(
+            Update,
+            (
+                FeathersSystems::Prepare,
+                FeathersSystems::Layout,
+                FeathersSystems::Draw,
+                FeathersSystems::Fit,
+                FeathersSystems::Render,
+            )
+                .chain(),
+        );
+        app.add_plugins((PanePlugin, PanelsPlugin))
+            .insert_resource(TranscriptFont(FontSource::default()))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<Selection>()
+            .init_resource::<crate::frame::FrameTree>()
+            .init_resource::<crate::frame::PanelAreas>();
+        app.add_systems(Startup, spawn_split_panes);
+        app.update();
+        let roots = app.world().resource::<PanelRoots>();
+        let transcript = roots.entity(PanelId::Transcript).expect("主转写");
+        let pane2 = roots.entity(PanelId::Pane2).expect("Pane2");
+        SplitFixture {
+            app,
+            transcript,
+            pane2,
+        }
+    }
+
+    fn rows_of(app: &App, panel: PanelId) -> Vec<KeyedRow> {
+        app.world().resource::<PanelRows>().get(panel).to_vec()
+    }
+
+    /// 行的身份 + 内容（逐行比较镜像语义）。
+    fn signatures(rows: &[KeyedRow]) -> Vec<(u64, u64, String)> {
+        rows.iter()
+            .map(|keyed| {
+                (
+                    keyed.key,
+                    keyed.hash,
+                    crate::selection::row_text(&keyed.row),
+                )
+            })
+            .collect()
+    }
+
+    fn set_pane_scroll(app: &mut App, root: Entity, scroll: PaneScroll) {
+        app.world_mut()
+            .get_mut::<TranscriptPane>(root)
+            .expect("转写根")
+            .scroll = scroll;
+    }
+
+    fn pane_scroll(app: &App, root: Entity) -> PaneScroll {
+        app.world().get::<TranscriptPane>(root).expect("转写根").scroll
+    }
+
+    fn set_active(app: &mut App, root: Entity) {
+        app.world_mut().resource_mut::<ActiveTranscript>().0 = Some(root);
+    }
+
+    fn pane_component_count(app: &mut App) -> usize {
+        let mut query = app.world_mut().query::<&TranscriptPane>();
+        query.iter(app.world()).count()
+    }
+
+    /// 遍历的是“所有带 `TranscriptPane` 的根”：根没登记进 `PanelRoots` 也能
+    /// 凭根上的 `PanelId` 窗口化（旧的无窗口调用方就是这样手工 spawn 的）。
+    #[test]
+    fn a_component_root_is_windowed_without_a_roots_entry() {
+        let mut app = App::new();
+        app.init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<PanelAreas>();
+        let root = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<PanelAreas>()
+            .0
+            .insert(root, pane_area(5));
+        app.insert_resource(TranscriptRows(keyed_rows(20)));
+        app.add_systems(Update, window_transcript);
+        app.update();
+
+        let rows = app.world().resource::<PanelRows>().get(PanelId::Transcript);
+        assert_eq!(rows.len(), 5, "按自己的区域窗口化");
+        assert_eq!(rows[0].key, 15, "默认跟随末尾：20 - 5");
+    }
+
+    /// 拆窗后两列逐行相等：`Pane2` 仍由 `mirror_transcript_rows` 填。
+    #[test]
+    fn split_panes_show_the_same_rows_line_by_line() {
+        let fixture = split_app();
+        let main = rows_of(&fixture.app, PanelId::Transcript);
+        let mirrored = rows_of(&fixture.app, PanelId::Pane2);
+        assert_eq!(main.len(), SPLIT_HEIGHT as usize);
+        assert_eq!(
+            signatures(&main),
+            signatures(&mirrored),
+            "拆窗后两列逐行相等（key/hash/文本）"
+        );
+    }
+
+    /// 主窗格 PgDn：主列变，`Pane2` 跟着变（镜像仍然生效）。
+    #[test]
+    fn paging_the_main_pane_moves_the_mirrored_pane_too() {
+        let mut fixture = split_app();
+        // 拆窗后活动窗格是 Pane2；这条测的是主窗格，先切回去。
+        set_active(&mut fixture.app, fixture.transcript);
+
+        let before_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
+        let before_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
+        assert_eq!(before_main, before_pane2);
+
+        // 跟随末尾时 PgDn 不动；先 PgUp 离开末尾，再 PgDn 回来，两次都应变化。
+        tap(&mut fixture.app, &[], KeyCode::PageUp);
+        let after_up_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
+        let after_up_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
+        assert_ne!(before_main, after_up_main, "PgUp 后主窗格换了窗口");
+        assert_eq!(
+            after_up_main, after_up_pane2,
+            "Pane2 镜像主窗格（同一份可见行）"
+        );
+
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        let after_down_main = signatures(&rows_of(&fixture.app, PanelId::Transcript));
+        let after_down_pane2 = signatures(&rows_of(&fixture.app, PanelId::Pane2));
+        assert_ne!(after_up_main, after_down_main, "PgDn 后主窗格又变了");
+        assert_eq!(
+            after_down_main, after_down_pane2,
+            "主窗格 PgDn 后 Pane2 跟着变"
+        );
+    }
+
+    /// `title = None` 时行数/行 key 与改动前相等：不插标题行。
+    #[test]
+    fn a_none_title_adds_no_row_and_keeps_the_same_keys() {
+        let mut app = windowing_app(100, 10, 0, true);
+        let root = transcript_root(&app);
+        assert!(
+            pane_of(&app, root).title.is_none(),
+            "默认 TranscriptPane 没有标题"
+        );
+        app.update();
+        let shown = rows_of(&app, PanelId::Transcript);
+        let want: Vec<u64> = keyed_rows(100)[90..].iter().map(|keyed| keyed.key).collect();
+        assert_eq!(
+            shown.iter().map(|keyed| keyed.key).collect::<Vec<_>>(),
+            want,
+            "行 key 就是整段最后 10 行，没有被标题行挤掉/插入"
+        );
+        assert_eq!(shown.len(), 10);
+        assert!(
+            !shown
+                .iter()
+                .any(|keyed| crate::selection::row_text(&keyed.row).contains("PANEL_TITLE")),
+            "title 字段还没人读"
+        );
+    }
+
+    /// 连拆两次仍是两个窗格，`ActiveTranscript` 仍指向同一块 Pane2。
+    #[test]
+    fn splitting_twice_keeps_exactly_two_panes() {
+        fn split_once(
+            mut commands: Commands,
+            mut tree: ResMut<crate::frame::FrameTree>,
+            mut roots: ResMut<PanelRoots>,
+            mut rows: ResMut<PanelRows>,
+        ) -> bool {
+            crate::frame::split_transcript(&mut commands, &mut tree, &mut roots, &mut rows)
+        }
+
+        let mut fixture = split_app();
+        let pane2 = fixture.pane2;
+        assert_eq!(pane_component_count(&mut fixture.app), 2);
+
+        assert!(
+            !fixture
+                .app
+                .world_mut()
+                .run_system_once(split_once)
+                .unwrap(),
+            "第二次拆窗是空操作"
+        );
+        assert_eq!(pane_component_count(&mut fixture.app), 2, "仍然只有两块转写");
+        assert_eq!(
+            fixture.app.world().resource::<PanelRoots>().entity(PanelId::Pane2),
+            Some(pane2),
+            "Pane2 还是同一块"
+        );
+        assert_eq!(
+            fixture.app.world().resource::<ActiveTranscript>(),
+            &ActiveTranscript(Some(pane2)),
+            "活动窗格仍指向 Pane2"
+        );
+    }
+
+    /// 活动窗格切换后，Alt+↑↓ / PgDn 作用在新活动窗格上（两块互不影响）。
+    #[test]
+    fn keys_follow_the_active_pane_after_splitting() {
+        let mut fixture = split_app();
+        let (transcript, pane2) = (fixture.transcript, fixture.pane2);
+        // 两块摆在不同位置，任何一块被动都会看得出来。
+        set_pane_scroll(&mut fixture.app, transcript, view(30, false));
+        set_pane_scroll(&mut fixture.app, pane2, view(50, false));
+        // 拆窗后的活动窗格是 Pane2。
+        assert_eq!(
+            fixture.app.world().resource::<ActiveTranscript>().0,
+            Some(pane2)
+        );
+
+        // Alt+↓ 在 Pane2：选第一条并把它顶到窗顶；主窗格不动。
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(pane_scroll(&fixture.app, pane2).top, 0);
+        assert_eq!(
+            fixture.app.world().get::<TranscriptPane>(pane2).unwrap().selected,
+            Some(0)
+        );
+        assert_eq!(
+            pane_scroll(&fixture.app, transcript).top,
+            30,
+            "主窗格不应被 Pane2 的键改动"
+        );
+
+        // PgDn 也作用在 Pane2。
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        assert_eq!(pane_scroll(&fixture.app, pane2).top, 9, "一页 9 行");
+        assert_eq!(pane_scroll(&fixture.app, transcript).top, 30);
+
+        // 切到主窗格：同一组键改的是主窗格，Pane2 保持刚才的位置。
+        set_active(&mut fixture.app, transcript);
+        alt_tap(&mut fixture.app, KeyCode::ArrowDown);
+        assert_eq!(pane_scroll(&fixture.app, transcript).top, 0);
+        assert_eq!(
+            fixture.app.world().get::<TranscriptPane>(transcript).unwrap().selected,
+            Some(0)
+        );
+        tap(&mut fixture.app, &[], KeyCode::PageDown);
+        assert_eq!(pane_scroll(&fixture.app, transcript).top, 9);
+        assert_eq!(
+            pane_scroll(&fixture.app, pane2).top,
+            9,
+            "Pane2 停在自己最后的位置"
+        );
+    }
+
+    /// `spawn_panel` 给两块转写根挂默认组件；拆窗把活动窗格指到 `Pane2`。
+    #[test]
+    fn transcript_panes_start_with_shown_and_no_title() {
+        let fixture = split_app();
+        for root in [fixture.transcript, fixture.pane2] {
+            let pane = pane_of(&fixture.app, root);
+            assert!(
+                matches!(pane.source, TranscriptSource::Shown),
+                "S1 两块都还是 Shown（Pane2 靠镜像填行）"
+            );
+            assert!(pane.title.is_none(), "默认没有标题行");
+            assert_eq!(pane.selected, None);
+        }
+    }
+
+    /// `editor.rs` 的兼容入口：只改全局 `PaneScroll.follow`，主窗格仍然跟末尾。
+    #[test]
+    fn the_legacy_pane_scroll_request_still_follows_the_main_pane() {
+        let mut fixture = split_app();
+        let (transcript, pane2) = (fixture.transcript, fixture.pane2);
+        set_pane_scroll(&mut fixture.app, transcript, view(20, false));
+        // 拆窗后活动窗格是 Pane2；兼容入口仍按旧语义作用于主窗格。
+        assert_eq!(
+            fixture.app.world().resource::<ActiveTranscript>().0,
+            Some(pane2)
+        );
+        fixture.app.world_mut().resource_mut::<PaneScroll>().follow = true;
+        fixture.app.update();
+        let scroll = pane_scroll(&fixture.app, transcript);
+        assert_eq!(scroll.top, SPLIT_ROWS - SPLIT_HEIGHT as usize);
+        assert!(scroll.follow, "发送后主窗格回到跟随末尾");
+    }
+
+    /// 滚轮按指针换算：在 `Pane2` 上滚滚的是 `Pane2`，主窗格不动。
+    #[test]
+    fn a_wheel_over_pane2_scrolls_pane2_only() {
+        let mut fixture = split_app();
+        let (transcript, pane2) = (fixture.transcript, fixture.pane2);
+        set_pane_scroll(&mut fixture.app, transcript, view(20, false));
+        set_pane_scroll(&mut fixture.app, pane2, view(50, false));
+        let row = fixture
+            .app
+            .world_mut()
+            .spawn(RowLayout {
+                panel: PanelId::Pane2,
+                panel_entity: pane2,
+                index: 0,
+            })
+            .id();
+        fixture.app.world_mut().write_message(PointerScroll {
+            entity: row,
+            pointer: mouse_pointer(),
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 1.0,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            phase: TouchPhase::Moved,
+        });
+        fixture.app.update();
+
+        assert_eq!(
+            pane_scroll(&fixture.app, pane2).top,
+            47,
+            "指针下的 Pane2 往上滚一格（3 行）"
+        );
+        assert_eq!(
+            pane_scroll(&fixture.app, transcript).top,
+            20,
+            "主窗格不该跟着滚"
         );
     }
 }

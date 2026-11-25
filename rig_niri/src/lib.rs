@@ -82,10 +82,15 @@ pub mod prelude {
     pub use crate::frame::FrameTree;
     pub use crate::frame::{add_split_key, split_binding, split_transcript};
     pub use crate::layout::{Child, Node, Size, Split, default_tree};
-    pub use crate::pane::{PanePlugin, PaneScroll, TranscriptRows};
+    pub use crate::pane::{
+        ActiveTranscript, PanePlugin, PaneScroll, TranscriptPane, TranscriptRows,
+    };
     pub use crate::keys::{
         AppKeyBindingsExt, InputAction, KeyBinding, KeyFocus, KeyPress, KeyPressed, KeyScope,
-        Keys, Modifiers, PendingInput, RefusedKeys, action_for,
+        Keys, Modifiers, PendingInput, RefusedKeys, action_for, run_command,
+    };
+    pub use crate::picker::{
+        ChoiceAction, ChoiceKey, ChoiceKeyPressed, ChoiceKeys,
     };
     pub use crate::complete::{
         Candidate, Completion, CompletionKind, CompletionPlugin, CompletionSource, CompletionState,
