@@ -1,8 +1,8 @@
 # rig_niri ↔ rig-tui 移植缺口清单
 
 > **性质**：只读审计。本文档是唯一新增文件，没有改动任何 `.rs`，没有动 git/jj 状态。
-> **基准**：`rig-tui = 0.47.0`（`/var/home/lichi/桌面/research/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rig-tui-0.47.0/src/`）
-> 对 `rig_niri 0.1.0`（`/var/home/lichi/桌面/research/rig_niri/src/`）。
+> **基准**：`rig-tui = 0.47.0`（`/var/home/lichi/桌面/bevy_3d_ai_research/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rig-tui-0.47.0/src/`）
+> 对 `rig_niri 0.1.0`（`/var/home/lichi/桌面/bevy_3d_ai_research/rig_niri/src/`）。
 > **方法**：逐文件读两边源码；每条"部分/缺什么"都指到上游函数名或行号。
 > **口径**：`已移植` = 该模块对外的职责已完整落地（可以换实现）；`部分` = 主路径在，但公开能力有明确缺口；`未开始` = 上游模块没有任何对应物；`有意替换` = 纯终端管道，用 bevy 窗口/渲染取代，不该移植。
 

@@ -32,7 +32,7 @@ cp -r rig_harness_in_3d my_app && cd my_app
 
 ```sh
 ../tools/fetch_cjk_font.sh        # 字体（3.2 MB 子集）
-CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home cargo build
+CARGO_HOME=/var/home/lichi/桌面/bevy_3d_ai_research/.cargo-home cargo build
 BEVY_ASSET_ROOT=$PWD RIG_HOME=/path/to/rig-home RF_SHOT_DIR=../render/my_app ./target/debug/my_app
 ```
 

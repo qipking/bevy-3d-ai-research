@@ -12,7 +12,7 @@
 
 ```bash
 cd research/occlusion_probe
-export CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home CARGO_NET_OFFLINE=true
+export CARGO_HOME=/var/home/lichi/桌面/bevy_3d_ai_research/.cargo-home CARGO_NET_OFFLINE=true
 target/debug/occlusion_probe  # 或用 cargo run
 # 例：
 BEVY_ASSET_ROOT=$PWD PROBE_PANEL_H=300 PROBE_SCROLL=40 \
@@ -39,7 +39,7 @@ BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=$PWD/../render/probe/parent_repro \
 ```bash
 cd research/occlusion_probe/rig_dbg
 CARGO_HOME=… cargo build
-BEVY_ASSET_ROOT=/var/home/lichi/桌面/research/rig_niri \
+BEVY_ASSET_ROOT=/var/home/lichi/桌面/bevy_3d_ai_research/rig_niri \
   RF_SHOT_DIR=$PWD/../../render/probe/dbg_tour timeout 120 ./target/debug/rig_dbg
 # 300px A/B（拷贝里 PANEL_H=300；guard 用环境变量开关，便于同一二进制对照）
 unset RIG_UNHOVER_GUARD   # 复现

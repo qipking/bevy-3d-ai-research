@@ -1,0 +1,11 @@
+# `cargo niri` = 跑这个 3D app（离线、带好资源与会话目录）。
+[alias]
+niri = "run --offline -p rig_harness_in_3d"
+niri-ws3 = "run --offline -p rig_harness_in_3d --"
+test-all = "test --offline --workspace"
+
+[env]
+# 字体在 rig_harness_in_3d/assets（cargo 从 workspace 根跑，所以要给绝对路径）
+BEVY_ASSET_ROOT = { value = "rig_harness_in_3d", relative = true }
+# harness 的会话目录：默认 ~/.rig，在只读环境下会失败，固定到仓库内
+RIG_HOME = { value = ".rig-home", relative = true }

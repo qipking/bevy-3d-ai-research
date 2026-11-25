@@ -1,7 +1,7 @@
 # 交接文档：rig_niri / feathers_in_3d
 
 > 写于 2026-11-23，目的是**上下文超限时也能接着干**。先读这一页，再按需展开其它文档。
-> 工作区：`/var/home/lichi/桌面/research`（jj 仓库）
+> 工作区：`/var/home/lichi/桌面/bevy_3d_ai_research`（jj 仓库）
 
 ---
 
@@ -71,7 +71,7 @@ cd research
 ./tools/fetch_cjk_font.sh            # -> rig_niri/assets/fonts/NotoSansCJKsc-Regular.otf
 
 cd rig_harness_in_3d          # 装配层；rig_niri 是纯 lib
-export CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home   # 本机 ~/.cargo 只读
+export CARGO_HOME=/var/home/lichi/桌面/bevy_3d_ai_research/.cargo-home   # 本机 ~/.cargo 只读
 cargo build
 BEVY_ASSET_ROOT=$PWD RF_SHOT_DIR=../render/rf_shots ./target/debug/rig_harness_in_3d
 ```

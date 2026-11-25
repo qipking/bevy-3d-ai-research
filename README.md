@@ -6,6 +6,7 @@
 ## 目录
 
 ```
+Cargo.toml          workspace 根（members: feathers_in_3d / rig_niri / rig_harness_in_3d）
 rig_harness_in_3d/  应用层（harness 装配 + 业务工具 + 演示/巡游）——fork 模板就是它
 rig_niri/           视图层：照 rig-tui 的模型重写的前端（面板/状态/输入/picker/窗口逻辑）
 feathers_in_3d/     渲染层：把 bevy_ui 子树镜像成 3D 网格 + 字形 + 排序 + 裁剪 + 拾取
@@ -31,14 +32,22 @@ feathers_in_3d     ← 渲染层（上游没有对应物）
 
 ## 跑
 
-```sh
-cd rig_harness_in_3d
-export CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home
-export BEVY_ASSET_ROOT=$PWD
+三个 crate 在仓库根组成一个 **cargo workspace**（`research/Cargo.toml`），共享一份
+`Cargo.lock` 和一份 `target/`：
 
-RIG_HOME=/var/home/lichi/桌面/research/.rig-home cargo run                          # 演示巡游
-RIG_HOME=/var/home/lichi/桌面/research/.rig-home cargo run --example harness_boot   # harness 本体自检
+```sh
+cd /var/home/lichi/桌面/bevy_3d_ai_research
+export CARGO_HOME=$PWD/.cargo-home     # 本机没有全局 cargo 缓存
+
+cargo niri            # = cargo run -p rig_harness_in_3d（.cargo/config.toml 里的 alias）
+cargo test-all        # = cargo test --workspace --offline
+./run.sh ws3          # 三条会话条带（带环境变量的一键启动）
+cargo run -p rig_harness_in_3d --example harness_boot   # harness 本体自检
 ```
+
+`.cargo/config.toml` 里已经设好 `BEVY_ASSET_ROOT` 和 `RIG_HOME`，所以从仓库根跑也不会
+出现"窗口打开了但没字"的问题。`bevy_luma`（自带 `[workspace]`）和 `experiments/` 被
+`exclude`，各自独立构建。
 
 `RIG_HOME` 必须有：harness 会在里面建会话目录（沙箱下默认的 `~/.rig` 可能只读）。
 

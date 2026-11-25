@@ -115,7 +115,7 @@ rows.set(PanelId::Overlay, my_rows);
 
 ```sh
 ../tools/fetch_cjk_font.sh          # 中文字体（含子集化，3.2 MB）
-export CARGO_HOME=/var/home/lichi/桌面/research/.cargo-home
+export CARGO_HOME=/var/home/lichi/桌面/bevy_3d_ai_research/.cargo-home
 
 cd ../rig_harness_in_3d             # 装配层（本 crate 是 lib，demo binary 在那里）
 cargo build

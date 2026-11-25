@@ -18,7 +18,8 @@ export BEVY_ASSET_ROOT="$ROOT/rig_harness_in_3d"
 export RIG_HOME="${RIG_HOME:-$ROOT/.rig-home}"
 mkdir -p "$RIG_HOME"
 
-cd "$ROOT/rig_harness_in_3d"
+# workspace 根统一构建（三个 crate 一份 target / 一份锁文件）
+cd "$ROOT"
 
 case "${1:-}" in
   niri)  export RF_NIRI_LAYOUT=1 ;;
@@ -33,4 +34,4 @@ echo "窗口里应该看到：转写面板（左）+ 输入框/状态行（右�
 echo "  鼠标中键（或 Alt+左键）拖动条带；F10 自动整理；F1..F8 切聚焦；F9 取消聚焦。"
 echo "  RIG_HOME=$RIG_HOME"
 echo "  BEVY_ASSET_ROOT=$BEVY_ASSET_ROOT"
-exec cargo run --offline
+exec cargo run --offline -p rig_harness_in_3d
