@@ -1,5 +1,7 @@
 # 上传到 GitHub（2026-11-25）
 
+> **已上传：https://github.com/qipking/bevy-3d-ai-research （public，默认分支 main）**
+>
 > 这台机器上**没有任何 GitHub 凭证**：没有 `gh` CLI，没有 SSH key，`~/.gitconfig` 为空，
 > 没有 credential helper。所以推送需要你提供一种认证方式（见下面三选一）。
 
