@@ -88,7 +88,10 @@ pub mod prelude {
     };
     pub use crate::frame::FrameTree;
     pub use crate::frame::{add_split_key, split_binding, split_transcript};
-    pub use crate::layout::{Child, Node, Size, Split, default_tree};
+    pub use crate::layout::{
+        Child, Node, PRESET_COLUMN_FRACTIONS, Size, Split, default_tree, next_preset_fraction,
+        previous_preset_fraction,
+    };
     pub use crate::pane::{
         ActiveTranscript, PanePlugin, PaneScroll, TranscriptPane, TranscriptRows,
     };

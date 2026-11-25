@@ -577,6 +577,129 @@ fn scroll_workspace_wheel(
 /// 滚轮一格（一行）横向滚几个字宽。
 const WHEEL_CELLS_PER_LINE: f32 = 8.0;
 
+/// 列宽/移动列的动作（见 `column_workspace_keys`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnAction {
+    /// 改活动列宽度：`true` = 往上取最近一档（变宽），`false` = 往下取（变窄）。
+    Resize(bool),
+    /// 与相邻列交换：`-1` 左、`+1` 右。
+    Move(isize),
+}
+
+/// 列宽预设与移动列（L4，niri `switch-preset-column-width` /
+/// `move-column-left/right`）。
+///
+/// 键位见 [`crate::keys::workspace_column_bindings`]：
+/// * `Alt+Shift+H/L`：活动列按预设宽度 `1/3 → 1/2 → 2/3` 循环——L（往右）
+///   往上取最近一档、到头回绕到 `1/3`；H（往左）反过来。默认转写列是
+///   `0.62`，第一次按 L 就落到 `2/3`。
+/// * `Ctrl+Alt+Shift+H/L`：活动列与左/右邻列**交换**（宽度跟着列走；到边界
+///   不动、不 panic）。
+///
+/// 三条约束（`NIRI_SCROLL.md` L4）：
+/// * 只改活动列自己的 `Size::Fraction`；移动时整列（尺寸 + 子树）一起搬，
+///   其它列的尺寸约束一个字节不改；
+/// * 动作当帧生效：先改 [`Workspace::tree`]，再同步聚焦工作区的全局
+///   [`FrameTree`]（`lay_out_frame` 读它），同一帧的布局就按新列宽/新顺序摆；
+/// * 改完按需把活动列完整滚进视口（只动 [`WorkspaceScroll`]）。
+///
+/// picker 打开时 `active_panel` 返回列表所在的列，所以 picker 列也能改宽/
+/// 移动；补全 tile 在右列内部（竖直分裂），列的宽度/位置变了它也只是跟着
+/// 右列走，尺寸不变。
+fn column_workspace_keys(
+    mut input: MessageReader<KeyboardInput>,
+    held: Option<Res<ButtonInput<KeyCode>>>,
+    set: Option<Res<WorkspaceSet>>,
+    frame: Option<Res<FrameSize>>,
+    active: Option<Res<ActiveTranscript>>,
+    picker: Option<Res<PickerInput>>,
+    mut frame_tree: Option<ResMut<FrameTree>>,
+    mut workspaces: Query<(
+        &mut Workspace,
+        Option<&WorkspacePanels>,
+        Option<&mut WorkspaceScroll>,
+    )>,
+) {
+    // 先读完消息：没有工作区时也不能把事件留在队列里。
+    let presses: Vec<KeyCode> = input
+        .read()
+        .filter(|event| event.state == ButtonState::Pressed)
+        .map(|event| event.key_code)
+        .collect();
+    if presses.is_empty() {
+        return;
+    }
+    let (Some(held), Some(set), Some(frame)) = (held, set, frame) else {
+        return;
+    };
+    let Some(focused) = set.focused else {
+        return;
+    };
+    let Ok((mut workspace, panels, mut scroll)) = workspaces.get_mut(focused) else {
+        return;
+    };
+    let modifiers = crate::keys::Modifiers::from_held(&held);
+    let control = modifiers.contains(crate::keys::Modifiers::CONTROL);
+    let alt = modifiers.contains(crate::keys::Modifiers::ALT);
+    let shift = modifiers.contains(crate::keys::Modifiers::SHIFT);
+    // Super 一起按着不算（那是别的绑定）。
+    if modifiers.contains(crate::keys::Modifiers::SUPER) {
+        return;
+    }
+    let picker_open = picker
+        .as_deref()
+        .is_some_and(|picker| picker.column.is_some());
+    let active_root = active.as_deref().and_then(|active| active.0);
+    let panel = panels
+        .map(|panels| active_panel(&panels.roots, active_root, picker_open))
+        .unwrap_or(PanelId::Transcript);
+    let viewport = f32::from(frame.cols) * CELL.x;
+
+    for code in presses {
+        let action = match (control, alt, shift, code) {
+            // 移动列：L3 的方向键（Ctrl+Alt）再加 Shift。
+            (true, true, true, KeyCode::KeyH) => Some(ColumnAction::Move(-1)),
+            (true, true, true, KeyCode::KeyL) => Some(ColumnAction::Move(1)),
+            // 改列宽：Alt+Shift，不带 Ctrl（和滚动/移动都不重叠）。
+            (false, true, true, KeyCode::KeyH) => Some(ColumnAction::Resize(false)),
+            (false, true, true, KeyCode::KeyL) => Some(ColumnAction::Resize(true)),
+            _ => continue,
+        };
+        let Some(action) = action else { continue };
+        let changed = match action {
+            ColumnAction::Resize(forward) => {
+                let Some(current) = workspace.tree.column_fraction(panel) else {
+                    continue;
+                };
+                let next = if forward {
+                    layout::next_preset_fraction(current)
+                } else {
+                    layout::previous_preset_fraction(current)
+                };
+                workspace.tree.set_column_fraction(panel, next)
+            }
+            ColumnAction::Move(delta) => workspace.tree.move_column(panel, delta),
+        };
+        if !changed {
+            continue;
+        }
+        // 聚焦工作区的布局读全局树：同一帧同步过去，动作才是"当帧生效"；
+        // `commit_focused_panels` 在 Render 会把全局树写回组件（口径不变）。
+        if let Some(tree) = frame_tree.as_deref_mut() {
+            tree.0 = workspace.tree.clone();
+        }
+        // 改宽/换位会改变活动列的位置或宽度：按需把它完整滚进视口。
+        if let Some(scroll) = scroll.as_deref_mut()
+            && let Some(bounds) = column_bounds(&workspace.tree, panel, viewport)
+        {
+            let next = bounds.scroll_to(scroll.scroll);
+            if next != scroll.scroll {
+                scroll.scroll = next;
+            }
+        }
+    }
+}
+
 /// 所有工作区。
 ///
 /// `focused` 现在决定内容写入口径（内容系统只写它）；第 3 批再让它决定可见性
@@ -1431,7 +1554,7 @@ fn drag_workspaces(
 }
 
 
-/// 工作区插件：启动收编 + 聚焦装载 + 新面板打标签 + L3 横向滚动交互。
+/// 工作区插件：启动收编 + 聚焦装载 + 新面板打标签 + L3/L4 横向滚动与列操作。
 ///
 /// L3 的三条系统（均只改 [`WorkspaceScroll`]）：
 /// * `scroll_active_column`：活动列变化 / picker 开关请求 / 窗口 resize 时
@@ -1439,15 +1562,21 @@ fn drag_workspaces(
 /// * `scroll_workspace_keys`：`Ctrl+Alt+H/L` 一屏、`Ctrl+Alt+Home/End` 到两端；
 /// * `scroll_workspace_wheel`：`Shift+滚轮` / 横向滚轮轴滚当前工作区。
 ///
+/// L4 的一条系统（见 [`column_workspace_keys`]）：
+/// * `column_workspace_keys`：`Alt+Shift+H/L` 改活动列宽（三档预设循环）、
+///   `Ctrl+Alt+Shift+H/L` 把活动列与左右邻列交换；改完按需滚进视口。
+///
 /// 放置（`frame::lay_out_frame` / `frame::place_panels`）和行同步
 /// （`panels::sync_panels`）在自己的插件里按 [`WorkspaceSet`] 分派，不在这里。
 pub struct WorkspacesPlugin;
 
 impl Plugin for WorkspacesPlugin {
     fn build(&self, app: &mut App) {
-        // L3 的横向滚动键：Global 绑定，只用来遮住 Input 作用域的同键回退
-        //（键本身由 `scroll_workspace_keys` 读，picker 打开时也能用）。
+        // L3/L4 的全局绑定：只用来遮住 Input 作用域的同键回退 / 占住键
+        //（键本身由 `scroll_workspace_keys` / `column_workspace_keys` 读，
+        // picker 打开时也能用）。
         crate::keys::add_workspace_scroll_keys(app);
+        crate::keys::add_workspace_column_keys(app);
         // 单独装本插件时也要有确定的阶段顺序；`FeathersViewPlugin` 重复配置
         // 同一组边是幂等的。
         app.configure_sets(
@@ -1496,12 +1625,14 @@ impl Plugin for WorkspacesPlugin {
         // L3：活动列滚进视口 + 键位/滚轮横向滚动。都排在 `lay_out_frame`
         // 之前，同一帧就能看到新 scroll；键位/滚轮排在活动列之后，用户
         // 这一帧的操作压过"自动滚到活动列"。
+        // L4：改列宽/移动列排在滚动之后，改完把活动列重新滚进视口。
         .add_systems(
             Update,
             (
                 scroll_active_column,
                 scroll_workspace_keys,
                 scroll_workspace_wheel,
+                column_workspace_keys,
             )
                 .chain()
                 .in_set(FeathersSystems::Layout)
@@ -3554,6 +3685,303 @@ mod tests {
         app.insert_resource(ActiveTranscript(None));
         app.update();
         assert_eq!(scroll_of(&app, a), 0.0, "切回主转写：它已可见，滚回 0");
+    }
+
+    // ---- L4：列宽预设 + 移动列 ----
+
+    /// 条带在 **UI 像素**下的叶子矩形（x/宽直接是像素，便于和
+    /// `fraction × viewport` 比较）。
+    fn strip_rects_px(app: &App, workspace: Entity) -> Vec<(PanelId, TileRect)> {
+        let viewport = viewport_px(app);
+        let area = TileRect {
+            center: Vec2::ZERO,
+            size: Vec2::new(viewport, 1.0),
+        };
+        workspace_tree(app, workspace).rects(area)
+    }
+
+    fn strip_rect_px(app: &App, workspace: Entity, panel: PanelId) -> TileRect {
+        strip_rects_px(app, workspace)
+            .into_iter()
+            .find(|(id, _)| *id == panel)
+            .map(|(_, rect)| rect)
+            .unwrap_or_else(|| panic!("{panel:?} 在条带上"))
+    }
+
+    fn tile_left(rect: &TileRect) -> f32 {
+        rect.center.x - rect.size.x * 0.5
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    /// 活动列完整落在视口 `[0, viewport]` 里（L4 改宽/移动后必须仍可见）。
+    fn assert_column_visible(app: &App, workspace: Entity, panel: PanelId) {
+        let viewport = viewport_px(app);
+        let bounds = column_bounds(&workspace_tree(app, workspace), panel, viewport)
+            .unwrap_or_else(|| panic!("{panel:?} 要有列"));
+        let scroll = scroll_of(app, workspace);
+        let left = bounds.x - scroll;
+        let right = left + bounds.width;
+        assert!(
+            left >= -1e-3 && right <= viewport + 1e-3,
+            "{panel:?} 必须完整可见：显示区间 [{left}, {right}] 不在 [0, {viewport}] 里（scroll={scroll}）"
+        );
+    }
+
+    fn hold_keys(app: &mut App, keys: &[KeyCode]) {
+        app.init_resource::<ButtonInput<KeyCode>>();
+        for key in keys {
+            set_key(app, *key, true);
+        }
+    }
+
+    // 42. L4 列宽：`Alt+Shift+L/H` 在三档预设宽度里循环。每次只有活动列
+    //     （最右边的 picker 列）的宽度变，其它叶子的 (x, width) 逐字节不变；
+    //     宽度 = fraction × 视口，活动列始终完整可见。
+    #[test]
+    fn keyboard_width_presets_cycle_on_the_active_column_only() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        append_picker_column(&mut app, a);
+        set_picker_open(&mut app, true);
+        app.update();
+        let tree_b = workspace_tree(&app, b);
+        let baseline = strip_rects_px(&app, a);
+        let picker_before = strip_rect_px(&app, a, PanelId::List);
+        assert!(close(picker_before.size.x, viewport * 0.5), "picker 列初始半屏宽");
+        assert_column_visible(&app, a, PanelId::List);
+
+        hold_keys(&mut app, &[KeyCode::AltLeft, KeyCode::ShiftLeft]);
+        // 0.5 往上取 2/3；到头回绕 1/3；再 1/2、2/3。
+        for expected in [
+            layout::PRESET_COLUMN_FRACTIONS[2],
+            layout::PRESET_COLUMN_FRACTIONS[0],
+            layout::PRESET_COLUMN_FRACTIONS[1],
+            layout::PRESET_COLUMN_FRACTIONS[2],
+        ] {
+            press_code(&mut app, KeyCode::KeyL);
+            let tree = workspace_tree(&app, a);
+            assert_eq!(tree.column_fraction(PanelId::List), Some(expected));
+            assert_eq!(
+                app.world().resource::<FrameTree>().0,
+                tree,
+                "同一帧同步全局树：lay_out_frame 读它"
+            );
+            let after = strip_rects_px(&app, a);
+            for (panel, old) in &baseline {
+                if *panel == PanelId::List {
+                    continue;
+                }
+                let fresh = after
+                    .iter()
+                    .find(|(id, _)| id == panel)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or_else(|| panic!("{panel:?} 还在条带上"));
+                assert_eq!(fresh, *old, "{panel:?} 的 (x, width) 必须逐字节不变");
+            }
+            let picker = strip_rect_px(&app, a, PanelId::List);
+            assert_eq!(picker.size.x, viewport * expected, "宽度 = fraction × 视口");
+            assert_eq!(
+                tile_left(&picker),
+                tile_left(&picker_before),
+                "最右列的左边不动，只有宽度变"
+            );
+            assert_column_visible(&app, a, PanelId::List);
+        }
+
+        // 反向：2/3 → 1/2。
+        press_code(&mut app, KeyCode::KeyH);
+        assert_eq!(
+            workspace_tree(&app, a).column_fraction(PanelId::List),
+            Some(layout::PRESET_COLUMN_FRACTIONS[1])
+        );
+        assert_column_visible(&app, a, PanelId::List);
+        assert_eq!(workspace_tree(&app, b), tree_b, "非聚焦工作区一个字节不动");
+    }
+
+    // 43. L4 列宽当帧生效：改聚焦工作区的转写列后，同一帧 `lay_out_frame`
+    //     写出的 Node 宽度就是 2/3 视口；右列宽度不变、只是整体左移。
+    #[test]
+    fn keyboard_width_keys_resize_the_transcript_column_in_the_same_frame() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let tree_b = workspace_tree(&app, b);
+        let sizes_before = panel_sizes(&app, a);
+        let width_of = |sizes: &[(PanelId, Vec2)], panel: PanelId| {
+            sizes
+                .iter()
+                .find(|(id, _)| *id == panel)
+                .map(|(_, size)| size.x)
+                .unwrap_or_else(|| panic!("{panel:?} 有 Node 尺寸"))
+        };
+        let input_before = width_of(&sizes_before, PanelId::Input);
+
+        hold_keys(&mut app, &[KeyCode::AltLeft, KeyCode::ShiftLeft]);
+        press_code(&mut app, KeyCode::KeyL);
+
+        let tree = workspace_tree(&app, a);
+        assert_eq!(
+            tree.column_fraction(PanelId::Transcript),
+            Some(layout::PRESET_COLUMN_FRACTIONS[2])
+        );
+        assert_eq!(app.world().resource::<FrameTree>().0, tree);
+        // 同一帧的放置：转写 Node 宽 = 2/3 视口，右列（输入）宽度不变。
+        let sizes = panel_sizes(&app, a);
+        assert!(
+            (width_of(&sizes, PanelId::Transcript) - viewport * layout::PRESET_COLUMN_FRACTIONS[2]).abs()
+                < 1e-3,
+            "转写 Node 宽应当已是 2/3 视口"
+        );
+        assert!((width_of(&sizes, PanelId::Input) - input_before).abs() < 1e-3, "右列宽度不变");
+        // 几何：右列紧贴转写右边、宽度不变（只平移）。
+        let transcript = strip_rect_px(&app, a, PanelId::Transcript);
+        let input = strip_rect_px(&app, a, PanelId::Input);
+        assert!(close(tile_left(&input), tile_left(&transcript) + transcript.size.x));
+        assert!(close(input.size.x, viewport * layout::RIGHT_COLUMN_FRACTION));
+        assert_eq!(scroll_of(&app, a), 0.0, "转写列在视口左端，已经可见");
+        assert_column_visible(&app, a, PanelId::Transcript);
+        assert_eq!(workspace_tree(&app, b), tree_b);
+    }
+
+    // 44. L4 移动列：`Ctrl+Alt+Shift+L/H` 与邻列交换。两列的宽度跟着列走、
+    //     x 重排；其它列不动；到左边界不越界、不 panic；来回移动逐字节复原。
+    #[test]
+    fn keyboard_move_swaps_the_active_column_with_its_neighbour() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        let before_tree = workspace_tree(&app, a);
+        let before = strip_rects_px(&app, a);
+        let tree_b = workspace_tree(&app, b);
+        // `strip_rects_px` 的坐标以帧中心为原点：条带最左边是 `-viewport/2`。
+        let left_edge = -viewport * 0.5;
+
+        hold_keys(
+            &mut app,
+            &[KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft],
+        );
+        // 转写（0.62）与右列（0.38）交换：右列到最左，转写接在它后面。
+        press_code(&mut app, KeyCode::KeyL);
+        let tree = workspace_tree(&app, a);
+        assert_eq!(
+            tree.column_fraction(PanelId::Input),
+            Some(layout::RIGHT_COLUMN_FRACTION),
+            "右列的尺寸约束跟着列走"
+        );
+        assert_eq!(
+            tree.column_fraction(PanelId::Transcript),
+            Some(layout::TRANSCRIPT_COLUMN_FRACTION)
+        );
+        assert_eq!(app.world().resource::<FrameTree>().0, tree);
+        let transcript = strip_rect_px(&app, a, PanelId::Transcript);
+        let input = strip_rect_px(&app, a, PanelId::Input);
+        assert!(close(input.size.x, viewport * layout::RIGHT_COLUMN_FRACTION), "右列宽度不变");
+        assert!(close(transcript.size.x, viewport * layout::TRANSCRIPT_COLUMN_FRACTION), "转写宽度不变");
+        assert!(close(tile_left(&input), left_edge), "右列换到最左");
+        assert!(
+            close(tile_left(&transcript), left_edge + input.size.x),
+            "转写接在右列后面"
+        );
+        // 右列内部的补全/输入宽度不变，只随整列平移。
+        let complete_before = before
+            .iter()
+            .find(|(id, _)| *id == PanelId::Complete)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        assert_eq!(
+            strip_rect_px(&app, a, PanelId::Complete).size.x,
+            complete_before.size.x,
+            "补全 tile 在右列内部，宽度不受移动影响"
+        );
+        // 同帧放置：Node 宽度已按新顺序写。
+        let sizes = panel_sizes(&app, a);
+        let width_of = |panel: PanelId| {
+            sizes
+                .iter()
+                .find(|(id, _)| *id == panel)
+                .map(|(_, size)| size.x)
+                .unwrap()
+        };
+        assert!((width_of(PanelId::Input) - viewport * layout::RIGHT_COLUMN_FRACTION).abs() < 1e-3);
+        assert!((width_of(PanelId::Transcript) - viewport * layout::TRANSCRIPT_COLUMN_FRACTION).abs() < 1e-3);
+        assert_column_visible(&app, a, PanelId::Transcript);
+        assert_eq!(scroll_of(&app, a), 0.0, "活动列换位后正好可见：不动 scroll");
+
+        // 换回来：树逐字节复原；再往左就是边界，不动、不 panic。
+        press_code(&mut app, KeyCode::KeyH);
+        assert_eq!(workspace_tree(&app, a), before_tree, "来回移动后树逐字节复原");
+        press_code(&mut app, KeyCode::KeyH);
+        assert_eq!(workspace_tree(&app, a), before_tree, "最左列再往左：不动");
+        assert_eq!(scroll_of(&app, a), 0.0);
+        assert_eq!(workspace_tree(&app, b), tree_b);
+    }
+
+    // 45. L4 与 picker 共存：picker 列也在条带里，可以左移穿过右列/转写列，
+    //     宽度不变；到最左再按不动；右移两次逐字节复原，始终完整可见。
+    #[test]
+    fn the_picker_column_can_be_moved_across_the_strip_and_stops_at_the_edge() {
+        let mut app = app_with_two_workspaces();
+        let (a, b) = workspaces(&app);
+        let viewport = viewport_px(&app);
+        append_picker_column(&mut app, a);
+        set_picker_open(&mut app, true);
+        app.update();
+        let before_tree = workspace_tree(&app, a);
+        let tree_b = workspace_tree(&app, b);
+        let right_width = strip_rect_px(&app, a, PanelId::Input).size.x;
+        let complete_width = strip_rect_px(&app, a, PanelId::Complete).size.x;
+        let transcript_before = strip_rect_px(&app, a, PanelId::Transcript);
+        assert!(close(
+            strip_rect_px(&app, a, PanelId::List).size.x,
+            viewport * layout::DEFAULT_COLUMN_FRACTION
+        ));
+        let left_edge = -viewport * 0.5;
+
+        hold_keys(
+            &mut app,
+            &[KeyCode::ControlLeft, KeyCode::AltLeft, KeyCode::ShiftLeft],
+        );
+        // 左移一格：与 0.38 的右列交换。
+        press_code(&mut app, KeyCode::KeyH);
+        let picker = strip_rect_px(&app, a, PanelId::List);
+        assert!(close(
+            tile_left(&picker),
+            left_edge + viewport * layout::TRANSCRIPT_COLUMN_FRACTION
+        ));
+        assert!(close(picker.size.x, viewport * layout::DEFAULT_COLUMN_FRACTION), "picker 宽度跟列走");
+        assert!(close(strip_rect_px(&app, a, PanelId::Input).size.x, right_width));
+        assert!(close(strip_rect_px(&app, a, PanelId::Complete).size.x, complete_width));
+        assert_eq!(
+            strip_rect_px(&app, a, PanelId::Transcript),
+            transcript_before,
+            "交换的只是 picker 与右列，转写列一个字节不动"
+        );
+        assert_column_visible(&app, a, PanelId::List);
+
+        // 再左移一格：与转写交换，picker 到最左；再左就是边界。
+        press_code(&mut app, KeyCode::KeyH);
+        assert!(close(
+            tile_left(&strip_rect_px(&app, a, PanelId::List)),
+            left_edge
+        ));
+        assert_column_visible(&app, a, PanelId::List);
+        let at_left = workspace_tree(&app, a);
+        press_code(&mut app, KeyCode::KeyH);
+        assert_eq!(workspace_tree(&app, a), at_left, "最左列再往左：不动、不 panic");
+
+        // 右移两次回到原序：树逐字节复原。
+        press_code(&mut app, KeyCode::KeyL);
+        press_code(&mut app, KeyCode::KeyL);
+        assert_eq!(workspace_tree(&app, a), before_tree, "移动到原序后树逐字节复原");
+        assert_column_visible(&app, a, PanelId::List);
+        // 最右列再往右：不动、不越界。
+        press_code(&mut app, KeyCode::KeyL);
+        assert_eq!(workspace_tree(&app, a), before_tree, "最右列再往右：不动");
+        assert_eq!(workspace_tree(&app, b), tree_b);
     }
 
     // 26. 整理会把拖过的位置重置回 order 对应的竖直序列。

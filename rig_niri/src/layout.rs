@@ -34,6 +34,13 @@
 //! [`DEFAULT_COLUMN_FRACTION`] 的视口宽，**已有列的宽度和 x 一个字节都不动**；
 //! [`Node::remove_column`] 摘掉它，树逐字节复原。
 //!
+//! 列宽预设与移动列（`NIRI_SCROLL.md` L4）：[`PRESET_COLUMN_FRACTIONS`] 是 niri
+//! 的三档宽度（1/3、1/2、2/3），[`next_preset_fraction`] /
+//! [`previous_preset_fraction`] 按"往上/往下取最近一档、到头回绕"循环；
+//! [`Node::set_column_fraction`] 只改一列的 [`Size::Fraction`]，
+//! [`Node::move_column`] 把整列（宽度 + 子树）与左右邻列交换、到边界不动。
+//! 键位与滚动在 `workspaces.rs`，这里只有纯几何与规则。
+//!
 //! 3D 坐标：区域用 [`TileRect`]（米，原点在帧中心，y 朝上）。第一块子区域在
 //! 上/左，第二块在下/右。
 
@@ -71,6 +78,12 @@ pub const TRANSCRIPT_COLUMN_FRACTION: f32 = 0.62;
 /// 和 [`TRANSCRIPT_COLUMN_FRACTION`] 相加为 1，默认屏幕仍然正好铺满视口；
 /// 取值接近旧的 2:1 比例。
 pub const RIGHT_COLUMN_FRACTION: f32 = 0.38;
+
+/// niri 的三档预设列宽（相对视口）：`1/3`、`1/2`、`2/3`。
+///
+/// 顺序就是 niri `preset-column-widths` 的默认顺序，也是 [`next_preset_fraction`]
+/// 往上走的方向。三个值都小于 1：任何一列都窄于视口，旁边的列能被看见。
+pub const PRESET_COLUMN_FRACTIONS: [f32; 3] = [1.0 / 3.0, 0.5, 2.0 / 3.0];
 
 /// 切分方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -462,6 +475,15 @@ impl Node {
                         && matches!(child.size, Size::Fraction(f) if f.sanitized() >= 1.0);
                     let child_area = if spans_area {
                         area
+                    } else if horizontal && has_fraction {
+                        // 列的宽直接取 `长度`（= 视口宽 × fraction），不要用
+                        // `end - cursor` 反算：前缀 x 一变，反算会差最后几个 ulp，
+                        // "改这一列不改别人宽度"就会被浮点误差破坏。宽度只由
+                        // 这一列自己的 fraction 决定，和它前/后有几列无关。
+                        TileRect {
+                            center: Vec2::new(cursor + lengths[index] * 0.5, area.center.y),
+                            size: Vec2::new(lengths[index], area.size.y),
+                        }
                     } else if horizontal {
                         TileRect {
                             center: Vec2::new((cursor + end) * 0.5, area.center.y),
@@ -801,6 +823,133 @@ impl Node {
         removed
     }
 
+    /// 条带里包含 `panel` 的那一列的尺寸约束（列 = 最外层横向 split 的直接子）。
+    ///
+    /// niri 的"列宽"挂在列本身上，列里的竖直分裂（右列、picker 的列表/preview）
+    /// 都算同一列。根是单叶子/没有横向 split 时返回 `None`——没有列宽可改。
+    pub fn column_size(&self, panel: PanelId) -> Option<Size> {
+        self.column_child(panel).map(|child| child.size)
+    }
+
+    /// 条带里包含 `panel` 的那一列的**视口比例宽**（见 [`Size::Fraction`]）。
+    ///
+    /// 列是 [`Size::Proportion`]/[`Size::Fixed`]（旧树、单列）时返回 `None`：
+    /// niri 的列宽预设只改 `Fraction` 列，别的列的宽度语义保持不变。
+    pub fn column_fraction(&self, panel: PanelId) -> Option<f32> {
+        match self.column_child(panel)?.size {
+            Size::Fraction(fraction) => Some(fraction.sanitized()),
+            Size::Proportion(_) | Size::Fixed(_) => None,
+        }
+    }
+
+    /// 把条带里包含 `panel` 的那一列改成 `fraction × 视口` 宽。
+    ///
+    /// 只写这一列的 [`Size::Fraction`]：列里竖直分裂的尺寸、其它列的尺寸都
+    /// 一个字节不改（niri 不变量 2）。改不动时——列是比例/固定宽、面板不在
+    /// 条带里、`fraction` 是 NaN/负数——返回 `false`，树保持原样。
+    pub fn set_column_fraction(&mut self, panel: PanelId, fraction: f32) -> bool {
+        let fraction = fraction.sanitized();
+        if fraction <= 0.0 {
+            return false;
+        }
+        let Some(child) = self.column_child_mut(panel) else {
+            return false;
+        };
+        match &mut child.size {
+            Size::Fraction(current) if *current == fraction => false,
+            Size::Fraction(current) => {
+                *current = fraction;
+                true
+            }
+            Size::Proportion(_) | Size::Fixed(_) => false,
+        }
+    }
+
+    /// 把包含 `panel` 的那一列与相邻列**交换**（`delta = -1` 左、`+1` 右）。
+    ///
+    /// 语义照 niri 的 `move-column-left/right`：±1 就是把整列与邻列对调，
+    /// 宽度跟着列走（交换的是整个 [`Child`]，尺寸和子树一起搬），两列之间的
+    /// 缝不变。条带里其它列的相对顺序、x、宽度都不动；到边界（最左往左、
+    /// 最右往右）返回 `false`，树一个字节都不改。
+    pub fn move_column(&mut self, panel: PanelId, delta: isize) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Container { node, .. } => node.move_column(panel, delta),
+            Self::Split {
+                direction: Split::Horizontal,
+                children,
+                ..
+            } => {
+                let Some(index) = children
+                    .iter()
+                    .position(|child| child.node.leaves().contains(&panel))
+                else {
+                    return false;
+                };
+                let target = index as isize + delta;
+                if target < 0 || target as usize >= children.len() {
+                    return false;
+                }
+                children.swap(index, target as usize);
+                true
+            }
+            Self::Split {
+                direction: Split::Vertical,
+                children,
+                ..
+            } => children
+                .iter_mut()
+                .any(|child| child.node.move_column(panel, delta)),
+        }
+    }
+
+    /// 条带里包含 `panel` 的那一列（最外层横向 split 的直接子）。
+    fn column_child(&self, panel: PanelId) -> Option<&Child> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Container { node, .. } => node.column_child(panel),
+            Self::Split {
+                direction: Split::Horizontal,
+                children,
+                ..
+            } => children
+                .iter()
+                .find(|child| child.node.leaves().contains(&panel)),
+            Self::Split {
+                direction: Split::Vertical,
+                children,
+                ..
+            } => children
+                .iter()
+                .find_map(|child| child.node.column_child(panel)),
+        }
+    }
+
+    /// [`Self::column_child`] 的可变版本。
+    fn column_child_mut(&mut self, panel: PanelId) -> Option<&mut Child> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Container { node, .. } => node.column_child_mut(panel),
+            Self::Split {
+                direction: Split::Horizontal,
+                children,
+                ..
+            } => {
+                let index = children
+                    .iter()
+                    .position(|child| child.node.leaves().contains(&panel))?;
+                children.get_mut(index)
+            }
+            Self::Split {
+                direction: Split::Vertical,
+                children,
+                ..
+            } => children
+                .iter_mut()
+                .find_map(|child| child.node.column_child_mut(panel)),
+        }
+    }
+
     /// 把只剩一个子的 split 摊平成那个子（不归一化比例权重，几何不变）。
     fn take_only_child(&mut self) -> Option<Node> {
         let Self::Split { children, .. } = self else {
@@ -811,6 +960,36 @@ impl Node {
         }
         children.pop().map(|child| child.node)
     }
+}
+
+/// 从当前列宽往上取**最近的一档**预设（niri `switch-preset-column-width`）。
+///
+/// 规则：在 [`PRESET_COLUMN_FRACTIONS`] 里找第一个严格宽于 `current` 的档；
+/// 已经是最宽的 `2/3`（或比它还宽）时回绕到 `1/3`。于是
+/// `1/3 → 1/2 → 2/3 → 1/3` 循环；自定义宽度按"往上取最近一档"进入循环
+/// （默认转写列 `0.62` 第一次变成 `2/3`）。
+pub fn next_preset_fraction(current: f32) -> f32 {
+    let current = current.sanitized();
+    PRESET_COLUMN_FRACTIONS
+        .iter()
+        .copied()
+        .find(|preset| *preset > current)
+        .unwrap_or(PRESET_COLUMN_FRACTIONS[0])
+}
+
+/// 从当前列宽往下取**最近的一档**预设（niri `switch-preset-column-width-back`）。
+///
+/// 规则：在 [`PRESET_COLUMN_FRACTIONS`] 里找最后一个严格窄于 `current` 的档；
+/// 已经是最窄的 `1/3`（或比它还窄）时回绕到 `2/3`。于是
+/// `2/3 → 1/2 → 1/3 → 2/3` 循环。
+pub fn previous_preset_fraction(current: f32) -> f32 {
+    let current = current.sanitized();
+    PRESET_COLUMN_FRACTIONS
+        .iter()
+        .rev()
+        .copied()
+        .find(|preset| *preset < current)
+        .unwrap_or(PRESET_COLUMN_FRACTIONS[PRESET_COLUMN_FRACTIONS.len() - 1])
 }
 
 
@@ -1763,5 +1942,187 @@ mod tests {
             "picker 列完全滚到条带左边界之外"
         );
         assert_eq!(after.len(), node.placements(area()).len(), "面板一个都没少");
+    }
+
+    // 28. 预设宽度循环：往上取最近一档、到头回绕；反向对称。
+    #[test]
+    fn preset_fractions_cycle_up_and_down_with_wraparound() {
+        let third = PRESET_COLUMN_FRACTIONS[0];
+        let half = PRESET_COLUMN_FRACTIONS[1];
+        let two_thirds = PRESET_COLUMN_FRACTIONS[2];
+        // 三档内部循环：1/3 → 1/2 → 2/3 → 1/3。
+        assert_eq!(next_preset_fraction(third), half);
+        assert_eq!(next_preset_fraction(half), two_thirds);
+        assert_eq!(next_preset_fraction(two_thirds), third, "最宽回绕到最窄");
+        // 自定义宽度往上取最近一档；比 2/3 还宽也回绕。
+        assert_eq!(next_preset_fraction(TRANSCRIPT_COLUMN_FRACTION), two_thirds);
+        assert_eq!(next_preset_fraction(0.38), half);
+        assert_eq!(next_preset_fraction(0.0), third);
+        assert_eq!(next_preset_fraction(1.0), third);
+        assert_eq!(next_preset_fraction(f32::NAN), third);
+        // 反向：2/3 → 1/2 → 1/3 → 2/3。
+        assert_eq!(previous_preset_fraction(two_thirds), half);
+        assert_eq!(previous_preset_fraction(half), third);
+        assert_eq!(previous_preset_fraction(third), two_thirds, "最窄回绕到最宽");
+        assert_eq!(previous_preset_fraction(TRANSCRIPT_COLUMN_FRACTION), half);
+        assert_eq!(previous_preset_fraction(0.38), third);
+        assert_eq!(previous_preset_fraction(1.0), two_thirds);
+        assert_eq!(previous_preset_fraction(f32::NAN), two_thirds);
+    }
+
+    /// 追加 picker 列后的默认树（列：[转写 0.62][右列 0.38][picker 0.5]）。
+    fn tree_with_picker_column() -> Node {
+        let mut node = default_tree();
+        assert!(node.append_column_at(
+            PanelId::Transcript,
+            Node::container(PanelId::Picker, Node::leaf(PanelId::List))
+        ));
+        node
+    }
+
+    fn rect_of(found: &[(PanelId, TileRect)], panel: PanelId) -> TileRect {
+        found
+            .iter()
+            .find(|(id, _)| *id == panel)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("{panel:?} 在树上"))
+    }
+
+    // 29. 改最右列（picker）的宽度：宽度 = 对应 fraction × 视口，其它所有叶子的
+    //     (x, width) 逐字节不变 —— 右边没有列要跟着挪（niri 不变量 2）。
+    #[test]
+    fn resizing_the_rightmost_column_leaves_every_other_column_untouched() {
+        let mut node = tree_with_picker_column();
+        let before = node.rects(area());
+        let picker_before = rect_of(&before, PanelId::List);
+
+        assert!(node.set_column_fraction(PanelId::List, PRESET_COLUMN_FRACTIONS[2]));
+        let after = node.rects(area());
+        for (panel, old) in &before {
+            if *panel == PanelId::List {
+                continue;
+            }
+            assert_eq!(rect_of(&after, *panel), *old, "{panel:?} 必须逐字节不变");
+        }
+        let picker = rect_of(&after, PanelId::List);
+        assert_eq!(
+            picker.size.x,
+            area().size.x * PRESET_COLUMN_FRACTIONS[2],
+            "宽度 = fraction × 视口"
+        );
+        assert_eq!(left(&picker), left(&picker_before), "最右列的 x 不动");
+
+        // 再切到 1/3：只有这一列变窄，仍然逐字节只动它。
+        assert!(node.set_column_fraction(PanelId::List, PRESET_COLUMN_FRACTIONS[0]));
+        let narrow = node.rects(area());
+        for (panel, old) in &after {
+            if *panel == PanelId::List {
+                continue;
+            }
+            assert_eq!(rect_of(&narrow, *panel), *old, "{panel:?} 必须逐字节不变");
+        }
+        assert_eq!(
+            rect_of(&narrow, PanelId::List).size.x,
+            area().size.x * PRESET_COLUMN_FRACTIONS[0]
+        );
+        // 相同的宽度不重写（返回 false，树不变）。
+        assert!(!node.set_column_fraction(PanelId::List, PRESET_COLUMN_FRACTIONS[0]));
+        assert_eq!(node.rects(area()), narrow);
+    }
+
+    // 30. 改中间/左侧列的宽度：它自己按 fraction 变宽，右边各列的 x 跟着累计宽
+    //     平移、宽度一个字节不变；它左边的列（Hints/Status 等 chrome）不动。
+    #[test]
+    fn resizing_the_transcript_column_keeps_other_widths_and_shifts_the_right_column() {
+        let mut node = default_tree();
+        let before = node.rects(area());
+        let transcript_before = rect_of(&before, PanelId::Transcript);
+        let input_before = rect_of(&before, PanelId::Input);
+        let hints_before = rect_of(&before, PanelId::Hints);
+        let status_before = rect_of(&before, PanelId::Status);
+
+        assert!(node.set_column_fraction(PanelId::Transcript, PRESET_COLUMN_FRACTIONS[1]));
+        let after = node.rects(area());
+        let transcript = rect_of(&after, PanelId::Transcript);
+        let input = rect_of(&after, PanelId::Input);
+
+        assert_eq!(
+            transcript.size.x,
+            area().size.x * PRESET_COLUMN_FRACTIONS[1],
+            "转写列宽度 = fraction × 视口"
+        );
+        assert_eq!(left(&transcript), left(&transcript_before), "左边界不动");
+        // 右列整体左移了转写列缩掉的宽度，宽度不变。
+        let shift = transcript_before.size.x - transcript.size.x;
+        assert_eq!(input.size.x, input_before.size.x, "右列宽度不变");
+        assert!(close(left(&input), left(&input_before) - shift), "右列 x 跟着累计宽平移");
+        assert!(close(right(&transcript), left(&input)), "两列仍然贴在一起");
+        // 横跨整条的 chrome 行不在条带里：一个字节都不动。
+        assert_eq!(rect_of(&after, PanelId::Hints), hints_before);
+        assert_eq!(rect_of(&after, PanelId::Status), status_before);
+
+        // 不是 Fraction 的列不动；坏的 fraction 也不写。
+        let mut proportions = three_leaf_tree();
+        let untouched = proportions.clone();
+        assert!(!proportions.set_column_fraction(PanelId::Transcript, 0.5));
+        assert!(!proportions.set_column_fraction(PanelId::Transcript, f32::NAN));
+        assert!(!proportions.set_column_fraction(PanelId::Status, 0.5));
+        assert_eq!(proportions, untouched);
+        assert_eq!(proportions.column_fraction(PanelId::Transcript), None);
+        assert_eq!(proportions.column_size(PanelId::Transcript), Some(Size::Proportion(2.0)));
+    }
+
+    // 31. 移动列 = 与邻列交换：整列（宽度 + 子树）一起搬，其它列一个字节不动；
+    //     到边界返回 false、不越界、不 panic。
+    #[test]
+    fn moving_a_column_swaps_it_with_its_neighbour_and_widths_travel() {
+        let mut node = tree_with_picker_column();
+        let before_tree = node.clone();
+        let before = node.rects(area());
+        let transcript_before = rect_of(&before, PanelId::Transcript);
+        let right_before = rect_of(&before, PanelId::Input);
+        let picker_before = rect_of(&before, PanelId::List);
+        let hints_before = rect_of(&before, PanelId::Hints);
+        assert_eq!(node.column_size(PanelId::List), Some(Size::Fraction(0.5)));
+
+        // picker 列左移一格：与 0.38 的右列交换。
+        assert!(node.move_column(PanelId::List, -1));
+        let moved = node.rects(area());
+        let picker = rect_of(&moved, PanelId::List);
+        let right_column = rect_of(&moved, PanelId::Input);
+        let transcript = rect_of(&moved, PanelId::Transcript);
+        // 宽度跟着列走。
+        assert_eq!(picker.size.x, picker_before.size.x);
+        assert_eq!(right_column.size.x, right_before.size.x);
+        // x 重排：picker 接在转写后面；右列再往右。
+        assert!(close(left(&picker), right(&transcript)));
+        assert!(close(left(&right_column), right(&picker)));
+        assert!(close(left(&picker), left(&picker_before) - right_before.size.x));
+        assert!(close(right(&right_column), right(&picker_before)), "两列交换后总宽不变");
+        // 转写与 chrome 行不动（交换只发生在后两列之间）。
+        assert_eq!(transcript, transcript_before);
+        assert_eq!(rect_of(&moved, PanelId::Hints), hints_before);
+        assert_eq!(rect_of(&moved, PanelId::Status), rect_of(&before, PanelId::Status));
+        // 右列内部的竖直分裂（补全/输入）宽度不变，只是整体挪了位置。
+        assert_eq!(rect_of(&moved, PanelId::Input).size.x, rect_of(&before, PanelId::Input).size.x);
+        assert_eq!(
+            rect_of(&moved, PanelId::Complete).size.x,
+            rect_of(&before, PanelId::Complete).size.x
+        );
+
+        // 再右移一格：树逐字节复原。
+        assert!(node.move_column(PanelId::List, 1));
+        assert_eq!(node, before_tree, "来回移动后树逐字节复原");
+
+        // 边界：最左列往左、最右列往右都不动、不 panic。
+        let at_edge = node.clone();
+        assert!(!node.move_column(PanelId::Transcript, -1));
+        assert!(!node.move_column(PanelId::List, 1));
+        assert_eq!(node, at_edge, "边界上树一个字节都不改");
+        // 找不到的列、root 单叶子也安全。
+        assert!(!node.move_column(PanelId::Preview, -1));
+        let mut single = leaf(PanelId::Transcript);
+        assert!(!single.move_column(PanelId::Transcript, -1));
+        assert_eq!(single, leaf(PanelId::Transcript));
     }
 }

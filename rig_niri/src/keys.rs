@@ -731,6 +731,45 @@ pub fn add_workspace_scroll_keys(app: &mut App) {
     }
 }
 
+/// 列宽预设 / 移动列的绑定（niri `switch-preset-column-width`、`move-column-left/right`）。
+///
+/// 键位理由（先查过 [`built_in`] 与 [`workspace_scroll_bindings`]）：
+/// * `Ctrl+Alt+H/L` 已经是 L3 的滚动键，不能再给移动列；移动列是 niri 的
+///   `Mod+Ctrl+H/L`，这里加上 Shift 变成 `Ctrl+Alt+Shift+H/L`——同一组方向键，
+///   多按一个 Shift 就是"搬列"，和滚动只差一个修饰键。
+/// * 改列宽用 `Alt+Shift+H/L`（左窄右宽），不带 Ctrl：它和滚动键、移动列键
+///   都不重叠；`Alt+Shift` 也不是任何内置键（内置表里只有 Alt+字符与
+///   Ctrl+Alt/Alt+方向键）。
+/// * 字符键的 Shift 在 [`KeyPress::new`] 里会归一到字符本身（`Shift+h` 是
+///   `Character("H")`），所以这里的 `H`/`L` 必须写**大写**；写小写会被归一成
+///   `Ctrl+Alt+h`，和 L3 的滚动绑定冲突、被 `bind` 拒绝。
+///
+/// 这些绑定和 [`workspace_scroll_bindings`] 一样**没有观察者**：动作由
+/// `crate::workspaces` 的 `column_workspace_keys` 读同一批 [`KeyboardInput`]
+/// 处理（picker 打开时 `editor::keys` 不跑，绑定表也不分发），绑定只负责占住
+/// 键、避免以后有插件把同键抢走。
+pub fn workspace_column_bindings() -> Vec<KeyBinding> {
+    let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
+    let ctrl_alt_shift = Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT;
+    let with = |key: char, modifiers: Modifiers, label: &str| {
+        KeyBinding::new(KeyPress::new(character_key(key), modifiers), label)
+    };
+    vec![
+        with('H', alt_shift, "Shrink the active column"),
+        with('L', alt_shift, "Widen the active column"),
+        with('H', ctrl_alt_shift, "Move the active column left"),
+        with('L', ctrl_alt_shift, "Move the active column right"),
+    ]
+}
+
+/// 装上 [`workspace_column_bindings`]（幂等；同键已被占用时只记
+/// [`RefusedKeys`]，不 panic）。
+pub fn add_workspace_column_keys(app: &mut App) {
+    for binding in workspace_column_bindings() {
+        let _ = bind(app.world_mut(), binding);
+    }
+}
+
 /// 这个 `Ask` 是否显示在**当前工作区**的确认面板里：没有 `ShownAgent`
 /// （无视图的测试/导出路径）时全部可见；有 `ForAgent` 的只认当前 agent，
 /// 无主的（app 级问题）也可见。
@@ -1272,6 +1311,49 @@ mod tests {
             .expect("命中的绑定");
         assert_eq!(row.binding.keys.to_string(), "ctrl+alt+home");
         assert!(row.action.is_none(), "键由 workspaces 读原始事件，不挂动作");
+    }
+
+    #[test]
+    fn workspace_column_keys_are_free_of_built_in_and_scroll_bindings() {
+        let column = workspace_column_bindings();
+        assert_eq!(column.len(), 4, "改宽 H/L + 移动列 H/L");
+        let scroll = workspace_scroll_bindings();
+        let built: Vec<KeyBinding> = built_in()
+            .into_iter()
+            .map(|(keys, label, _)| KeyBinding::new(keys, label).in_scope(KeyScope::Input))
+            .collect();
+        for binding in &column {
+            assert_eq!(binding.scope, KeyScope::Global);
+            for other in scroll.iter().chain(built.iter()) {
+                assert!(
+                    !binding.conflicts(other),
+                    "`{}` 不能和 `{}`（{}）冲突",
+                    binding.keys,
+                    other.keys,
+                    other.label
+                );
+            }
+        }
+        // 字符键的 Shift 由字符本身携带：绑定是 `alt+H` / `ctrl+alt+H`
+        // （不是 `alt+shift+h`），这样才和窗口上报的 `Shift+h → H` 对得上，
+        // 也不会和 L3 的小写 `ctrl+alt+h` 滚动键撞。
+        let keys: Vec<String> = column.iter().map(|binding| binding.keys.to_string()).collect();
+        assert_eq!(
+            keys,
+            vec!["alt+H", "alt+L", "ctrl+alt+H", "ctrl+alt+L"]
+        );
+
+        // 绑定实体能全部装上（不和内置键/滚动键冲突，也没有被拒绝）。
+        let mut app = App::new();
+        add_built_in(&mut app);
+        add_workspace_scroll_keys(&mut app);
+        add_workspace_column_keys(&mut app);
+        let refused = app
+            .world()
+            .get_resource::<RefusedKeys>()
+            .map(|refused| refused.0.clone())
+            .unwrap_or_default();
+        assert!(refused.is_empty(), "列宽/移动列绑定不能被拒绝：{refused:?}");
     }
 
     #[test]
