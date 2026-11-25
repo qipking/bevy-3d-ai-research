@@ -25,13 +25,57 @@
 | 渲染桥 | `feathers_in_3d` | 我们 | bevy_ui → 世界空间面板/文字/拾取 | `FeathersIn3dPlugin`、`WorldPanel` |
 | UI 工具包 | `bevy_feathers` 0.20 | 上游 | 视觉语言：`UiTheme`、token、按钮/输入框/滚动条样式、`Outline` | `FeathersPlugins`、`UiTheme` |
 
-依赖方向（没有反向依赖）：
+依赖方向（按 `Cargo.toml` 核实，没有循环）：
 
 ```
-rig_harness_in_3d ──> rig_niri ──> feathers_in_3d ──> bevy / bevy_feathers / bevy_ui
-        │
-        └──────────> rig_harness ──> rig_ecs ──> rig_core
+rig-core
+  ▲   ▲
+rig-ecs rig-harness-protocol / http / memory / tools
+  ▲        ▲
+rig-harness ┘
+  ▲   ▲
+rig-tui │
+  ▲   │
+rig_niri
+  ▲
+rig_harness_in_3d ──> rig-harness（直接，装配用）
+  └────────────────> feathers_in_3d ──> bevy / bevy_ui / bevy_text（不认识 rig）
 ```
+
+直接依赖（只列关键项）：
+
+| crate | 直接依赖 |
+|---|---|
+| `rig-ecs` | `rig-core`、`rig-memory` |
+| `rig-harness` | `rig-core`、`rig-ecs`、`rig-harness-protocol`、`rig-http`、`rig-memory`、`rig-tools` |
+| `rig-tui` | `rig-core`、`rig-ecs`、`rig-harness`、`rig-markdown`、`rig-tools` |
+| `rig_niri` | `rig-tui`、`rig-harness`、`rig-ecs`、`rig-core`、`feathers_in_3d`、`bevy_feathers` |
+| `feathers_in_3d` | `bevy`、`bevy_ui`、`bevy_text`、`bevy_luma`（**不依赖任何 rig**） |
+| `rig_harness_in_3d` | `rig_niri`、`rig-harness`、`rig-ecs`、`rig-core`、`rig-tui`、`feathers_in_3d`、`bevy_feathers` |
+
+**容易误读的两点**：
+
+- `rig_niri` 不是 `rig-harness` 的兄弟，而是在它之上：`rig_niri` 直接依赖 `rig-harness`
+  （`ShownAgent`、`Answerer`、`ShowsPickers`、`Picker`、`Ask`）。应用层看起来"分叉"，只是因为它
+  既装配 `rig_niri` 又直接装配 `rig-harness`。
+- `feathers_in_3d` 是最底层的渲染桥，**不认识 rig**；是 `rig_niri` 依赖它，不是反过来。
+
+### 为什么 `rig_niri` 依赖 `rig-tui`
+
+`rig-tui` 里有两层东西：**终端前端**（terminal/input/keys/editor/pick 的绘制）和
+**look 协议 + 纯文本渲染器**。`rig_niri` 只用后者（17 个文件、51 处 `use rig_tui::…`）：
+
+| 类别 | 用的东西 |
+|---|---|
+| look 协议 | `RenderBatch`/`RenderInput`/`RenderOutput`/`RenderRequest`/`RenderKey`、`ToolRender`、`CallState`、`LookLine`、`RenderSystems`、`TranscriptRender`、`text_rows` |
+| 主题 | `rig_tui::theme::Theme`（17 个 band） |
+| 纯函数 | `wrap::{wrap,wrap_typed,wrap_all}`、`markdown::render`、`highlight::code_rows`、`diff::unified_lines`、`status::line` |
+| 值类型 | ratatui 的 `Line`/`Span`/`Style`/`Color`、`TranscriptSource`、`Replaced`、`AppStatus`、`StatusItems` |
+
+一个都没用：`terminal`、`input`、`keys`、`editor`、`pick` 的绘制、`TuiPlugin`。所以两个前端
+（终端 / 3D）在**行为上并行**，只是共享的"内容稿件格式"上游没有单独拆 crate，放在了 `rig-tui` 里。
+这是**有意保留的成本选择**（用户 2026-11-26 确认）：真要彻底解耦，得把约 3k 行协议+渲染器拷进
+workspace 并持续跟上游漂移，收益不抵成本。
 
 ---
 
