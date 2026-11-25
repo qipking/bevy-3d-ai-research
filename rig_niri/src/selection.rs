@@ -28,6 +28,7 @@
 //! | 点空白 | 行越界，或 [`Selection::clear`] | 清除选区 |
 //! | 点输入面板（输入行或输入框空白） | [`pointer_selection`] + [`InputFocusSurface`] | [`KeyFocus`] 交回输入框（`None`） |
 //! | Alt+↑/↓（`pane.rs`） | [`Selection::select_item`] | 选中一整块条目（复用下面的高亮/复制） |
+//! | `Ctrl+Shift+C` | [`crate::clipboard::copy_selection_keys`] | 复制活动转写窗格的鼠标/键盘选区（F10） |
 //! | 滚轮 | [`crate::pane::pane_wheel`] | 滚走的内容收起选区（滚动本身在 `pane.rs`） |
 //! | 窗口/面板尺寸变化 | [`clear_selection_on_resize`] | 清除选区（上游 `Event::Resize`） |
 //!
@@ -1189,15 +1190,19 @@ impl Plugin for SelectionPlugin {
             // resize 先清（清的是上一帧的旧选区），同一帧的按下/拖动再落新选区。
             // 输入面板的拾取面排在鼠标处理前补好：这一帧的空白点击也有目标可命中
             // （新面板根要等下一帧布局后才有矩形，属正常）。
+            // F10：`Ctrl+Shift+C` 的键盘复制排在松手复制之后；它读的是同一份
+            // `Selection`/`PanelRows`，只处理按键，不改鼠标路径。
             .add_systems(
                 Update,
                 (
                     clear_selection_on_resize,
                     ensure_input_focus_surface,
                     pointer_selection,
+                    clipboard::copy_selection_keys.run_if(crate::picker::no_picker),
                 )
                     .chain()
-                    .in_set(crate::FeathersSystems::Prepare),
+                    .in_set(crate::FeathersSystems::Prepare)
+                    .before(clipboard::show_copied),
             );
     }
 }

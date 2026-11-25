@@ -18,7 +18,7 @@
 > 所有条目都能用 `grep`/`read` 复现（PARITY §6 有命令）。
 
 **现在的分布**：已完成 5 项（#1 #2 #3 #5 #7）；部分完成 3 项（#4 #8 #9）；
-未开始 2 项（#6 #10）；UI 重组（feathers）另见 §11（F6–F10，未开始）。
+未开始 2 项（#6 #10）；UI 重组（feathers）另见 §11（F10 已完成，F6 切片 2/F7–F9 未开始）。
 
 ---
 
@@ -70,7 +70,8 @@
   鼠标拖选已能落在输入面板并反色/复制（`panels.rs:203` 对所有面板生效，测试
   `clicking_the_input_boxes_blank_area_keeps_its_own_text_selection`，`pane.rs:2460`）。
   输入非空时 hints tile 现在写一行空行、不再显示键位（`hints.rs:183`），tile 高度不变；
-  "输入框里打字作答"是另一件事，见 §5；键盘选区见 §11 F10。
+  "输入框里打字作答"是另一件事，见 §5；输入框的 Shift+方向键选区仍写在 §11 F10 的剩余里
+  （F10 的转写选区键盘复制已完成）。
 
 ---
 
@@ -400,7 +401,7 @@
 | **F7** | 主题切换 UI：`/theme` 与持久化（浅色/高对比），`UiTheme` 已是资源、面板/行/滚动条都按 token 解析（`theme.rs:98`–`:141`、`lib.rs:151`–`:159`），缺入口与 `[view] theme` 设置 | **S** | 无；`Settings`/`add_setting` 的先例已在（`status.rs:64`/`:281`） |
 | **F8** | 3D 镜像图标/图片：feathers 组件里的 `ImageNode` 现在不镜像，按钮只能文字（`FEATHERS_UI.md` §5）；要做就得给 `feathers_in_3d` 加图片/图标层 | **M** | 无；影响所有带图标的 feathers 控件 |
 | **F9** | 过渡/补间：动作现在当帧生效，niri 的 `scroll` 插值与面板切换没有动画 | **S–M** | 依赖 L1/L5；先做 `scroll` 插值再谈按钮过渡 |
-| **F10** | 输入框键盘选区（Shift+方向键）：`Editor` 只有光标、没有锚点；鼠标拖选已能用（`selection.rs`） | **M** | 无；与 §5 的输入框内作答独立 |
+| **F10** | 转写选区键盘复制：**已完成（2026-11-26）**——`Ctrl+Shift+C`（`InputAction::CopySelection`，独立系统 `clipboard::copy_selection_keys`，不占 `editor::keys` 的 16 参数上限）复制活动转写窗格的鼠标拖选或 Alt+↑/↓ 选中的条目（条目按整条的所有视觉行、`\n` 连接），写 `Copied N lines`；没有选中时不写剪贴板、状态行给 `NOTHING_SELECTED`。原列的“输入框 Shift+方向键选区”仍**未做**：`Editor` 只有光标、没有锚点 | **S（复制）/ 原输入框选区 M** | 鼠标松手复制、Alt+↑↓ 选条目、`Ctrl+C` 清空都不变 |
 
 **不做**：不为了"像终端"回退 F1–F5 的 token；不引入弹层；不给 `TextInput`/`ListView`/`Button`
 换内核（理由见 `FEATHERS_UI.md` §4）。
@@ -462,5 +463,5 @@
 4. **§6 多来源转写**（L）——S1 已完成，S2–S6（`dialogue_batch_of`/`source_rows`/`ShowAgent`/
    `Replaced`/`PastEffects`）是用户能看见的最大一块；§8 的压缩提示等它的 `Replaced`。
 5. **§11 F6 面板画布 + §10 插件扩展点**（L+L）——同一件事的两种说法；
-   F8/F9/F10 视需求插入。
+   F8/F9 视需求插入（F10 的转写选区键盘复制已完成）。
 

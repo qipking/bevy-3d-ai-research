@@ -6,6 +6,9 @@
 //!
 //! - 复制：把 [`Selection`] 选中的文本写进系统剪贴板，并给出
 //!   `Copied N lines`（上游原文，`1` 行时是 `Copied 1 line`）。
+//! - 键盘复制（F10）：`Ctrl+Shift+C` 由 [`copy_selection_keys`] 读按键，
+//!   复制**活动转写窗格**里的鼠标选区或 Alt+↑/↓ 选中的条目；没有选中时不写
+//!   剪贴板，只在状态行给 [`NOTHING_SELECTED`]。
 //! - 粘贴：读剪贴板的文本，插到编辑器光标处；空剪贴板/读取失败给一句
 //!   可显示的错误，不 panic。
 //! - 粘贴附件：上游是“把剪贴板图片存成文件，再在输入里打 `@path`”，
@@ -50,11 +53,15 @@
 
 use std::path::{Path, PathBuf};
 
+use bevy::input::ButtonInput;
+use bevy::input::keyboard::KeyCode;
 use bevy::prelude::*;
 use bevy_clipboard::{Clipboard, ClipboardError as BevyClipboardError};
-use rig_tui::{AppStatus, Side, StatusItem, Tone};
+use rig_tui::{AppStatus, Side, StatusItem, Tone, TranscriptSource};
 
 use crate::editor::Editor;
+use crate::pane::{ActiveTranscript, TranscriptPane, TranscriptRows};
+use crate::panels::{PanelId, PanelRoots, PanelRows};
 use crate::selection::Selection;
 use crate::transcript::Row;
 
@@ -245,6 +252,199 @@ pub fn copy_selection(
     let lines = copy_text(&text, clipboard)?;
     selection.mark_copied(lines);
     Ok(Copied { lines })
+}
+
+/// F10：`Ctrl+Shift+C` 触发复制活动转写窗格里的选区。
+///
+/// 独立系统，不占 [`crate::editor::keys`] 的 16 个参数上限。绑定表里的
+/// [`crate::keys::InputAction::CopySelection`] 只负责占键、让输入系统认识这个
+/// 动作；真正复制在这里读按键，所以**焦点在转写根上**（Alt+↑/↓ 选中条目
+/// 之后）也照样触发。
+///
+/// * 活动窗格：`ActiveTranscript` 指向的 `Transcript`/`Pane2`；它没有指向、
+///   或指向的不是转写根时退回主 `Transcript`。选区不属于活动窗格（比如
+///   选的是输入框或另一块窗格）时按“没有选中”处理，避免拿错行下标复制。
+/// * 鼠标拖选：用该面板这一帧的可见行（[`PanelRows`]），只复制选中范围。
+/// * 键盘条目（[`Selection::item`]）：优先用 [`TranscriptRows`] 里这一块的
+///   **全部视觉行**（折行后的每一行），所以条目比窗口高、只露出一部分时也
+///   复制整条；窗格来源不是 `Shown` 时退回可见行。
+/// * 没有选中：不写剪贴板，把 [`NOTHING_SELECTED`] 写进状态行
+///   （[`COPY_FAILED`]，和 Ctrl+V 失败同一条状态行通道）。
+pub fn copy_selection_keys(
+    held: Option<Res<ButtonInput<KeyCode>>>,
+    active: Option<Res<ActiveTranscript>>,
+    roots: Option<Res<PanelRoots>>,
+    panels: Option<Res<PanelRows>>,
+    full: Option<Res<TranscriptRows>>,
+    panes: Query<&TranscriptPane>,
+    mut selection: Option<ResMut<Selection>>,
+    mut system_clipboard: Option<ResMut<Clipboard>>,
+    mut memory_clipboard: Option<ResMut<MemoryClipboard>>,
+    mut copied: MessageWriter<Copied>,
+    mut status: Option<ResMut<AppStatus>>,
+) {
+    let Some(held) = held else {
+        return;
+    };
+    if !copy_chord_pressed(&held) {
+        return;
+    }
+    let Some(selection) = selection.as_deref_mut() else {
+        return;
+    };
+    let panel = copy_panel(selection, active.as_deref(), roots.as_deref());
+
+    // 选区在别的面板（或输入框）里：Ctrl+Shift+C 是转写专用的复制，不能拿
+    // 别的面板的行去套它的行下标。
+    if let Some(selected) = selection.panel()
+        && (!is_transcript(selected) || selected != panel)
+    {
+        report_copy_failure(status.as_deref_mut(), NOTHING_SELECTED);
+        return;
+    }
+
+    // 鼠标选区用可见行；键盘条目优先用整段里的全部行（见函数文档）。
+    let visible = panels
+        .as_deref()
+        .map(|panels| panels.row_values(panel))
+        .unwrap_or_default();
+    let (rows, item) = selection
+        .item()
+        .and_then(|item| full_item_rows(item, panel, full.as_deref(), roots.as_deref(), &panes))
+        .unwrap_or((visible, None));
+
+    match copy_target(
+        selection,
+        panel,
+        &rows,
+        item,
+        system_clipboard.as_deref_mut(),
+        memory_clipboard.as_deref_mut(),
+    ) {
+        Ok(copied_lines) => {
+            copied.write(copied_lines);
+            if let Some(status) = status.as_deref_mut() {
+                clear_copy_failed(status);
+            }
+        }
+        Err(why) => report_copy_failure(status.as_deref_mut(), &why),
+    }
+}
+
+/// 这一帧是否刚按下 `Ctrl+Shift+C`。
+///
+/// 用物理键 `KeyCode::KeyC` + 当前修饰键，和绑定表的 `ctrl+C` 是同一件事：
+/// 字符键的 Shift 在大写 `C` 上。Alt/Super 一起按着时不算，免得抢别的组合。
+fn copy_chord_pressed(held: &ButtonInput<KeyCode>) -> bool {
+    let control = held.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let shift = held.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let alt_or_super = held.any_pressed([
+        KeyCode::AltLeft,
+        KeyCode::AltRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+    ]);
+    control && shift && !alt_or_super && held.just_pressed(KeyCode::KeyC)
+}
+
+/// 转写窗格（主转写或拆出来的 Pane2）。
+fn is_transcript(panel: PanelId) -> bool {
+    matches!(panel, PanelId::Transcript | PanelId::Pane2)
+}
+
+/// 复制目标面板：活动窗格优先，其次选区所在转写面板，最后主转写。
+fn copy_panel(
+    selection: &Selection,
+    active: Option<&ActiveTranscript>,
+    roots: Option<&PanelRoots>,
+) -> PanelId {
+    let active = active
+        .and_then(|active| active.0)
+        .and_then(|root| roots.and_then(|roots| panel_of_root(root, roots)));
+    active
+        .or(selection.panel().filter(|panel| is_transcript(*panel)))
+        .unwrap_or(PanelId::Transcript)
+}
+
+/// 根实体 -> 转写 [`PanelId`]；不是 `Transcript`/`Pane2` 的根返回 `None`。
+fn panel_of_root(root: Entity, roots: &PanelRoots) -> Option<PanelId> {
+    roots
+        .0
+        .iter()
+        .find_map(|(panel, candidate)| {
+            (is_transcript(*panel) && *candidate == root).then_some(*panel)
+        })
+}
+
+/// 键盘选中条目的全部视觉行：整段 `full` 里 key 高 32 位等于 `item` 的行。
+///
+/// 只有窗格来源是 [`TranscriptSource::Shown`]（[`TranscriptRows`] 就是它这一
+/// 帧的整段）时才可用；`Agent`/`Value` 来源的窗格退回 `PanelRows` 的可见行，
+/// 否则会拿另一份内容的行复制。
+fn full_item_rows(
+    item: u32,
+    panel: PanelId,
+    full: Option<&TranscriptRows>,
+    roots: Option<&PanelRoots>,
+    panes: &Query<&TranscriptPane>,
+) -> Option<(Vec<Row>, Option<u32>)> {
+    let root = roots?.entity(panel)?;
+    if !panes
+        .get(root)
+        .ok()
+        .is_some_and(|pane| matches!(pane.source, TranscriptSource::Shown))
+    {
+        return None;
+    }
+    let rows: Vec<Row> = full?
+        .0
+        .iter()
+        .filter(|row| (row.key >> 32) as u32 == item)
+        .map(|row| row.row.clone())
+        .collect();
+    (!rows.is_empty()).then_some((rows, Some(item)))
+}
+
+/// 按“内存替身优先、其次系统剪贴板”调 [`copy_selection`]。
+fn copy_target(
+    selection: &mut Selection,
+    panel: PanelId,
+    rows: &[Row],
+    item: Option<u32>,
+    system: Option<&mut Clipboard>,
+    memory: Option<&mut MemoryClipboard>,
+) -> Result<Copied, String> {
+    match (memory, system) {
+        (Some(memory), _) => copy_rows(selection, panel, rows, item, memory),
+        (None, Some(system)) => copy_rows(selection, panel, rows, item, system),
+        (None, None) => Err(NO_CLIPBOARD.to_owned()),
+    }
+}
+
+/// 复制一组行；`item` 是键盘条目时用一份临时选区覆盖整条（真实选区的高亮
+/// 范围不动，只记 `Copied`）。
+fn copy_rows(
+    selection: &mut Selection,
+    panel: PanelId,
+    rows: &[Row],
+    item: Option<u32>,
+    clipboard: &mut impl ClipboardText,
+) -> Result<Copied, String> {
+    let Some(item) = item else {
+        return copy_selection(selection, rows, clipboard);
+    };
+    let mut item_selection = Selection::new();
+    item_selection.select_item(panel, 0, rows.len(), item);
+    let copied = copy_selection(&mut item_selection, rows, clipboard)?;
+    selection.mark_copied(copied.lines);
+    Ok(copied)
+}
+
+/// 把复制失败的原因写状态行（没有状态行资源时什么也不做）。
+fn report_copy_failure(status: Option<&mut AppStatus>, why: &str) {
+    if let Some(status) = status {
+        show_copy_failed(status, why);
+    }
 }
 
 /// Ctrl+V 读到的东西。
@@ -559,6 +759,7 @@ fn reference(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::panels::KeyedRow;
     use crate::selection::{ClickKind, Selection};
     use rig_tui::ratatui::text::Line;
 
@@ -694,6 +895,250 @@ mod tests {
         assert_eq!(copied_message(1), "Copied 1 line");
         assert_eq!(copied_message(2), "Copied 2 lines");
         assert_eq!(Copied { lines: 3 }.message(), "Copied 3 lines");
+    }
+
+    // ---- F10：Ctrl+Shift+C 键盘复制 ----
+
+    /// `ordinal` 是块序号（key 的高 32 位），`index` 是块内行号（低 32 位）。
+    fn keyed(ordinal: u32, index: u64, text: &str) -> KeyedRow {
+        KeyedRow {
+            key: (u64::from(ordinal) << 32) | index,
+            hash: index,
+            row: row(text),
+        }
+    }
+
+    /// 只跑键盘复制与状态行的最小 App：不建窗口、不碰系统剪贴板。
+    fn copy_app(visible: Vec<KeyedRow>) -> App {
+        let mut app = App::new();
+        app.init_resource::<Selection>()
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<ActiveTranscript>()
+            .init_resource::<TranscriptRows>()
+            .init_resource::<MemoryClipboard>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<AppStatus>()
+            .add_message::<Copied>()
+            .add_systems(Update, (copy_selection_keys, show_copied).chain());
+        app.world_mut()
+            .resource_mut::<PanelRows>()
+            .set(PanelId::Transcript, visible);
+        app
+    }
+
+    /// 按一次 `Ctrl+Shift+C` 并跑一帧；跑完清掉按键，免得下一次 update 又
+    /// 把它当成 just_pressed（测试 App 没有 InputPlugin）。
+    fn tap_copy(app: &mut App) {
+        {
+            let mut held = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            held.reset_all();
+            held.press(KeyCode::ControlLeft);
+            held.press(KeyCode::ShiftLeft);
+            held.press(KeyCode::KeyC);
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+    }
+
+    fn written(app: &App) -> Vec<String> {
+        app.world().resource::<MemoryClipboard>().written.clone()
+    }
+
+    fn visible_rows(app: &App) -> Vec<Row> {
+        app.world()
+            .resource::<PanelRows>()
+            .row_values(PanelId::Transcript)
+    }
+
+    #[test]
+    fn the_plugin_runs_the_copy_before_the_copied_status() {
+        let mut app = App::new();
+        app.add_plugins(crate::selection::SelectionPlugin)
+            .init_resource::<PanelRows>()
+            .init_resource::<PanelRoots>()
+            .init_resource::<MemoryClipboard>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<AppStatus>()
+            .add_systems(
+                Update,
+                show_copied.in_set(crate::FeathersSystems::Prepare),
+            );
+        app.world_mut()
+            .resource_mut::<PanelRows>()
+            .set(PanelId::Transcript, vec![keyed(0, 0, "picked")]);
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Transcript, 0, 1, 0);
+
+        tap_copy(&mut app);
+
+        assert_eq!(written(&app), vec!["picked".to_owned()]);
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == COPIED.name)
+            .expect("同一帧就显示 Copied（copy 排在 show_copied 前）");
+        assert_eq!(item.text, "Copied 1 line");
+    }
+
+    #[test]
+    fn the_copy_chord_copies_a_keyboard_selected_item() {        let rows = vec![
+            keyed(0, 0, "user one"),
+            keyed(0, 1, "user two"),
+            keyed(1, 0, "answer a"),
+            keyed(1, 1, "answer b"),
+            keyed(1, 2, "answer c"),
+            keyed(2, 0, "notice"),
+        ];
+        let mut app = copy_app(rows);
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Transcript, 2, 5, 1);
+
+        tap_copy(&mut app);
+
+        assert_eq!(
+            written(&app),
+            vec!["answer a\nanswer b\nanswer c".to_owned()],
+            "键盘条目按视觉行、用 \\n 连接"
+        );
+        let selection = app.world().resource::<Selection>();
+        assert_eq!(selection.copied(), Some(3));
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == COPIED.name)
+            .expect("状态行显示 Copied");
+        assert_eq!(item.text, "Copied 3 lines");
+    }
+
+    #[test]
+    fn the_copy_chord_copies_only_the_mouse_selected_range() {
+        let mut app = copy_app(vec![
+            keyed(0, 0, "hello"),
+            keyed(0, 1, "world"),
+        ]);
+        let rows = visible_rows(&app);
+        let selection = selected(&rows, (0, 2), (1, 2));
+        *app.world_mut().resource_mut::<Selection>() = selection;
+
+        tap_copy(&mut app);
+
+        assert_eq!(written(&app), vec!["llo\nwo".to_owned()]);
+        assert_eq!(
+            app.world().resource::<Selection>().copied(),
+            Some(2),
+            "鼠标选区只复制选中范围"
+        );
+    }
+
+    #[test]
+    fn the_copy_chord_without_a_selection_reports_and_keeps_the_clipboard() {
+        let mut app = copy_app(vec![keyed(0, 0, "hello")]);
+        tap_copy(&mut app);
+
+        assert!(written(&app).is_empty(), "没有选中不能写剪贴板");
+        assert_eq!(
+            app.world().resource::<Selection>().copied(),
+            None,
+            "失败不显示 Copied"
+        );
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == COPY_FAILED.name)
+            .expect("没有选中要写一条可见错误");
+        assert_eq!(item.text, NOTHING_SELECTED);
+    }
+
+    #[test]
+    fn an_item_taller_than_the_window_still_copies_every_visual_row() {
+        let full = (0..5)
+            .map(|index| keyed(0, index, &format!("wrapped line {index}")))
+            .collect::<Vec<_>>();
+        let visible = full[1..3].to_vec();
+        let mut app = copy_app(visible);
+
+        // 主转写窗格画的是整段（Shown），整段里条目 0 有 5 行。
+        let root = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<PanelRoots>()
+            .0
+            .insert(PanelId::Transcript, root);
+        app.world_mut().resource_mut::<TranscriptRows>().0 = full;
+        // 窗口只露出一部分的键盘选区：高亮范围是 0..2。
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Transcript, 0, 2, 0);
+
+        tap_copy(&mut app);
+
+        assert_eq!(
+            written(&app),
+            vec![
+                "wrapped line 0\nwrapped line 1\nwrapped line 2\nwrapped line 3\nwrapped line 4"
+                    .to_owned()
+            ],
+            "条目比窗口高时也要复制整条（所有视觉行）"
+        );
+        assert_eq!(app.world().resource::<Selection>().copied(), Some(5));
+    }
+
+    #[test]
+    fn the_copy_chord_uses_the_active_pane_selection() {
+        let mut app = copy_app(vec![]);
+        {
+            let mut panels = app.world_mut().resource_mut::<PanelRows>();
+            panels.set(PanelId::Transcript, vec![keyed(0, 0, "main")]);
+            panels.set(PanelId::Pane2, vec![keyed(0, 0, "side")]);
+        }
+        let main = app
+            .world_mut()
+            .spawn((PanelId::Transcript, TranscriptPane::default()))
+            .id();
+        let side = app
+            .world_mut()
+            .spawn((PanelId::Pane2, TranscriptPane::default()))
+            .id();
+        {
+            let mut roots = app.world_mut().resource_mut::<PanelRoots>();
+            roots.0.insert(PanelId::Transcript, main);
+            roots.0.insert(PanelId::Pane2, side);
+        }
+        app.world_mut().resource_mut::<ActiveTranscript>().0 = Some(side);
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Pane2, 0, 1, 0);
+
+        tap_copy(&mut app);
+        assert_eq!(written(&app), vec!["side".to_owned()], "复制活动窗格的选区");
+
+        // 选区落在非活动的主转写上：不拿它的行下标去套活动窗格。
+        app.world_mut()
+            .resource_mut::<Selection>()
+            .select_item(PanelId::Transcript, 0, 1, 0);
+        tap_copy(&mut app);
+        assert_eq!(
+            written(&app),
+            vec!["side".to_owned()],
+            "非活动窗格的选区不能写剪贴板"
+        );
+        let status = app.world().resource::<AppStatus>();
+        let item = status
+            .0
+            .iter()
+            .find(|item| item.name == COPY_FAILED.name)
+            .expect("活动窗格里没有选区时要有可见错误");
+        assert_eq!(item.text, NOTHING_SELECTED);
     }
 
     // ---- 粘贴 ----

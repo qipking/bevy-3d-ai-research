@@ -1136,6 +1136,10 @@ fn act(action: InputAction, editor: &mut Editor, busy: bool) -> Option<Act> {
         | Do::SelectUp
         | Do::SelectDown
         | Do::Deselect => {}
+        // F10：Ctrl+Shift+C 的复制由 `clipboard::copy_selection_keys` 读按键
+        // 完成（绑定是 Global，焦点在转写根上时也走这里）。输入系统只把动作
+        // 当成已消费，**不能**落到 Clear。
+        Do::CopySelection => {}
         Do::AnswerInline(number) => return Some(Act::AnswerInline(usize::from(number))),
         Do::DismissInline => return Some(Act::DismissInline),
         // Ctrl+V 的绑定是上游同名动作 `PasteImage`：上游同时读文本和图片，
@@ -2273,6 +2277,36 @@ mod tests {
         app.world_mut().resource_mut::<Editor>().set_cursor(0);
         with_modifier(&mut app, KeyCode::AltLeft, Key::Character("d".into()), KeyCode::KeyD);
         assert_eq!(text(&app), " two", "Alt+D 删后一个词");
+    }
+
+    #[test]
+    fn ctrl_c_still_clears_but_ctrl_shift_c_does_not() {
+        let mut app = test_app();
+        app.world_mut().resource_mut::<Editor>().set("hello");
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("c".into()),
+            KeyCode::KeyC,
+        );
+        assert_eq!(text(&app), "", "Ctrl+C 仍是 Clear");
+
+        // Ctrl+Shift+C：字符键的 Shift 由大写的 C 携带，命中的是
+        // `CopySelection`（动作由独立系统执行），不是 Clear。
+        app.world_mut().resource_mut::<Editor>().set("hello");
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::ShiftLeft);
+        with_modifier(
+            &mut app,
+            KeyCode::ControlLeft,
+            Key::Character("C".into()),
+            KeyCode::KeyC,
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::ShiftLeft);
+        assert_eq!(text(&app), "hello", "Ctrl+Shift+C 不能清空输入");
     }
 
     #[test]

@@ -10,11 +10,13 @@
 //! 与上游一致的部分：
 //! - [`built_in`] 的 43 条内置绑定（上游 `keys.rs:570`–`:650`；PARITY 写的
 //!   “45 条”对 0.47.0 的源码不准确，见测试）；
-//! - [`InputAction`] 的 32 个动作（从 `Clear` 到 `DismissInline`，含
-//!   `AnswerInline(u8)`；PARITY 写的“19 个”是旧版本数字）；
+//! - [`InputAction`] 的 33 个动作（上游 0.47.0 的 32 个，加本 crate 的
+//!   [`InputAction::CopySelection`]；含 `AnswerInline(u8)`，PARITY 写的
+//!   “19 个”是旧版本数字）；
 //! - [`KeyBinding`] / [`KeyScope`] / [`KeyFocus`] / [`KeyPressed`] /
 //!   [`Keys`] / [`find`] / 多键前缀匹配 / 作用域遮蔽；
-//! - [`add_built_in`] 额外生成的两类绑定：转写区 Esc（`Deselect`）与
+//! - [`add_built_in`] 额外生成的三类绑定：F10 的 `Ctrl+Shift+C`
+//!   （[`InputAction::CopySelection`]）、转写区 Esc（`Deselect`）与
 //!   Alt+1..9、Alt+0 的内联回答键（带 [`InlineKey`]，先挂 `Disabled`）。
 //!   确认面板里有未回答的 `Ask` 时，[`arm_inline_keys`] 摘掉 `Disabled`
 //!   启用它们；问题答完/被拒后挂回去——和上游 `keys.rs::arm_inline_keys`
@@ -500,7 +502,8 @@ pub fn run_command(
 #[derive(Resource, Default, Debug)]
 pub struct RefusedKeys(pub Vec<String>);
 
-/// 内置动作，对齐上游 `InputAction`（0.47.0 的 32 个变体全在）。
+/// 内置动作，对齐上游 `InputAction`（0.47.0 的 32 个变体全在），另加
+/// F10 的 [`InputAction::CopySelection`]。
 ///
 /// 挂在 [`KeyBinding`] 实体上时，按键由视图自己执行；没有这个组件时触发
 /// [`KeyPressed`]。插件也可以直接 spawn 一个带 `InputAction` 的绑定来重新
@@ -561,6 +564,12 @@ pub enum InputAction {
     Stop,
     /// 粘贴图片；本 crate 还没有接图片剪贴板，先留空实现。
     PasteImage,
+    /// 复制转写区里选中的内容（鼠标拖选或 Alt+↑/↓ 选中的条目）。
+    ///
+    /// 动作本身由 [`crate::clipboard::copy_selection_keys`] 读按键执行；
+    /// 绑定只负责占住 `Ctrl+Shift+C`，并让 [`crate::editor::keys`] 把它当成
+    /// 已消费的动作（输入框不会因此清空）。
+    CopySelection,
     /// 选转写区上一条。
     SelectUp,
     /// 选转写区下一条。
@@ -576,8 +585,9 @@ pub enum InputAction {
 /// 内置绑定表：`(键, 说明, 动作)`，逐条照抄上游 `built_in()`。
 ///
 /// 上游 0.47.0 的源码是 43 条；PARITY.md 里的“45 条”与源码不符，测试里
-/// 按源码逐条断言。除这 43 条外，[`add_built_in`] 还会生成转写区 Esc 与
-/// Alt+1..9、Alt+0 共 11 条，一共 54 个内置绑定实体。
+/// 按源码逐条断言。除这 43 条外，[`add_built_in`] 还会生成 F10 的
+/// `Ctrl+Shift+C`、转写区 Esc 与 Alt+1..9、Alt+0 共 12 条，一共 55 个内置
+/// 绑定实体。
 pub fn built_in() -> Vec<(Keys, &'static str, InputAction)> {
     use InputAction as Do;
     let key = |key: Key| Keys::from(KeyPress::key(key));
@@ -664,8 +674,30 @@ pub fn built_in() -> Vec<(Keys, &'static str, InputAction)> {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct InlineKey;
 
-/// 生成视图自带的内置绑定：43 条输入键、转写区 Esc，以及先挂
-/// `Disabled` 的内联回答键（Alt+1..9、Alt+0）。
+/// F10：`Ctrl+Shift+C` —— 复制转写区里选中的内容。
+///
+/// 键位先查过 [`built_in`]：`Ctrl+C` 是 [`InputAction::Clear`]，而字符键的
+/// Shift 在 [`KeyPress::new`] 里会归一成字符本身（`Shift+c` 上报为
+/// `Character("C")`）。所以这里必须写**大写** `C`：`Ctrl+Shift+C` 是
+/// `ctrl+C`，`Ctrl+C` 是 `ctrl+c`，两个键不相等，不会和清空输入冲突（这也是
+/// `workspace_column_bindings` 里 `alt+H`/`ctrl+alt+H` 的同一写法）。
+///
+/// 作用域是 [`KeyScope::Global`]：Alt+↑/↓ 选中条目后焦点在转写根上，Input
+/// 作用域的绑定查不到。真正的复制由
+/// [`crate::clipboard::copy_selection_keys`] 读按键完成；这个绑定只负责占住
+/// 键、并把动作交给 `editor::keys` 消费（否则带修饰键的字符键会被当成普通
+/// 输入或 Clear 处理）。
+pub fn copy_selection_binding() -> KeyBinding {
+    KeyBinding::new(
+        KeyPress::new(character_key('C'), Modifiers::CONTROL | Modifiers::SHIFT),
+        "Copy the selected transcript text",
+    )
+    .in_scope(KeyScope::Global)
+}
+
+/// 生成视图自带的内置绑定：43 条输入键、F10 的 `Ctrl+Shift+C`
+/// （[`InputAction::CopySelection`]）、转写区 Esc，以及先挂 `Disabled` 的
+/// 内联回答键（Alt+1..9、Alt+0）。
 pub fn add_built_in(app: &mut App) {
     app.init_resource::<KeyFocus>();
     for (keys, label, action) in built_in() {
@@ -673,6 +705,11 @@ pub fn add_built_in(app: &mut App) {
         if let Some(mut bound) = bind(app.world_mut(), binding) {
             bound.insert(action);
         }
+    }
+    // F10：Ctrl+Shift+C 复制转写选区。Global 作用域，选条目后也能收到；
+    // 动作由 `clipboard::copy_selection_keys` 读同一批按键执行。
+    if let Some(mut bound) = bind(app.world_mut(), copy_selection_binding()) {
+        bound.insert(InputAction::CopySelection);
     }
     // 读转写时 Esc 把键交回输入框。
     let back = KeyBinding::new(KeyPress::key(Key::Escape), "Back to the input")
@@ -1257,6 +1294,62 @@ mod tests {
     }
 
     #[test]
+    fn the_copy_selection_binding_is_ctrl_shift_c_and_does_not_collide_with_clear() {
+        let copy = copy_selection_binding();
+        assert_eq!(copy.keys.to_string(), "ctrl+C", "Shift 归一到字符 C");
+        assert_eq!(copy.scope, KeyScope::Global, "选条目后焦点在转写根上");
+        for (keys, label, action) in built_in() {
+            let other = KeyBinding::new(keys, label).in_scope(KeyScope::Input);
+            assert!(
+                !copy.conflicts(&other),
+                "`{}` 不能和内置 `{}`（{action:?}）冲突",
+                copy.keys,
+                other.keys
+            );
+        }
+        // Ctrl+C（Clear）与 Ctrl+Shift+C 是两个键：前者小写 c，后者大写 C。
+        let clear = KeyBinding::new(KeyPress::ctrl('c'), "Clear").in_scope(KeyScope::Input);
+        assert!(!copy.conflicts(&clear));
+        assert_ne!(copy.keys, clear.keys);
+        // 真实按下去（窗口上报 Character("C") + Ctrl/Shift）要命中 CopySelection，
+        // 输入框（Input 作用域）和转写根（Panel 作用域）都一样；Ctrl+C 仍是 Clear。
+        let mut app = App::new();
+        add_built_in(&mut app);
+        let mut query =
+            app.world_mut()
+                .query::<(Entity, &KeyBinding, Option<&InputAction>)>();
+        let collected: Vec<(Entity, &KeyBinding, Option<InputAction>)> = query
+            .iter(app.world())
+            .map(|(entity, binding, action)| (entity, binding, action.copied()))
+            .collect();
+        let rows: Vec<BindingRef> = collected
+            .iter()
+            .map(|(entity, binding, action)| BindingRef {
+                entity: *entity,
+                binding,
+                action: *action,
+            })
+            .collect();
+        let copy_press = KeyPress::new(
+            Key::Character("C".into()),
+            Modifiers::CONTROL | Modifiers::SHIFT,
+        );
+        let panel = Entity::from_raw_u32(77).unwrap();
+        for scope in [KeyScope::Input, KeyScope::Panel(panel)] {
+            assert_eq!(
+                action_for(&rows, std::slice::from_ref(&copy_press), scope),
+                Some(InputAction::CopySelection),
+                "Ctrl+Shift+C 在 {scope:?} 里要命中复制"
+            );
+        }
+        assert_eq!(
+            action_for(&rows, &[KeyPress::ctrl('c')], KeyScope::Input),
+            Some(InputAction::Clear),
+            "Ctrl+C 在输入框里仍是 Clear"
+        );
+    }
+
+    #[test]
     fn workspace_scroll_keys_are_free_and_shadow_the_bare_home_and_end() {
         let scroll = workspace_scroll_bindings();
         assert_eq!(scroll.len(), 4, "H/L + Home/End");
@@ -1357,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn add_built_in_spawns_43_plus_transcript_esc_plus_10_inline() {
+    fn add_built_in_spawns_43_plus_copy_plus_transcript_esc_plus_10_inline() {
         let mut app = App::new();
         add_built_in(&mut app);
         // 默认查询会跳过 Disabled，所以显式 Allow 它们，数全部内置实体。
@@ -1366,13 +1459,13 @@ mod tests {
             .query_filtered::<&KeyBinding, Allow<Disabled>>()
             .iter(app.world())
             .count();
-        assert_eq!(count, 43 + 1 + 10);
+        assert_eq!(count, 43 + 1 + 1 + 10, "43 输入 + Ctrl+Shift+C + Esc + 10 内联");
         let enabled = app
             .world_mut()
             .query::<&KeyBinding>()
             .iter(app.world())
             .count();
-        assert_eq!(enabled, 43 + 1, "Alt+0..9 先 Disabled");
+        assert_eq!(enabled, 43 + 1 + 1, "Alt+0..9 先 Disabled");
     }
 
     #[test]
