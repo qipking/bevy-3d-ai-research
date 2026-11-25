@@ -1,12 +1,15 @@
 # 开放面板画布（F6）：插件面板注册、条带列与行读回
 
-> **状态（2026-11-26）**：**切片 1 已实现**——插件能注册面板、把它作为 niri 列放进
-> 指定工作区、拿到 `bevy_ui` 根并 spawn 自己的子树（3D 镜像自动可见）、按
-> `RowLayout` + `PanelAreas` 读回“第 n 行的世界矩形”。内置 `PanelId` 面板的行为与
-> 几何不变。**`StatusLine` 组件留给切片 2**（设计见 §3.5，尚未写代码）。
+> **状态（2026-11-26）**：**切片 1、切片 2 都已实现**——插件能注册面板、把它作为
+> niri 列放进指定工作区、拿到 `bevy_ui` 根并 spawn 自己的子树（3D 镜像自动可见）、
+> 按 `RowLayout` + `PanelAreas` 读回“第 n 行的世界矩形”。切片 2 补上了
+> `StatusLine`（任意面板底部状态行）、`PanelAuto::AllWorkspaces` 自动工作区策略、
+> 插件列的整树移除/注销，以及插件列作为活动列（`ActiveTranscript` 之外的另一个
+> 焦点）。内置 `PanelId` 面板的行为与几何不变。
 >
-> 落点：`rig_niri/src/panel.rs`（新）、`rig_niri/src/panels.rs` 的
-> `PluginPanel` / `PanelId::Plugin`。行号是本次快照；函数名是稳定锚。
+> 落点：`rig_niri/src/panel.rs`（新）、`rig_niri/src/status.rs`（`StatusLine`）、
+> `rig_niri/src/panels.rs` 的 `PluginPanel` / `PanelId::Plugin`。行号是本次快照；
+> 函数名是稳定锚。
 >
 > 配套：[`NIRI_SCROLL.md`](NIRI_SCROLL.md)（列宽/滚动）、
 > [`FEATHERS_UI.md`](FEATHERS_UI.md)（视觉 token）、
@@ -42,7 +45,7 @@
 | `layout.rs:99` `Size::Fraction` | 列宽 = 视口宽的比例；`append_column_at`（`:779`）追加到含转写的横向条带 | 没有“插件列 + 任意 fraction”的便捷入口 |
 | `layout.rs:912` `set_column_fraction` | 只改目标列的 `Fraction`，其它列一个字节不动 | 可复用（切片 1 就是 `append_column_at` 后调它） |
 | `workspaces.rs:732` `WorkspacePanels` | 每工作区 `rows`/`roots`/`spawned`/`areas` 权威快照 | 插件列必须同时更新“组件 + 聚焦全局代理” |
-| `status.rs:382`（上游 `reference/rig-tui-inspect/rig-tui-0.47.0/src/status.rs`）`StatusLine` | 上游是挂任意实体的组件，在它的一行画状态 | 我们只有固定 `PanelId::Status`；`status_rows`（`status.rs:186`）每帧现算一行 |
+| `status.rs:382`（上游 `reference/rig-tui-inspect/rig-tui-0.47.0/src/status.rs`）`StatusLine` | 上游是挂任意实体的组件，在它的一行画状态 | **切片 2 已补**：`status.rs` 的 `StatusLine` 挂在任意面板根上，在面板底部画一行；`PanelId::Status` 的现有状态行不变 |
 
 **3D 侧本来不是缺口**：`feathers_in_3d` 不认识 rig，`MirrorRoot`（`world3d.rs:126`）
 下面的整棵 `bevy_ui` 子树都会被镜像（`Node`/文字/`ImageNode`/`Outline`，见
@@ -71,6 +74,17 @@ let _ = reveal_panel_column(world, workspace, panel);
 
 // 5) 读回：某块面板第 n 行这一帧在世界里的矩形
 let row: Option<DrawnRow> = drawn_row(world, workspace, panel.id(), 2);
+
+// 6) 切片 2：注册时就自动装进所有工作区（之后新建的也带）
+let panel: PluginPanel = app.register_panel_with("git", PanelSpec::everywhere(0.28));
+// 或者运行时打开/关闭：
+add_panel_everywhere(world, panel, 0.28);
+focus_panel_column(world, workspace, panel);      // 成为活动列并滚进视口
+remove_panel_everywhere(world, panel);            // 从所有工作区摘掉（旧列宽不变）
+unregister_panel(world, panel);                   // 连注册一起删
+
+// 7) 任意面板底部状态行（内置/插件面板都可以）
+world.entity_mut(root).insert(StatusLine::default());
 ```
 
 ### 3.1 身份：注册表 + 句柄，`PanelId::Plugin(..)`
@@ -106,12 +120,12 @@ let row: Option<DrawnRow> = drawn_row(world, workspace, panel.id(), 2);
 **列宽/位置规则**（niri 第一原则）：新列是 `Size::Fraction(fraction)`，宽度
 相对**视口**，已有列的宽度和 x 一个字节都不改。默认树的两列已经占满一屏
 （`TRANSCRIPT_COLUMN_FRACTION` 0.62 + `RIGHT_COLUMN_FRACTION` 0.38，`layout.rs:74`/`:80`），
-所以追加列通常落在视口右边；`reveal_panel_column`（`panel.rs:234`）用
+所以追加列通常落在视口右边；`reveal_panel_column` 用
 `column_bounds` + `scroll_to_visible` 把它滚进来（只写 `WorkspaceScroll`）。
 
-> 切片 1 **不自动抢滚动**：`scroll_active_column` 在“活动列变化 / 窗口 resize”时
-> 仍会把活动转写列滚进视口。插件在启动第一帧之后放面板/调用 reveal 最稳；
-> 若以后要“新列自动获得焦点”，属于切片 2 的活动列扩展。
+> `add_panel_column` 本身**不抢滚动**：`scroll_active_column` 仍按活动列（转写窗格
+> 或切片 2 的 `ActivePanelColumn`）走。要让插件列获得焦点/自动滚进来，用
+> `focus_panel_column`（§3.6）。
 
 ### 3.3 插件怎么画：两条路，可混用
 
@@ -157,10 +171,12 @@ pub fn drawn_rows(world: &World, workspace: Entity, panel: PanelId) -> Vec<Drawn
 > “某块面板第 n 行”；不需要再存 `TuiFrame` 那种“每个面板的屏幕矩形”表。
 > 读回的是**几何**，不是行文本/高亮（文本在行实体上，需要时再读 `RowText`）。
 
-### 3.5 `StatusLine`（切片 2，设计定稿、未实现）
+### 3.5 `StatusLine`（切片 2，已实现）
 
-目标：任意面板底部画一条状态行，内容仍来自 `AppStatus` / `StatusItems` /
-`StatusParts`，不复制状态行逻辑。
+**任意面板根挂上就在它的底部画一条状态行**，内容与内置 `PanelId::Status` 同源：
+`AppStatus` / agent / 运行中 turn 的 `StatusItems` / `StatusParts` / `[status] hide`
+/ `no agent` / `rig_tui::status::line` 宽度裁剪。挂哪块画哪块，多个面板各画各的；
+不挂就不画。
 
 ```rust
 /// 挂在面板根上：这块面板底部画一条状态行。
@@ -171,21 +187,82 @@ pub struct StatusLine {
 }
 ```
 
-实现要点（切片 2）：
+落点（`rig_niri/src/status.rs`）：
 
-- 从 `status_rows`（`status.rs:186`）里抽出“来源合并 + `[status] hide` +
-  `no agent` + `rig_tui::status::line` 裁剪”的纯函数
-  `status_line_row(agent, width) -> (Line, Option<Line>)`；`status_rows` 继续用
-  它写 `PanelId::Status`，行为不变。
-- 新系统排在 `PanelsPlugin` 的 `sync_panels` 之后（`FeathersSystems::Render`）：
-  对每个 `(StatusLine, PanelAreas)` 面板，宽度取面板 `area.cols`，生成一行，
-  spawn/更新一个**绝对定位的底部子节点**（`position_type: Absolute`, `bottom: 0`,
-  左右贴内容区），里面放和普通行一样的 `Text`/`TextSpan`。
-- 用绝对定位而不是硬塞进 `PanelRows`：插件自己的 flex 子树和内置行 diff 都不被
-  打乱；面板变高变矮时状态行自动贴底。3D 镜像对绝对定位子树同样生效。
-- `StatusLine` 只影响挂了它的面板；`PanelId::Status` 的现有状态行一字节不变。
-- 测试：挂到插件面板 → 底部子节点存在、世界 y 在面板底；宽度变化重新裁剪；
-  没主题/没 agent 不 panic。
+- `merged_status_items(agent, app_status, own, turn, parts, settings)` 是唯一的
+  “来源合并 + 覆盖 + `[status] hide` + `no agent`”纯函数；
+  `status_line_row(items, width)` 直接调 `rig_tui::status::line` 裁成左右两条。
+  `status_rows`（写 `PanelId::Status`）和 `StatusLine` 都走它们，规则不复制。
+- `draw_status_lines` 排在 `publish_focused_spawned` 之后（
+  `FeathersSystems::Render`；它是 `PanelsPlugin` 行同步链的末尾），所以本帧的
+  `PanelArea` / 行都已在位。
+- 每块面板生成/更新一个**绝对定位的底部子节点**：`position_type: Absolute`、
+  `bottom: 0`、左右贴内容区、高 `ROW_HEIGHT`；宽度取面板这一帧的 `area.cols`，
+  宽度变化时重新裁剪。内容 hash 没变不重建文字。
+- **不写 `PanelRows`、不进行 diff**：插件自己的 flex 子树、内置行同步、`drawn_row`
+  都不受影响。3D 镜像对绝对定位子树同样生效。
+- **输入框（`PanelId::Input`）**：上游语义是“编辑器在自己的底行画状态行”，不额外
+  占一行。我们不改 `editor.rs`，用同一个绝对定位底部行盖在输入框底行上——不占
+  flex 行、不改 `PanelArea`/面板行数，视觉上就是编辑器底行。
+- `StatusLine.agent = Some(e)` 画指定 agent（`None` 跟 `ShownAgent`）；没有 agent
+  时补 `no agent`（上游 `status.rs:406`）。
+- `PanelId::Status` 的主状态行仍由 `status_rows` 写，行为一个字节不变。
+
+测试（`panel.rs` 的 `a_status_line_on_a_plugin_panel_is_drawn_at_the_bottom` /
+`a_status_line_on_the_input_panel_stays_in_its_bottom_row` /
+`status_lines_are_per_panel_and_clip_to_the_panel_width`）：挂/不挂、输入框底行、
+多面板独立、宽度裁剪、换 agent。
+
+### 3.6 生命周期与活动列（切片 2，已实现）
+
+**注册策略**：
+
+```rust
+pub enum PanelAuto { Manual, AllWorkspaces }
+
+pub struct PanelSpec { pub fraction: f32, pub auto: PanelAuto }
+impl PanelSpec { pub fn everywhere(fraction: f32) -> Self; }
+
+app.register_panel_with("git", PanelSpec::everywhere(0.28));
+```
+
+`PanelRegistry` 为每块面板存一份 `PanelSpec`。`PanelAuto::AllWorkspaces` 由
+`apply_auto_panels`（`WorkspacesPlugin` 的 `Prepare`，exclusive system）补齐：
+
+- 注册时已有 N 个工作区 → 第一帧每个工作区各加一列；
+- 之后 `spawn_workspace` / `spawn_workspace_with_tree` 新建的工作区 → 下一帧自动带上；
+- 已有该列的工作区不重复加（`add_panel_column` 幂等）。
+
+运行时也可以 `add_panel_everywhere(world, panel, fraction)`：把规格改成
+`AllWorkspaces` 并立刻补齐所有工作区。
+
+**移除/注销**（都对树用 `Node::remove_column`，只摘包含这块面板的那一列）：
+
+- `remove_panel_column(world, workspace, panel)`：摘一个工作区；同步该工作区的
+  根/行/区域表，聚焦时同帧同步全局 `FrameTree` / `PanelRoots` / `PanelRows` /
+  `PanelSpawned`，并 despawn 面板根；
+- `remove_panel_everywhere(world, panel)`：摘所有工作区，并把规格降回
+  `PanelAuto::Manual`（否则 `apply_auto_panels` 下一帧会加回来）；
+- `unregister_panel(world, panel)`：注册表 + 所有工作区一起删。
+
+**旧列宽不动**：`remove_column` 只删根条带里包含该面板的那一个直接子节点；其它列
+仍是 `Size::Fraction(fraction × 视口宽)`，宽度、x 一个字节不改。测试
+`removing_an_auto_panel_restores_every_workspace_tree` 断言“加列 → 摘列”之后每个
+工作区的树逐字节复原、根实体已 despawn、自动策略已停。
+
+**活动列**：`ActivePanelColumn { workspace, panel }` 是 `ActiveTranscript` 之外的
+另一个焦点（插件列不在转写窗格模型里）：
+
+- `focus_panel_column(world, workspace, panel)`：设为活动列并立即 `reveal`；
+- `scroll_active_column` / `column_workspace_keys` 经
+  `active_panel_with_plugin` 解析活动列——**picker 打开时 picker 列优先**，否则
+  插件列（根还在时）→ `ActiveTranscript` → 主转写；改宽/移动列键因此也作用于
+  插件列；
+- `clear_panel_column_focus(world)` 交回转写窗格。
+
+picker 开列/关列只摘它自己的 `PanelId::List` 那列，插件列留在条带里；测试
+`a_plugin_column_can_be_revealed_alongside_an_open_picker_column` 覆盖“开着
+picker 时 reveal 插件列、关 picker 后插件列宽不变”。
 
 ---
 
@@ -198,8 +275,7 @@ pub struct StatusLine {
 | `RequestRedraw` / `RedrawArea` / 脏区门控 | 每帧重排 + 每帧 `sync_mirror`，没有“省一帧重绘”的收益；插件改数据下一帧自然可见 |
 | `TuiFrame`/`TerminalWrite` 的屏幕格坐标 | 终端专有；3D 里世界矩形由 `WorldPanel::anchor` 给出，读回用 `DrawnRow` |
 | 插件改内置面板的尺寸/位置 | 内置 `PanelId` 的面板行为不变；开新列不改已有列宽（niri 不变量） |
-| 行内容/高亮/滚动状态的完整 `DrawnTranscript` | 切片 1 只读几何；文本读 `RowText`，高亮/选区在 `Selection`/行样式里 |
-| 自动给“以后创建的工作区”都加插件列 | 切片 2 可加注册策略（`PanelSpec { fraction, all_workspaces }`）；切片 1 是显式放到某个工作区 |
+| 行内容/高亮/滚动状态的完整 `DrawnTranscript` | 读回只读几何；文本读 `RowText`，高亮/选区在 `Selection`/行样式里 |
 
 ---
 
@@ -241,44 +317,53 @@ pub struct StatusLine {
   所以 `add_panel_column` 对聚焦工作区必须同时写全局代理（§3.2 第 4 步），
   非聚焦工作区只写组件，不污染全局。
 - 应用层自己 `spawn_workspace`（`workspaces.rs:781`）创建的每个工作区都是独立
-  条带；插件显式对某个工作区调用 `add_panel_column` 即可。切片 2 若加“所有
-  工作区都装”的策略，落点是 `spawn_workspace_with_tree` 之后统一应用注册表。
+  条带；插件显式对某个工作区调用 `add_panel_column` 即可。切片 2 的
+  `PanelAuto::AllWorkspaces` 由 `apply_auto_panels` 在每帧 `Prepare` 统一补齐：
+  已有工作区 + 之后新建的工作区都覆盖，注册表是唯一策略来源。
 
 ### 状态行
 
-`PanelId::Status` 仍是内置固定状态行（`status.rs:186`），插件加**条目**走
-`StatusParts`（`status.rs:113`）；给任意面板挂整条状态行是切片 2 的
-`StatusLine`（§3.5）。两者共享同一套来源/裁剪逻辑，不复制。
+`PanelId::Status` 仍是内置固定状态行（`status.rs` 的 `status_rows`），插件加
+**条目**走 `StatusParts`；给任意面板挂整条状态行是 `StatusLine`（§3.5）。两者
+共享 `merged_status_items` + `status_line_row` 同一套来源/裁剪逻辑，不复制。
 
 ---
 
-## 6. 切片 1 已实现 / 切片 2 待做
+## 6. 已实现（切片 1 + 切片 2）
 
-### 切片 1（本次）
+### 切片 1
 
 | 内容 | 落点 |
 |---|---|
-| `PluginPanel` 句柄 + `PanelId::Plugin(..)` | `panels.rs:40` / `:66` |
-| 注册表（名字幂等）+ `App::register_panel` | `panel.rs:65` / `:113` |
-| 放进工作区条带、拿根、更新组件 + 聚焦全局代理 | `panel.rs:141` |
-| 滚进视口 | `panel.rs:234` |
-| `DrawnRow` / `drawn_row` / `drawn_rows` | `panel.rs:263` / `:281` / `:316` |
-| 测试（7 个） | `panel.rs` `mod tests`：注册→列→根→区域→镜像根；行世界矩形数值；reveal 后可见；重复/找不到工作区/空面板；非聚焦工作区；句柄可做树叶子 |
+| `PluginPanel` 句柄 + `PanelId::Plugin(..)` | `panels.rs` |
+| 注册表（名字幂等）+ `App::register_panel` | `panel.rs` |
+| 放进工作区条带、拿根、更新组件 + 聚焦全局代理 | `panel.rs::add_panel_column` |
+| 滚进视口 | `panel.rs::reveal_panel_column` |
+| `DrawnRow` / `drawn_row` / `drawn_rows` | `panel.rs` |
 
-回归：`cargo test --workspace --offline` 全绿；`rig_niri` lib 测试 580 → 587，
-内置面板的现有测试不变。
+### 切片 2（2026-11-26 完成）
 
-### 切片 2（建议顺序）
+| 内容 | 落点 |
+|---|---|
+| `StatusLine` 组件 + 底部绝对定位行（任意面板；输入框落在编辑器底行） | `status.rs::StatusLine` / `draw_status_lines` |
+| 来源复用：`merged_status_items` / `status_line_row`（`status_rows` 与 `StatusLine` 共用） | `status.rs` |
+| 注册策略 `PanelSpec { fraction, auto }` + `PanelAuto::AllWorkspaces` | `panel.rs` |
+| 自动补齐已有/新工作区 | `panel.rs::apply_auto_panels`（`WorkspacesPlugin` 的 `Prepare`） |
+| `add_panel_everywhere` / `remove_panel_column` / `remove_panel_everywhere` / `unregister_panel` | `panel.rs` |
+| 插件列活动焦点 `ActivePanelColumn` + `focus_panel_column` / `clear_panel_column_focus` | `panel.rs` / `workspaces.rs::active_panel_with_plugin` |
+| picker 与本策略共存 | `panel.rs` 测试 `a_plugin_column_can_be_revealed_alongside_an_open_picker_column` |
 
-1. `StatusLine` 组件 + 来源复用 + 底部绝对定位子节点（§3.5）——S/M。
-2. `PanelSpec` 注册策略：`fraction`、`all_workspaces`、可选 `Look`，在
-   `spawn_workspace`/`bootstrap` 后统一应用——S。
-3. 读回扩展：行文本/高亮（`RowText` 已有）、`DrawnRow` 带 panel/workspace 的
-   可见性判断（`effective_clip` 非空）——S。
-4. 活动列扩展：插件列可以成为 `scroll_active_column` 的目标（新列自动获得焦点）
-   ——S/M，依赖 L3 的滚动快照。
-5. 插件命令绑定：`InputAction` 已开放前缀/`run_command`，缺“注册表 + 默认键位”
-   的公开入口——M（属于 `REMAINING.md` §10 的另一半）。
+测试：`panel.rs` 的 14 个测试覆盖切片 1 的注册/列/根/区域/镜像根/行世界矩形/
+reveal/重复输入/非聚焦工作区/queue/树叶子，以及切片 2 的 StatusLine（插件面板、
+输入框底行、多面板/宽度裁剪）、自动工作区（已有 + 新建）、移除后树逐字节复原、
+picker 共存、插件列活动焦点。`cargo test --workspace --offline` 全绿（`rig_niri`
+lib 595 → 602）。
+
+### 切片 2 之后仍没做（见 `REMAINING.md` §10）
+
+- 插件命令绑定入口（注册表 + 默认键位；`InputAction` / `run_command` 已有）；
+- `DrawnRow` 的可见性辅助（`effective_clip` 非空）与行文本/高亮读回扩展；
+- `RequestRedraw` / 脏区门控（本设计明确不做）。
 
 ### 验收口径
 

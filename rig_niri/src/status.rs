@@ -10,23 +10,34 @@
 //!
 //! | 上游 | 这里 | 说明 |
 //! |---|---|---|
-//! | `StatusSources::line`（`:400`） | [`status_rows`] | 合并顺序 `AppStatus`、agent 自己的、运行中 turn 的（上游 `:413`），`[status] hide` 过滤（`:409`），没有 agent 时补 `no agent`（`:406`） |
+//! | `StatusSources::line`（`:400`） | [`status_rows`] / [`status_line_row`] | 合并顺序 `AppStatus`、agent 自己的、运行中 turn 的（上游 `:413`），`[status] hide` 过滤（`:409`），没有 agent 时补 `no agent`（`:406`） |
 //! | `no agent` 占位（`:406`） | [`no_agent_item`] | 名字 `agent`、左、`order` 30（model 那一格）、`keep` `u8::MAX`、`Tone::Dim` |
-//! | turn 的 items（`:404`） | [`status_rows`] | 从 `ShownAgent` 指向的 agent 上的 `ActiveTurn` 找到 turn 实体，再取它的 `StatusItems` |
+//! | turn 的 items（`:404`） | [`merged_status_items`] | 从 `ShownAgent`（或 `StatusLine.agent`）指向的 agent 上的 `ActiveTurn` 找到 turn 实体，再取它的 `StatusItems` |
 //! | `StatusSettings.hide`（`:272`） | [`StatusSettings`] | `[status] hide`；只在装配层已有 `rig_harness::prelude::Settings` 时读（可选依赖），没有就全显示 |
 //! | `StatusParts` / `AppStatusPartsExt`（`:329`/`:347`） | [`StatusParts`] / [`AppStatusPartsExt`] | 最小可用版：资源里存画出来的条目，同名替换、空文本隐藏；不逐字照抄上游“只记名字给 `/plugins`”的元数据语义 |
-//! | `StatusLine` 组件（`:382`） | 切片 2（设计见 `docs/design/PANEL_CANVAS.md` §3.5） | 组件/绘制都还没写 |
+//! | `StatusLine` 组件（`:382`） | [`StatusLine`] + [`draw_status_lines`] | **切片 2 已实现（2026-11-26）**：挂在任意面板根上，在面板底部画一条绝对定位状态行；不是 `PanelId::Status` 专用 |
 //! | `StatusSystems::{Show, Edit}`（`:216`） | 不做 | 见下面“没做的部分” |
+//!
+//! ## `StatusLine`：任意面板底部一条
+//!
+//! `StatusLine` 是 `TuiPanel` 的兄弟组件（上游 `status.rs:382`）：任意实体挂上就
+//! 在面板底部画一条状态行，`agent = None` 跟 `ShownAgent`，`Some(agent)` 画指定
+//! agent 的条目。我们的实现：
+//!
+//! * 复用 [`merged_status_items`] + [`status_line_row`]（`status_rows` 和它走同一
+//!   份合并/裁剪），不复制来源规则；
+//! * 画成面板根下一个**绝对定位的底部子节点**（`bottom: 0`，高 [`ROW_HEIGHT`]），
+//!   不写 `PanelRows`、不进 `sync_panels` 的行 diff，所以插件自己的 flex 子树和
+//!   内置行同步都不被打乱；
+//! * 输入框（`PanelId::Input`）上挂时同样贴底——就是编辑器底行（上游语义是
+//!   “编辑器在自己的底行画”，不额外占一行；我们不改 `editor.rs`，用绝对定位
+//!   盖在底行上，面板高度/行数/树都不变）；
+//! * 宽度取面板这一帧 [`PanelArea::cols`]，裁剪仍由 `rig_tui::status::line` 做；
+//! * 多个面板各画各的、互不影响；不挂就不画。`PanelId::Status` 的主状态行仍然
+//!   由 [`status_rows`] 写行，行为一个字节不变。
 //!
 //! ## 没做的部分
 //!
-//! * **`StatusLine` 组件**：上游它是 `TuiPanel` 的兄弟组件，任意实体挂上就在自己
-//!   `PanelCanvas` 的一行里画一条（可以是别的 agent 的）。切片 1 的
-//!   [`crate::panel`] 已经让插件能拿到任意面板根；切片 2 会在这个根上挂
-//!   `StatusLine` 组件，并在面板底部画一个绝对定位的状态行子节点（复用本模块的
-//!   来源合并/裁剪，不复制逻辑，见 `docs/design/PANEL_CANVAS.md` §3.5）。所以
-//!   状态行仍然只有 [`PanelId::Status`] 一条，也还没有 `StatusLine.agent` 的
-//!   “画别的 agent”入口。
 //! * **`StatusSystems::{Show, Edit}` 阶段**：上游的状态行条目是**缓存**在
 //!   `StatusItems` 组件里、由插件在 `PostUpdate` 按阶段写，视图最后再画；我们的
 //!   状态行每帧在 [`crate::FeathersSystems::Draw`] 里从 `AppStatus` / agent / turn
@@ -34,7 +45,10 @@
 //!   [`AppStatusPartsExt`] 或直接写 `AppStatus`，先后顺序不影响结果，因此不需要
 //!   两个阶段。等以后有插件需要在“所有 Show 之后统一 Edit”时再加也不迟。
 
+use std::collections::{HashMap, HashSet};
+
 use bevy::prelude::*;
+use bevy_ui::px;
 use rig_ecs::agent::ActiveTurn;
 use rig_harness::prelude::{AppSettingsExt, Settings, ShownAgent};
 use rig_tui::ratatui::style::Style;
@@ -44,7 +58,8 @@ use serde::Deserialize;
 
 use crate::frame::{PanelAreas, PanelRoots};
 use crate::panels::{KeyedRow, PanelId, PanelRows};
-use crate::transcript::Row;
+use crate::transcript::{ROW_HEIGHT, Row, TranscriptFont};
+use crate::workspaces::WorkspacePanels;
 
 /// `[status]` 在 `settings.toml` 里的段名。
 pub const SECTION: &str = "status";
@@ -81,6 +96,90 @@ impl StatusSettings {
 /// 表示状态行再窄也留着它。
 pub fn no_agent_item() -> StatusItem {
     StatusItem::new("agent", Side::Left, 30, u8::MAX).says("no agent", Tone::Dim)
+}
+
+/// 挂在任意面板根上：这块面板底部画一条状态行（切片 2）。
+///
+/// 内容与内置 [`PanelId::Status`](crate::panels::PanelId::Status) 完全同源：
+/// `AppStatus`、agent / 运行中 turn 的 `StatusItems`、[`StatusParts`]、
+/// `[status] hide`，最后交给 `rig_tui::status::line` 按宽度裁剪（见
+/// [`merged_status_items`] / [`status_line_row`]）。挂哪块面板画哪块，多个面板
+/// 各画各的；不挂就不画。
+///
+/// 状态行是面板根下一个**绝对定位的底部子节点**：不占 flex 行、不写
+/// [`PanelRows`](crate::panels::PanelRows)，所以插件自己的子树和内置的行同步都
+/// 不受影响。输入框（[`PanelId::Input`](crate::panels::PanelId::Input)）上挂时它
+/// 就落在编辑器底行——上游语义是“编辑器在自己的底行画状态”，不额外占一行。
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusLine {
+    /// 画哪个 agent 的条目；`None` = 当前 `ShownAgent`（上游同义）。
+    pub agent: Option<Entity>,
+}
+
+/// 一条 [`StatusLine`] 生成出来的底部子节点（增量更新用）。
+///
+/// 只由 [`draw_status_lines`] 维护；`hash` 没变时不会重建文字节点。
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusLineRow {
+    /// 它挂在哪个面板根上。
+    pub panel: Entity,
+    /// 这一帧内容的 hash（文本 + 样式 + 左右段）。
+    pub hash: u64,
+}
+
+/// 状态行的来源合并：`AppStatus` → agent 自己的 → 运行中 turn 的 →
+/// [`StatusParts`] 覆盖 → `[status] hide` → 没有 agent 时补 `no agent`。
+///
+/// 这是 [`status_rows`] 和 [`draw_status_lines`] 共用的**唯一**一份来源规则；
+/// `own` / `turn` 由调用方按 `agent` 查好传进来（没有 agent 时传 `None`）。
+pub fn merged_status_items(
+    agent: Option<Entity>,
+    app_status: Option<&AppStatus>,
+    own: Option<&StatusItems>,
+    turn: Option<&StatusItems>,
+    parts: Option<&StatusParts>,
+    settings: Option<&StatusSettings>,
+) -> Vec<StatusItem> {
+    let mut items: Vec<StatusItem> = Vec::new();
+    if let Some(app) = app_status {
+        items.extend(app.0.iter().cloned());
+    }
+    if agent.is_some() {
+        // agent 自己的 items，再是它运行中 turn 的（上游 `:402`-`:404`）。
+        if let Some(own) = own {
+            items.extend(own.iter().cloned());
+        }
+        if let Some(turn) = turn {
+            items.extend(turn.iter().cloned());
+        }
+    }
+    // `StatusParts` 覆盖同名条目（上游 `StatusItems::show`：先 hide 再 push；
+    // 空文字只 hide 不画）。放在 `hide` 过滤之前，所以被设置隐藏的部分也不画。
+    if let Some(parts) = parts {
+        for part in parts.iter() {
+            items.retain(|item| item.name != part.name());
+            if !part.item.text.is_empty() {
+                items.push(part.item.clone());
+            }
+        }
+    }
+    if let Some(settings) = settings {
+        items.retain(|item| !settings.hidden(item.name));
+    }
+    // 没有 agent 时在 model 那一格画 `no agent`（上游 `:406`）。
+    if agent.is_none() {
+        items.push(no_agent_item());
+    }
+    items
+}
+
+/// 把条目裁成左/右两条：直接复用 `rig_tui::status::line`（丢/缩规则与终端一致）。
+pub fn status_line_row(
+    items: &[StatusItem],
+    width: u16,
+) -> (Line<'static>, Option<Line<'static>>) {
+    let (left, right) = rig_tui::status::line(items.iter(), width);
+    (left, (right.width() > 0).then_some(right))
 }
 
 /// 状态行的一部分：画出来的条目 + 给 `/plugins` 之类看的短标签。
@@ -194,42 +293,21 @@ pub fn status_rows(
     areas: Option<Res<PanelAreas>>,
     roots: Option<Res<PanelRoots>>,
 ) {
-    // 显示的 agent：上游 `status.agent.or(self.shown.0)`；我们没有 `StatusLine`
-    // 组件，所以只有 `ShownAgent` 一个来源。
+    // 显示的 agent：上游 `status.agent.or(self.shown.0)`；内置状态行没有
+    // `StatusLine` 组件，所以只有 `ShownAgent` 一个来源。
     let agent = shown.as_ref().and_then(|shown| shown.0);
-
-    let mut items: Vec<StatusItem> = Vec::new();
-    if let Some(app) = &app_status {
-        items.extend(app.0.iter().cloned());
-    }
-    if let Some(agent) = agent {
-        // agent 自己的 items，再是它运行中 turn 的（上游 `:402`-`:404`）。
-        if let Ok(own) = status_items.get(agent) {
-            items.extend(own.iter().cloned());
-        }
-        if let Ok(turn) = turns.get(agent) {
-            if let Ok(turn_items) = status_items.get(turn.turn()) {
-                items.extend(turn_items.iter().cloned());
-            }
-        }
-    }
-    // `StatusParts` 覆盖同名条目（上游 `StatusItems::show`：先 hide 再 push；
-    // 空文字只 hide 不画）。放在 `hide` 过滤之前，所以被设置隐藏的部分也不画。
-    if let Some(parts) = &parts {
-        for part in parts.iter() {
-            items.retain(|item| item.name != part.name());
-            if !part.item.text.is_empty() {
-                items.push(part.item.clone());
-            }
-        }
-    }
-    if let Some(settings) = &settings {
-        items.retain(|item| !settings.hidden(item.name));
-    }
-    // 没有 agent 时在 model 那一格画 `no agent`（上游 `:406`）。
-    if agent.is_none() {
-        items.push(no_agent_item());
-    }
+    let own = agent.and_then(|agent| status_items.get(agent).ok());
+    let turn = agent
+        .and_then(|agent| turns.get(agent).ok())
+        .and_then(|turn| status_items.get(turn.turn()).ok());
+    let items = merged_status_items(
+        agent,
+        app_status.as_deref(),
+        own,
+        turn,
+        parts.as_deref(),
+        settings.as_deref(),
+    );
     if items.is_empty() {
         panels.set(PanelId::Status, Vec::new());
         return;
@@ -240,9 +318,9 @@ pub fn status_rows(
         .and_then(|root| areas.as_ref().and_then(|areas| areas.get(root)))
         .map_or(DEFAULT_WIDTH, |area| area.cols);
     // rig-tui 的裁剪：左边一条、右边一条，丢/缩按 keep 与 min_width。
-    let (left, right) = rig_tui::status::line(items.iter(), width);
+    let (left, right) = status_line_row(&items, width);
     let mut row = Row::new(left);
-    if right.width() > 0 {
+    if let Some(right) = right {
         row = row.with_right(right);
     }
     let line = row.line.clone();
@@ -260,6 +338,137 @@ pub fn status_rows(
         PanelId::Status,
         vec![KeyedRow { key: 1, hash, row }],
     );
+}
+
+/// 给每块挂了 [`StatusLine`] 的面板画底部状态行（切片 2）。
+///
+/// 来源/裁剪与 [`status_rows`] 完全同源（[`merged_status_items`] +
+/// [`status_line_row`]），只是目标不是 `PanelRows`，而是面板根下一个**绝对定位
+/// 的底部子节点**：`bottom: 0`、高 [`ROW_HEIGHT`]、左右贴内容区。
+///
+/// * 不挂 `StatusLine` 的面板一个节点都不多——内置 `PanelId::Status` 的主状态行
+///   仍由 [`status_rows`] 写行，行为不变；
+/// * 输入框上挂时它就在编辑器底行（绝对定位盖在底行上，不占 flex 行、不改面板
+///   高度，也不往 `PanelRows[Input]` 里写东西）；
+/// * 面板宽度取这一帧的 `PanelArea.cols`（优先本工作区的，旧单屏路径退回全局
+///   `PanelAreas`），宽度变化时重新裁剪；
+/// * 内容 hash 没变就不重建文字；`StatusLine` 被摘掉/面板被 despawn 时清掉遗留行。
+///
+/// 排在 `PanelsPlugin` 的行同步之后（`publish_focused_spawned` 是那条链的末尾），
+/// 所以第一帧就能看到本帧的行/区域；只改自己 spawn 的底部子节点，不和行 diff
+/// 抢同一批实体。
+#[allow(clippy::too_many_arguments)]
+fn draw_status_lines(
+    mut commands: Commands,
+    lines: Query<(Entity, &StatusLine, Option<&crate::workspaces::WorkspacePanel>)>,
+    existing: Query<(Entity, &StatusLineRow)>,
+    app_status: Option<Res<AppStatus>>,
+    shown: Option<Res<ShownAgent>>,
+    status_items: Query<&StatusItems>,
+    turns: Query<&ActiveTurn>,
+    parts: Option<Res<StatusParts>>,
+    settings: Option<Res<StatusSettings>>,
+    areas: Option<Res<PanelAreas>>,
+    workspaces: Query<&WorkspacePanels>,
+    font: Option<Res<TranscriptFont>>,
+    theme: Option<Res<crate::theme::Theme>>,
+) {
+    let default_font = bevy::text::FontSource::default();
+    let font = font
+        .as_deref()
+        .map(|font| font.0.clone())
+        .unwrap_or(default_font);
+    let theme = theme.map(|theme| *theme.as_ref()).unwrap_or_default();
+    let shown = shown.as_deref().and_then(|shown| shown.0);
+
+    let alive: HashSet<Entity> = lines.iter().map(|(entity, _, _)| entity).collect();
+    let mut rows: HashMap<Entity, (Entity, u64)> = existing
+        .iter()
+        .map(|(entity, row)| (row.panel, (entity, row.hash)))
+        .collect();
+
+    for (panel, status_line, tag) in &lines {
+        // 面板这一帧的区域：本工作区的权威快照优先，旧单屏路径退回全局。
+        let area = tag
+            .and_then(|tag| workspaces.get(tag.0).ok())
+            .and_then(|panels| panels.areas.get(&panel).copied())
+            .or_else(|| areas.as_ref().and_then(|areas| areas.get(panel)));
+        let Some(area) = area else {
+            continue;
+        };
+        // `StatusLine.agent` 覆盖 `ShownAgent`（上游 `status.agent.or(shown)`）。
+        let agent = status_line.agent.or(shown);
+        let own = agent.and_then(|agent| status_items.get(agent).ok());
+        let turn = agent
+            .and_then(|agent| turns.get(agent).ok())
+            .and_then(|turn| status_items.get(turn.turn()).ok());
+        let items = merged_status_items(
+            agent,
+            app_status.as_deref(),
+            own,
+            turn,
+            parts.as_deref(),
+            settings.as_deref(),
+        );
+        let existing = rows.remove(&panel);
+        if items.is_empty() {
+            // 条目全被 hide 掉：不画空行（和 `status_rows` 写空行同义）。
+            if let Some((row, _)) = existing {
+                commands.entity(row).despawn();
+            }
+            continue;
+        }
+        let (left, right) = status_line_row(&items, area.cols);
+        let mut row = Row::new(left);
+        if let Some(right) = right {
+            row = row.with_right(right);
+        }
+        let hash = crate::transcript::row_hash(&row);
+        match existing {
+            Some((_, old_hash)) if old_hash == hash => {}
+            Some((row_entity, _)) => {
+                crate::transcript::fill_row_text_themed(
+                    &mut commands,
+                    row_entity,
+                    &row,
+                    &font,
+                    &theme,
+                );
+                commands.entity(row_entity).insert(StatusLineRow { panel, hash });
+            }
+            None => {
+                let mut spawned = None;
+                commands.entity(panel).with_children(|parent| {
+                    spawned =
+                        Some(crate::transcript::spawn_row_themed(parent, &row, &font, &theme));
+                });
+                if let Some(row_entity) = spawned {
+                    commands.entity(row_entity).insert(StatusLineRow { panel, hash });
+                    // 贴底、脱离 flex：面板根的 `justify_content`/行数都不受影响。
+                    commands
+                        .entity(row_entity)
+                        .entry::<Node>()
+                        .and_modify(|mut node| {
+                            node.position_type = PositionType::Absolute;
+                            node.left = px(0.0);
+                            node.right = px(0.0);
+                            node.top = Val::Auto;
+                            node.bottom = px(0.0);
+                            node.width = Val::Auto;
+                            node.height = px(ROW_HEIGHT);
+                            node.flex_shrink = 0.0;
+                        });
+                }
+            }
+        }
+    }
+
+    // `StatusLine` 被摘掉（或面板被 despawn）之后，别留下孤儿底部行。
+    for (panel, (row, _)) in rows {
+        if !alive.contains(&panel) {
+            commands.entity(row).despawn();
+        }
+    }
 }
 
 /// 注册状态行：`AppStatus` / `StatusParts` / `[status]` 设置资源 + 每帧把条目
@@ -283,6 +492,15 @@ impl Plugin for StatusPlugin {
             app.init_resource::<StatusSettings>();
         }
         app.add_systems(Update, status_rows.in_set(crate::FeathersSystems::Draw));
+        // 切片 2：任意面板的底部状态行。排在 `PanelsPlugin` 行同步链的末尾之后，
+        // 这样本帧的 `PanelArea` / 行都已在位；只装 `StatusPlugin` 的 App 没有
+        // 那条链时，这个 ordering 只是一个空依赖，不影响运行。
+        app.add_systems(
+            Update,
+            draw_status_lines
+                .after(crate::workspaces::publish_focused_spawned)
+                .in_set(crate::FeathersSystems::Render),
+        );
     }
 }
 

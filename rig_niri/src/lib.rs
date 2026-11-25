@@ -122,22 +122,24 @@ pub mod prelude {
     };
     pub use crate::panels::{KeyedRow, PanelId, PanelRows, PanelRoots, PluginPanel};
     pub use crate::panel::{
-        DrawnRow, PanelRegistry, PanelRegistryExt, add_panel_column, drawn_row, drawn_rows,
-        reveal_panel_column,
+        ActivePanelColumn, DrawnRow, PanelAuto, PanelRegistry, PanelRegistryExt, PanelSpec,
+        add_panel_column, add_panel_everywhere, apply_auto_panels, clear_panel_column_focus,
+        drawn_row, drawn_rows, focus_panel_column, remove_panel_column, remove_panel_everywhere,
+        reveal_panel_column, unregister_panel,
     };
     pub use crate::workspaces::{
         ColumnBounds, WORKSPACE_GAP, Workspace, WorkspaceDrag, WorkspacePanel, WorkspacePanels,
         WorkspaceScroll, WorkspaceScrollFocus, WorkspaceSet, WorkspacesPlugin, active_panel,
-        arrange_workspaces, clamp_scroll, column_bounds, drag_workspace, drag_world_delta,
-        focus_workspace, place_workspace, scroll_by, scroll_to_visible, spawn_workspace,
-        spawn_workspace_with_tree, workspace_step, workspace_strip_height,
+        active_panel_with_plugin, arrange_workspaces, clamp_scroll, column_bounds, drag_workspace,
+        drag_world_delta, focus_workspace, place_workspace, scroll_by, scroll_to_visible,
+        spawn_workspace, spawn_workspace_with_tree, workspace_step, workspace_strip_height,
     };
     pub use crate::transcript::{Below, BelowSeen, BlockId, Slot, TextId, Transcript};
     pub use crate::batch::{CallFact, CallHistory};
     pub use crate::niri::{Column, Layer, PresetSize, Tile, TileRect, Tiling, TilingPlugin};
     pub use crate::spatial::{Card, CardContent, CardLook, Funnel, SpatialFocus, spawn_card};
     pub use crate::status::{
-        AppStatusPartsExt, StatusPart, StatusParts, StatusPlugin, StatusSettings,
+        AppStatusPartsExt, StatusLine, StatusPart, StatusParts, StatusPlugin, StatusSettings,
     };
     pub use crate::theme::Theme;
     pub use crate::title::WindowTitle;

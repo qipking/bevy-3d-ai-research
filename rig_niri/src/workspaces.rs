@@ -78,6 +78,7 @@ use crate::layout;
 use crate::niri::TileRect;
 use crate::panels::{PanelId, PanelRoots, PanelRows, PanelSpawned};
 use crate::pane::ActiveTranscript;
+use crate::panel::ActivePanelColumn;
 use crate::picker::PickerInput;
 use crate::FeathersSystems;
 
@@ -325,8 +326,25 @@ pub fn column_bounds(
 /// 活动列是**哪块面板**所在的列：picker 打开时是列表那一列，否则是活动
 /// 转写根（[`ActiveTranscript`]）所在的列；解析不出来时退回主转写。
 pub fn active_panel(roots: &PanelRoots, active_root: Option<Entity>, picker_open: bool) -> PanelId {
+    active_panel_with_plugin(roots, active_root, picker_open, None)
+}
+
+/// [`active_panel`] 的切片 2 版本：除了 picker / `ActiveTranscript`，还认一个
+/// **插件列焦点**（[`ActivePanelColumn`]）。
+///
+/// 优先级：picker 打开时 picker 列表列（现有语义不变）→ 插件列（只在它的根
+/// 还在当前工作区根表里时）→ `ActiveTranscript` 的转写窗格 → 主转写。
+pub fn active_panel_with_plugin(
+    roots: &PanelRoots,
+    active_root: Option<Entity>,
+    picker_open: bool,
+    plugin: Option<PanelId>,
+) -> PanelId {
     if picker_open {
         return PanelId::List;
+    }
+    if let Some(panel) = plugin.filter(|panel| roots.entity(*panel).is_some()) {
+        return panel;
     }
     active_root
         .and_then(|root| {
@@ -389,6 +407,7 @@ fn scroll_active_column(
     set: Option<Res<WorkspaceSet>>,
     frame: Option<Res<FrameSize>>,
     active: Option<Res<ActiveTranscript>>,
+    active_column: Option<Res<ActivePanelColumn>>,
     picker: Option<Res<PickerInput>>,
     mut focus: ResMut<WorkspaceScrollFocus>,
     mut workspaces: Query<(
@@ -405,6 +424,7 @@ fn scroll_active_column(
         .as_deref()
         .is_some_and(|picker| picker.column.is_some());
     let active_root = active.as_deref().and_then(|active| active.0);
+    let active_column = active_column.as_deref();
     let frame_key = (frame.cols, frame.rows);
     let frame_changed = focus.last_frame != Some(frame_key);
     focus.last_frame = Some(frame_key);
@@ -412,8 +432,9 @@ fn scroll_active_column(
     let focused_key = set.focused.and_then(|entity| {
         let (_, panels, _) = workspaces.get(entity).ok()?;
         let roots = panels.map(|panels| &panels.roots);
+        let plugin = active_column.and_then(|active| active.plugin_for(entity)).map(|panel| panel.id());
         let panel = roots
-            .map(|roots| active_panel(roots, active_root, picker_open))
+            .map(|roots| active_panel_with_plugin(roots, active_root, picker_open, plugin))
             .unwrap_or(PanelId::Transcript);
         Some(ActiveColumnKey {
             workspace: entity,
@@ -612,6 +633,7 @@ fn column_workspace_keys(
     set: Option<Res<WorkspaceSet>>,
     frame: Option<Res<FrameSize>>,
     active: Option<Res<ActiveTranscript>>,
+    active_column: Option<Res<ActivePanelColumn>>,
     picker: Option<Res<PickerInput>>,
     mut frame_tree: Option<ResMut<FrameTree>>,
     mut workspaces: Query<(
@@ -650,8 +672,12 @@ fn column_workspace_keys(
         .as_deref()
         .is_some_and(|picker| picker.column.is_some());
     let active_root = active.as_deref().and_then(|active| active.0);
+    let plugin = active_column
+        .as_deref()
+        .and_then(|active| active.plugin_for(focused))
+        .map(|panel| panel.id());
     let panel = panels
-        .map(|panels| active_panel(&panels.roots, active_root, picker_open))
+        .map(|panels| active_panel_with_plugin(&panels.roots, active_root, picker_open, plugin))
         .unwrap_or(PanelId::Transcript);
     let viewport = f32::from(frame.cols) * CELL.x;
 
@@ -1553,7 +1579,6 @@ fn drag_workspaces(
     });
 }
 
-
 /// 工作区插件：启动收编 + 聚焦装载 + 新面板打标签 + L3/L4 横向滚动与列操作。
 ///
 /// L3 的三条系统（均只改 [`WorkspaceScroll`]）：
@@ -1592,6 +1617,8 @@ impl Plugin for WorkspacesPlugin {
         )
         .init_resource::<WorkspaceSet>()
         .init_resource::<LoadedFocus>()
+        // 切片 2：插件列焦点（`ActiveTranscript` 之外的另一个焦点）。
+        .init_resource::<ActivePanelColumn>()
         // 第 3 批：拖拽状态（中键 / Alt+左键，见 `drag_workspaces`）。
         .init_resource::<WorkspaceDrag>()
         // L3：活动列快照 + picker 打开/关闭的滚动请求。
@@ -1607,6 +1634,15 @@ impl Plugin for WorkspacesPlugin {
         .add_systems(
             Update,
             apply_focus.in_set(FeathersSystems::Prepare),
+        )
+        // 切片 2：把注册表里“自动装进所有工作区”的面板补齐到每个工作区
+        // （已有工作区 + 之后 spawn 的工作区）。exclusive system：要 &mut World
+        // 调 `panel::add_panel_column`；排在 `apply_focus` 之后，全局代理已就位。
+        .add_systems(
+            Update,
+            crate::panel::apply_auto_panels
+                .in_set(FeathersSystems::Prepare)
+                .after(apply_focus),
         )
         // 第 3 批：拖动工作区（世界坐标由 `drag_world_delta` 从屏幕位置反算）。
         .add_systems(

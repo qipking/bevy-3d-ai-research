@@ -18,7 +18,8 @@
 > 所有条目都能用 `grep`/`read` 复现（PARITY §6 有命令）。
 
 **现在的分布**：已完成 5 项（#1 #2 #3 #5 #7）；部分完成 3 项（#4 #8 #9）；
-未开始 2 项（#6 #10）；UI 重组（feathers）另见 §11（F10 已完成，F6 切片 2/F7–F9 未开始）。
+未开始 2 项（#6 #10，其中 #10 只剩插件命令绑定）；UI 重组（feathers）另见 §11
+（F6 切片 1/2、F10 已完成，F7–F9 未开始）。
 
 ---
 
@@ -357,47 +358,61 @@
 
 ## 10. 插件扩展点：画自己的面板、自己的状态行、绑命令、读"画了什么"
 
-- **状态（2026-11-26）**：**面板注册 + 条带列 + 行读回已完成（切片 1）**，设计见
-  [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)。插件现在能
-  `app.register_panel("git")` 拿 `PluginPanel` 句柄、用
-  `add_panel_column(world, workspace, handle, fraction)` 把它作为 `Fraction` 列放进指定
-  工作区的条带、拿根实体 spawn `Node`/`Text`/`ImageNode`（3D 镜像直接可见），并用
-  `drawn_row(world, workspace, panel, n)` 读回第 n 行的世界矩形。内置 `PanelId` 面板的
-  行为/几何不变（`rig_niri` lib 测试 580 → 587）。
-- **还没做**：`StatusLine` 组件（任意面板底部一条状态行）留在切片 2；活动列/自动滚动、
-  “注册后自动装进所有工作区”的策略、插件命令绑定入口也未做。
+- **状态（2026-11-26）**：**切片 1 + 切片 2 已完成**，设计见
+  [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)。插件现在能：
+  - `app.register_panel("git")` / `register_panel_with("git", PanelSpec::everywhere(0.28))`
+    拿 `PluginPanel` 句柄；
+  - 用 `add_panel_column(world, workspace, handle, fraction)` 把面板作为 `Fraction` 列
+    放进指定工作区，或用 `PanelAuto::AllWorkspaces` 自动装进**所有**工作区（之后新建的
+    工作区也带）；
+  - `remove_panel_column` / `remove_panel_everywhere` / `unregister_panel` 摘列/注销，
+    只动包含该面板的那一列（已有列宽不变）；
+  - 拿根实体 spawn `Node`/`Text`/`ImageNode`（3D 镜像直接可见），并用
+    `drawn_row(world, workspace, panel, n)` 读回第 n 行的世界矩形；
+  - 给**任意面板根**（内置 `PanelId` 或插件面板）挂 `status::StatusLine`，在底部画一条
+    与 `PanelId::Status` 同源的状态行（输入框上落在编辑器底行、不额外占行）；
+  - 用 `focus_panel_column` 让插件列成为活动列（`ActiveTranscript` 之外的另一个焦点），
+    `scroll_active_column` / 改宽 / 移动列键都认它；picker 开列/关列与它共存。
+  内置 `PanelId` 面板的行为/几何不变（`rig_niri` lib 测试 595 → 602）。
+- **还没做**：
+  - 插件**命令绑定**的公开入口（注册表 + 默认键位；`InputAction` / `KeyBinding` /
+    `run_command` 已有，缺的是“插件注册自己的命令 + 默认键”的 API）；
+  - `DrawnRow` 的可见性辅助（`effective_clip` 非空）与行文本/高亮的读回扩展；
+  - `RequestRedraw` / `RedrawArea` / `TuiFrame` 门控（[`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md) §4
+    明确不做：3D 每帧重排 + 每帧镜像，没有省一帧的收益）。
 - **上游 API / 我们的落点**：上游 `panel::{TuiPanel, PanelCanvas, RequestRedraw, RedrawArea}`
   （`reference/.../panel.rs:106`/`:160`/`:82`/`:91`）、
   `status::{StatusLine, StatusParts, AppStatusPartsExt}`（同目录 `status.rs:382`/`:296`/`:329`）、
   `render::TuiFrame`（`render.rs:1196`）、`view::DrawnTranscript`（`view.rs:316`）、
   `keys::run_command`（`keys.rs:455`）、`add_view`（`lib.rs:260`）。我们：`PanelId` 仍是
   内置封闭枚举，但多了一个 `PanelId::Plugin(PluginPanel)` 变体（`panels.rs:66`），
-  插件身份/注册/放置/读回在 `rig_niri/src/panel.rs`；状态行仍只有固定
-  `PanelId::Status`（每帧在 `status_rows` `status.rs:186` 里现算），插件能加**条目**
-  （`StatusParts` `:113`）但不能给任意面板挂 `StatusLine`；`TuiFrame`/`DrawnTranscript`
-  没有移植（3D 里读回是 `DrawnRow` 的世界矩形，不需要终端屏幕格），也没有
-  `RequestRedraw` 门控（bevy_ui + `sync_mirror` 每帧重排）；`run_command` 已移植
-  （`keys.rs:488`）；`BatchPlugin` 仍要应用层手动加（`lib.rs:239`–`:256` 的插件元组里没有，
+  插件身份/注册/放置/读回/列表策略在 `rig_niri/src/panel.rs`；任意面板的状态行在
+  `status.rs::StatusLine` + `draw_status_lines`（与 `status_rows` 共用
+  `merged_status_items` / `status_line_row`）；`TuiFrame`/`DrawnTranscript` 没有移植
+  （3D 里读回是 `DrawnRow` 的世界矩形，不需要终端屏幕格），也没有 `RequestRedraw` 门控
+  （bevy_ui + `sync_mirror` 每帧重排）；`run_command` 已移植（`keys.rs:488`）；
+  `BatchPlugin` 仍要应用层手动加（`lib.rs:239`–`:256` 的插件元组里没有，
   `rig_harness_in_3d/src/main.rs:68` 自己加）。
-- **工作量**：切片 1 已完成；**切片 2 约 M**（`StatusLine` S/M + 注册策略 S + 活动列 S/M +
-  命令绑定 M）。不需要“`PanelId` → 实体标识”的架构改写了：`PanelId::Plugin` 只扩了一个变体，
+- **工作量**：切片 1/2 已完成；**只剩命令绑定 M**（读回可见性辅助 S 可选，不阻塞）。
+  不需要“`PanelId` → 实体标识”的架构改写了：`PanelId::Plugin` 只扩了一个变体，
   `layout`/`frame`/`workspaces` 的键空间原样复用。
-- **依赖**：`StatusLine` 依赖现在这套面板画布（根/区域/行），无 §6 依赖；命令绑定独立；
-  `DrawnRow` 的几何只依赖 `RowLayout` + `PanelAreas`（已有）。
+- **依赖**：`StatusLine`/自动工作区/活动列都依赖现有面板画布（根/区域/行/树），
+  无 §6 依赖；命令绑定独立；`DrawnRow` 的几何只依赖 `RowLayout` + `PanelAreas`（已有）。
 
 
 ---
 
 ## 11. UI 重组（feathers）：F6 以后
 
-> F1–F5 已完成（[`FEATHERS_UI.md`](../design/FEATHERS_UI.md) §2）；**F6 切片 1 已完成**
-> （插件面板注册/条带列/行读回，见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）。
+> F1–F5 已完成（[`FEATHERS_UI.md`](../design/FEATHERS_UI.md) §2）；**F6 切片 1、2 已完成**
+> （插件面板注册/条带列/行读回 + `StatusLine`/自动工作区/活动列，见
+> [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）。
 > 这一节只列**还没做**的候选，不阻塞功能移植。布局的 L1–L5 在
 > [`NIRI_SCROLL.md`](../design/NIRI_SCROLL.md)，L1 进行中，不在本节重复。
 
 | 步 | 内容 | 工作量 | 依赖 / 现状 |
 |---|---|---|---|
-| **F6** | 开放面板画布：**切片 1 已完成（2026-11-26）**——注册表 + `PanelId::Plugin(..)` + `add_panel_column` + `drawn_row`（见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）；**切片 2 未做**：`StatusLine` 组件（任意面板一行状态）、自动装进所有工作区的策略、活动列自动滚动 | **L → 切片 2 M** | 同 §10；切片 1 只扩了 `PanelId` 一个变体，内置面板行为不变（`rig_niri` 580 → 587 测试） |
+| **F6** | 开放面板画布：**切片 1、2 已完成（2026-11-26）**——注册表 + `PanelId::Plugin(..)` + `add_panel_column` + `drawn_row`；切片 2 的 `StatusLine`（任意面板底部状态行、输入框不额外占行）、`PanelAuto::AllWorkspaces` 自动工作区（已有 + 新建）、`remove_panel_*` / `unregister_panel` 整树移除、`ActivePanelColumn` 插件列焦点（见 [`PANEL_CANVAS.md`](../design/PANEL_CANVAS.md)）；**只剩**插件命令绑定入口（§10） | **剩余 M（命令绑定）** | 同 §10；`PanelId` 只扩了一个变体，内置面板行为不变（`rig_niri` lib 595 → 602 测试） |
 | **F7** | 主题切换 UI：`/theme` 与持久化（浅色/高对比），`UiTheme` 已是资源、面板/行/滚动条都按 token 解析（`theme.rs:98`–`:141`、`lib.rs:151`–`:159`），缺入口与 `[view] theme` 设置 | **S** | 无；`Settings`/`add_setting` 的先例已在（`status.rs:64`/`:281`） |
 | **F8** | 3D 镜像图标/图片：feathers 组件里的 `ImageNode` 现在不镜像，按钮只能文字（`FEATHERS_UI.md` §5）；要做就得给 `feathers_in_3d` 加图片/图标层 | **M** | 无；影响所有带图标的 feathers 控件 |
 | **F9** | 过渡/补间：动作现在当帧生效，niri 的 `scroll` 插值与面板切换没有动画 | **S–M** | 依赖 L1/L5；先做 `scroll` 插值再谈按钮过渡 |
@@ -462,6 +477,6 @@
    是最便宜的"看得见"。
 4. **§6 多来源转写**（L）——S1 已完成，S2–S6（`dialogue_batch_of`/`source_rows`/`ShowAgent`/
    `Replaced`/`PastEffects`）是用户能看见的最大一块；§8 的压缩提示等它的 `Replaced`。
-5. **§11 F6 面板画布 + §10 插件扩展点**（L+L）——同一件事的两种说法；
-   F8/F9 视需求插入（F10 的转写选区键盘复制已完成）。
+5. **§11 F6 面板画布 + §10 插件扩展点**（切片 1/2 已完成，剩命令绑定 M）——
+   同一件事的两种说法；F8/F9 视需求插入（F10 的转写选区键盘复制已完成）。
 
