@@ -62,6 +62,7 @@ use std::path::PathBuf;
 use bevy::ecs::entity_disabling::Disabled;
 use bevy::prelude::*;
 use bevy::text::FontSource;
+use bevy_window::FileDragAndDrop;
 use feathers_in_3d::FeathersIn3dPlugin;
 use rig_ecs::prelude::Notice;
 use rig_niri::{editor, pane, transcript};
@@ -304,6 +305,9 @@ impl Plugin for HarnessExtPlugin {
             .init_resource::<rig_niri::panels::PanelRows>()
             .init_resource::<transcript::Transcript>()
             .init_resource::<rig_tui::AppStatus>()
+            // 窗口拖入：真实 App 由 `WindowPlugin` 注册，headless 测试和单独
+            // 用本插件时也得有这个消息资源，系统才不会被参数校验跳过。
+            .add_message::<FileDragAndDrop>()
             .add_command("hello", "Say hello", hello)
             .add_command(
                 "setting",
@@ -332,6 +336,12 @@ impl Plugin for HarnessExtPlugin {
                 status::apply_view_settings
                     .in_set(rig_niri::FeathersSystems::Draw)
                     .after(rig_niri::status::status_rows),
+            )
+            // 拖进窗口的图片文件 -> 输入框里的 `@path`（和输入按键同在
+            // Prepare 阶段，只读消息队列，不碰键位）。
+            .add_systems(
+                Update,
+                drop_image_files.in_set(rig_niri::FeathersSystems::Prepare),
             );
     }
 }
@@ -360,6 +370,29 @@ fn run_typed_prompts(
             continue;
         };
         commands.trigger(RunCommand::new(agent, line.trim()));
+    }
+}
+
+/// 把拖进窗口的图片文件变成输入框里的 `@path`。
+///
+/// 读 bevy 的 [`FileDragAndDrop::DroppedFile`] 消息：图片扩展名由
+/// [`rig_niri::clipboard::dropped_file_text`] 判断（非图片返回 `None`，
+/// 这里静默忽略）。没有 [`Editor`] 资源（例如只装本扩展的 headless App）
+/// 时也什么都不做，不 panic。
+pub fn drop_image_files(
+    mut dropped: MessageReader<FileDragAndDrop>,
+    mut editor: Option<ResMut<rig_niri::editor::Editor>>,
+) {
+    for file in dropped.read() {
+        let Some(editor) = editor.as_mut() else {
+            continue;
+        };
+        let FileDragAndDrop::DroppedFile { path_buf, .. } = file else {
+            continue;
+        };
+        if let Some(text) = rig_niri::clipboard::dropped_file_text(path_buf) {
+            editor.insert(&text);
+        }
     }
 }
 
@@ -862,6 +895,52 @@ mod tests {
         for fake in ["312 tokens", "ctx 12%", "no model"] {
             assert!(!all.contains(fake), "演示数据 `{fake}` 不能再出现：{all:?}");
         }
+    }
+
+    // ---- 拖入文件 -> 输入框里的 @path ----
+
+    /// 带输入框资源的 headless App：只装本模板扩展，不建窗口。
+    fn drop_app() -> App {
+        let mut app = headless_app();
+        app.insert_resource(Editor::default());
+        app
+    }
+
+    /// 像 winit 那样写一条文件拖入消息，然后跑一帧。
+    fn drop_file(app: &mut App, path: &str) {
+        app.world_mut()
+            .write_message(FileDragAndDrop::DroppedFile {
+                window: Entity::PLACEHOLDER,
+                path_buf: PathBuf::from(path),
+            });
+        app.update();
+    }
+
+    #[test]
+    fn dropping_an_image_file_inserts_an_attachment() {
+        let mut app = drop_app();
+        drop_file(&mut app, "/tmp/shot.png");
+        assert_eq!(app.world().resource::<Editor>().text(), "@/tmp/shot.png");
+    }
+
+    #[test]
+    fn dropping_a_non_image_file_is_ignored() {
+        let mut app = drop_app();
+        drop_file(&mut app, "/tmp/notes.txt");
+        assert!(
+            app.world().resource::<Editor>().text().is_empty(),
+            "非图片文件不能进输入框"
+        );
+    }
+
+    #[test]
+    fn dropping_a_file_without_an_editor_does_not_panic() {
+        let mut app = headless_app();
+        drop_file(&mut app, "/tmp/shot.png");
+        assert!(
+            app.world().get_resource::<Editor>().is_none(),
+            "测试前提：这个 App 没有 Editor 资源"
+        );
     }
 
     // ---- 输入框 -> 内核：Deliver / RunCommand / AppExit ----

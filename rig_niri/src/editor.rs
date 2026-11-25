@@ -16,6 +16,11 @@
 //! - 非空输入 Enter -> [`rig_ecs::inbox::Deliver`]（[`DeliveryMode::Steer`]）给
 //!   [`ShownAgent`] 指的那个 agent，也就是当前聚焦工作区的 agent；同时本地回显、
 //!   记历史、转写窗格跟着末尾（[`PaneScroll::follow`]）；
+//! - 有未回答的 free-text `Ask`（`free_text && !multiple`）时，Enter **不发送**
+//!   消息，而是用输入框里的文本回答最老的那个（`answer_with_text`，上游
+//!   rig-tui 的 `in_input`/`draft` 语义）；问题第一次成为最老的可作答问题时，
+//!   它的 `initial` 会填进空输入框（只填一次，`seed_initial_answer`）。选项型
+//!   问题（`free_text == false`）不抢 Enter，仍是普通发送；
 //! - turn 跑着时 Tab -> `Deliver`（[`DeliveryMode::Queue`]）；补全列表开着时
 //!   Tab 仍然是接受候选；
 //! - turn 跑着时 Esc -> [`rig_ecs::agent::StopTurn`]；补全列表开着时 Esc 仍然是
@@ -940,14 +945,17 @@ pub fn refuse_ask(ask: Entity, decisions: &mut Query<&mut Decision>) -> bool {
 /// 效应 id 的排最后。确认面板每个 `Ask` 一块，Alt+n 答的是第一块的
 /// 第 n 个选项；点击则可以点任何一块的任何一行。
 fn first_pending_ask(
-    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    asks: &Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
     shown: Option<Entity>,
 ) -> Option<(Entity, Ask)> {
     asks.iter()
-        .filter(|(_, _, _, owner)| {
+        .filter(|(_, _, _, owner, _)| {
             crate::keys::ask_is_visible(shown, owner.map(|ForAgent(owner)| *owner))
         })
-        .min_by_key(|(_, _, effect, _)| {
+        .min_by_key(|(_, _, effect, _, _)| {
             effect
                 .map(Effect::id)
                 .unwrap_or(EffectId::from_raw(u64::MAX))
@@ -955,10 +963,109 @@ fn first_pending_ask(
         .map(|(entity, ask, ..)| (entity, ask.clone()))
 }
 
+/// 输入框里的 Enter 该回答的那个 `Ask`：**最老的、能靠打字作答的问题**。
+///
+/// 范围比 [`first_pending_ask`] 窄：只算 `free_text` 且不是多选
+/// （`!multiple`）的问题——多选的 free-text 是"选项 + 备注"，本前端还没做
+/// （见 `docs/status/REMAINING.md` §5 的"还没做"）。可见性、FIFO（内核效应
+/// id 从老到新，没登记 id 的排最后）与确认 tile / Alt+1..9 完全同一口径，
+/// 所以自由文本问题也按先来先答。
+///
+/// 上游 rig-tui 用 `PickerInput.draft`/`in_input()` 表示"这个问题拿输入框
+/// 作答"；本前端没有 picker 队列，改成"当前最老的 free-text 问题"直接拿
+/// Enter。
+fn first_free_text_ask(
+    asks: &Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
+    shown: Option<Entity>,
+) -> Option<(Entity, Ask, bool)> {
+    asks.iter()
+        .filter(|(_, ask, _, owner, _)| {
+            ask.free_text
+                && !ask.multiple
+                && crate::keys::ask_is_visible(shown, owner.map(|ForAgent(owner)| *owner))
+        })
+        .min_by_key(|(_, _, effect, _, _)| {
+            effect
+                .map(Effect::id)
+                .unwrap_or(EffectId::from_raw(u64::MAX))
+        })
+        .map(|(entity, ask, _, _, seeded)| (entity, ask.clone(), seeded))
+}
+
+/// 给"已经轮到过输入框"的 free-text 问题打的标记：`initial` 只填一次。
+///
+/// 挂在 `Ask` 实体上（而不是记在资源里）：问题被回答、撤掉或 despawn 时
+/// 标记跟着走，不会留下指向死实体的表。第一次成为最老的可作答问题时由
+/// `seed_initial_answer` 插入。
+///
+/// 公开只是因为 [`keys`] 的 [`Ask`] 查询元组里有它（Bevy 的
+/// `SystemParam` 存在 `pub fn` 的签名里）；本 crate 之外没有别的用途。
+#[derive(Component)]
+pub struct AnswerSeeded;
+
+/// 把 free-text 问题的 `initial` 填进空输入框；每个问题只填一次。
+///
+/// 触发点是它**第一次**成为最老的、能靠打字作答的问题（和 Enter 回答用
+/// 同一个 [`first_free_text_ask`]）。挂 [`AnswerSeeded`] 的时机是"第一次
+/// 轮到它"，不管这一帧输入框是不是空的：用户自己写着的文本不动，之后
+/// 用户清空输入也不会被 `initial` 再回填（"用户改过就不要再覆盖"）。上游
+/// `pick::show_first` 也是问题一出现就把 `initial` 交给输入框，只填一次。
+fn seed_initial_answer(
+    asks: &Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
+    shown: Option<Entity>,
+    editor: &mut Editor,
+    commands: &mut Commands,
+) {
+    let Some((ask, question, seeded)) = first_free_text_ask(asks, shown) else {
+        return;
+    };
+    if seeded {
+        return;
+    }
+    // 先记"已经轮到过它"：即使输入框当时非空，以后也不再回填。
+    commands.entity(ask).try_insert(AnswerSeeded);
+    let Some(initial) = question.initial else {
+        return;
+    };
+    if editor.is_empty() {
+        editor.set(initial);
+    }
+}
+
+/// 用输入框里打好的文本回答 `ask`：上游 `Chosen::text(input.take_answer())`
+/// 在本前端的落点，以 [`Decider::Person`] 记下 `Answer::text(text)`。
+///
+/// `take` 取走文本、不进历史（和上游 `take_answer` 一样：答案不是要发送的
+/// 消息）。先看 [`Decision::is_decided`] 再取文本：问题已经被点击 / Alt+n /
+/// Esc 答掉时，不能把用户刚打的字吞掉。返回这次决定是否生效。
+fn answer_with_text(
+    ask: Entity,
+    editor: &mut Editor,
+    decisions: &mut Query<&mut Decision>,
+) -> bool {
+    let Ok(mut decision) = decisions.get_mut(ask) else {
+        return false;
+    };
+    if decision.is_decided() {
+        return false;
+    }
+    let text = editor.take();
+    decision.decide(Decider::Person, Answer::text(text).outcome())
+}
+
 /// Alt+n：用当前确认问题的第 `number` 个选项回答；越界什么也不做。
 fn answer_shown_ask(
     number: usize,
-    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    asks: &Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
     shown: Option<Entity>,
     decisions: &mut Query<&mut Decision>,
 ) -> bool {
@@ -976,7 +1083,10 @@ fn answer_shown_ask(
 
 /// Alt+0 / Esc：拒绝当前确认问题（第一个未回答的 `Ask`）。
 fn refuse_shown_ask(
-    asks: &Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    asks: &Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
     shown: Option<Entity>,
     decisions: &mut Query<&mut Decision>,
 ) -> bool {
@@ -1153,7 +1263,12 @@ pub struct Clipboards<'w> {
 ///   [`clipboard::PASTE_FAILED`]（和 `Copied` 同一套状态反馈）；
 /// * 确认面板里有未回答的 `Ask` 时，Esc 先拒绝它、Alt+1..9 用第一个问题的
 ///   第 n 个选项回答、Alt+0 拒绝——都走 [`answer_ask`] / [`refuse_ask`]，
-///   和点击确认行同一条落点；没有问题时的 Esc 行为不变。
+///   和点击确认行同一条落点；没有问题时的 Esc 行为不变；
+/// * 有能靠打字作答的 free-text 问题（`free_text && !multiple`）时，Enter
+///   改成回答最老的那个（`first_free_text_ask` → `answer_with_text`），
+///   不再发送消息；输入为空时 Enter 什么也不做。它第一次成为最老的
+///   可作答问题时，`seed_initial_answer` 把 `initial` 填进空输入框
+///   （只填一次）。
 #[allow(clippy::too_many_arguments)]
 pub fn keys(
     mut input: MessageReader<KeyboardInput>,
@@ -1168,7 +1283,10 @@ pub fn keys(
     mut completion: Option<ResMut<crate::complete::CompletionState>>,
     shown: Option<Res<ShownAgent>>,
     entering: Query<(), With<ActiveTurn>>,
-    asks: Query<(Entity, &Ask, Option<&Effect>, Option<&ForAgent>), Without<Outcome>>,
+    asks: Query<
+        (Entity, &Ask, Option<&Effect>, Option<&ForAgent>, Has<AnswerSeeded>),
+        Without<Outcome>,
+    >,
     mut decisions: Query<&mut Decision>,
     mut scroll: Option<ResMut<PaneScroll>>,
     mut clipboards: Clipboards,
@@ -1185,6 +1303,10 @@ pub fn keys(
     // `KeyPressed.agent` 和动作分支里的 `agent` 是同一事实来源：显示中的
     // `ShownAgent`（应用层切工作区时更新），没有就是 `None`。
     let shown_agent = shown.as_deref().and_then(|shown| shown.0);
+    // free-text 问题第一次排到"最老的可作答问题"时，把它的 `initial`
+    // 填进空输入框（每个问题只填一次，见 [`seed_initial_answer`]）。放在
+    // 读按键之前，所以同一帧按下的 Enter 看到的就是填好的文本。
+    seed_initial_answer(&asks, shown_agent, &mut editor, &mut commands);
     let mut modifiers = Modifiers::from_held(&held);
     for event in input.read() {
         // 修饰键自己更新状态；同一帧里先按修饰键的事件也因此正确。
@@ -1244,6 +1366,21 @@ pub fn keys(
                             if completion_act(action, state, &mut editor) {
                                 continue;
                             }
+                        }
+                        // 输入框作答（上游 `pick.rs` 的 `in_input`/`draft`）：
+                        // 有 free-text 问题且不是多选时，Enter 归它，不再发送
+                        // 消息；有多个就答最老的（和确认 tile / Alt+1..9 同一
+                        // FIFO）。输入为空时 Enter 不作答、也不发送——什么也
+                        // 不做。选项型问题（`free_text == false`）不进这个
+                        // 分支，Enter 照旧发送（上游："the user's next line is
+                        // a message, not its answer"）。
+                        if matches!(action, InputAction::Send)
+                            && let Some((ask, _, _)) = first_free_text_ask(&asks, agent)
+                        {
+                            if !editor.text.trim().is_empty() {
+                                answer_with_text(ask, &mut editor, &mut decisions);
+                            }
+                            continue;
                         }
                         let busy = agent.is_some_and(|agent| entering.contains(agent));
                         match act(action, &mut editor, busy) {
@@ -2248,6 +2385,46 @@ mod tests {
         entity
     }
 
+    /// 在世界里 spawn 一个 free-text 问题（`initial` 是可编辑的起始文本，
+    /// `multiline` 允许换行），等内核挂上 `Effect`/`Decision`。
+    ///
+    /// `app.update()` 也会跑一遍 [`seed_initial_answer`]：有 `initial` 时，
+    /// 返回时输入框里已经填好它。
+    fn spawn_free_text(
+        app: &mut App,
+        title: &str,
+        initial: Option<&str>,
+        multiline: bool,
+    ) -> Entity {
+        let mut ask = Ask::new(title);
+        match initial {
+            Some(initial) => ask = ask.initial(initial),
+            None => ask = ask.free_text(),
+        }
+        if multiline {
+            ask = ask.multiline();
+        }
+        let entity = app.world_mut().spawn(ask).id();
+        app.update();
+        assert!(
+            app.world().get::<Decision>(entity).is_some(),
+            "Ask 的 Effect 要带上内核的 Decision"
+        );
+        entity
+    }
+
+    /// `ask_app` + 一个真 agent + `ShownAgent` + `Deliver` 观察者：free-text
+    /// 作答要同时断言"Ask 的 Decision"与"没有 Deliver"。
+    fn answering_app() -> (App, Entity) {
+        let mut app = ask_app();
+        let agent = app.world_mut().spawn(Name::new("agent")).id();
+        app.insert_resource(ShownAgent(Some(agent)))
+            .init_resource::<Observed>()
+            .add_observer(record_deliver)
+            .add_observer(record_stop);
+        (app, agent)
+    }
+
     /// Alt+数字：按住 Alt 发一个数字键，再松开。
     fn alt_digit(app: &mut App, digit: char) {
         let code = match digit {
@@ -2513,6 +2690,168 @@ mod tests {
         app.world_mut().entity_mut(ask).despawn();
         send(&mut app, Key::Escape, KeyCode::Escape, None);
         assert_eq!(observed(&app).stopped, [agent], "没有问题时 Esc 还是停 turn");
+    }
+
+    // ---- 输入框作答（free-text Ask）：Enter 归问题，不再发送 ----
+
+    #[test]
+    fn enter_answers_a_free_text_ask_instead_of_delivering() {
+        let (mut app, _agent) = answering_app();
+        let ask = spawn_free_text(&mut app, "说说你的想法", None, false);
+        type_text(&mut app, "yes please");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            decision_answer(&app, ask),
+            Some(Answer::text("yes please")),
+            "Enter 应把输入框里的文本作为 free-text 答案"
+        );
+        assert!(decision_by_person(&app, ask), "作答者是 Decider::Person");
+        assert!(
+            observed(&app).delivered.is_empty(),
+            "用输入框作答时不能同时把文本发出去"
+        );
+        assert_eq!(text(&app), "", "作答后输入框清空");
+        assert!(
+            app.world().resource::<SubmittedPrompts>().0.is_empty(),
+            "答案不是发送的消息，不回显"
+        );
+    }
+
+    #[test]
+    fn enter_with_an_empty_input_answers_nothing_and_sends_nothing() {
+        let (mut app, _agent) = answering_app();
+        let ask = spawn_free_text(&mut app, "怎么做？", None, false);
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert!(
+            !app.world()
+                .get::<Decision>(ask)
+                .expect("Ask 要有 Decision")
+                .is_decided(),
+            "空输入时 Enter 不作答"
+        );
+        assert!(
+            observed(&app).delivered.is_empty(),
+            "空输入时 Enter 也不发送"
+        );
+        assert_eq!(text(&app), "", "空输入保持为空");
+    }
+
+    #[test]
+    fn enter_still_delivers_when_the_ask_only_has_choices() {
+        let (mut app, agent) = answering_app();
+        let ask = spawn_ask(&mut app, &[("confirm", "确认支付"), ("cancel", "取消")]);
+        type_text(&mut app, "把这句话发出去");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            observed(&app).delivered,
+            [(agent, "把这句话发出去".to_owned(), DeliveryMode::Steer)],
+            "选项型问题（free_text=false）不抢 Enter，仍按普通消息发送"
+        );
+        assert!(
+            !app.world()
+                .get::<Decision>(ask)
+                .expect("Ask 要有 Decision")
+                .is_decided(),
+            "选项型问题不能被输入框里的文字答掉"
+        );
+    }
+
+    #[test]
+    fn enter_answers_the_oldest_free_text_ask_first() {
+        let (mut app, _agent) = answering_app();
+        let first = spawn_free_text(&mut app, "第一个问题", None, false);
+        let second = spawn_free_text(&mut app, "第二个问题", None, false);
+        type_text(&mut app, "先答最老的");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            decision_answer(&app, first),
+            Some(Answer::text("先答最老的")),
+            "多个 free-text 问题时答最老的（FIFO，和确认 tile 同一顺序）"
+        );
+        assert!(
+            decision_answer(&app, second).is_none(),
+            "后面的问题不受影响"
+        );
+    }
+
+    #[test]
+    fn a_multiline_free_text_ask_takes_every_line_typed_before_enter() {
+        let (mut app, _agent) = answering_app();
+        let ask = spawn_free_text(&mut app, "分几行说", None, true);
+        type_text(&mut app, "first");
+        with_modifier(&mut app, KeyCode::ShiftLeft, Key::Enter, KeyCode::Enter);
+        type_text(&mut app, "second");
+        assert_eq!(text(&app), "first\nsecond", "Shift+Enter 仍换行");
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+
+        assert_eq!(
+            decision_answer(&app, ask),
+            Some(Answer::text("first\nsecond")),
+            "multiline 问题把整段（含换行）作为答案"
+        );
+        assert!(observed(&app).delivered.is_empty(), "多行答案也不发送");
+    }
+
+    #[test]
+    fn the_initial_text_is_filled_once_and_never_again() {
+        let (mut app, _agent) = answering_app();
+        let ask = spawn_free_text(&mut app, "从这句开始改", Some("改这句话"), false);
+        assert_eq!(
+            text(&app),
+            "改这句话",
+            "第一次成为最老的可作答问题时把 initial 填进空输入框"
+        );
+
+        // 用户清空输入（模拟改过/删光），再等一帧：不能回填。
+        app.world_mut().resource_mut::<Editor>().take();
+        app.update();
+        assert_eq!(text(&app), "", "用户清空后 initial 不再回填");
+
+        // 空输入按 Enter：既不作答，也不发送。
+        send(&mut app, Key::Enter, KeyCode::Enter, None);
+        assert_eq!(text(&app), "", "空 Enter 后依然不回填");
+        assert!(
+            !app.world()
+                .get::<Decision>(ask)
+                .expect("Ask 要有 Decision")
+                .is_decided(),
+            "空输入不能拿 initial 之外的空串作答"
+        );
+        assert!(observed(&app).delivered.is_empty());
+    }
+
+    #[test]
+    fn the_confirm_tile_points_a_free_text_ask_at_the_input() {
+        let mut app = ask_app();
+        let _ask = spawn_free_text(&mut app, "说说你的想法", None, false);
+        let rows = confirm_rows_now(&mut app);
+        let hint = rows
+            .iter()
+            .find(|keyed| plain(&keyed.row.line).contains("类型作答"))
+            .expect("free-text 问题的确认块要有一行指路提示");
+        let hint_text = plain(&hint.row.line);
+        assert!(
+            hint_text.contains("在输入框") && hint_text.contains("Enter"),
+            "提示要写明去输入框里按 Enter：{hint_text:?}"
+        );
+        assert!(
+            rows.last()
+                .is_some_and(|last| plain(&last.row.line) == hint_text),
+            "提示是这块的最后一行：{:?}",
+            rows.iter().map(|keyed| plain(&keyed.row.line)).collect::<Vec<_>>()
+        );
+        assert!(
+            hint.row.line
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM)),
+            "提示行要用 dim 样式：{:?}",
+            hint.row.line.spans
+        );
     }
 
     // ---- 发送 / 排队 / 停止 / 退出：键 -> 内核事件的整条链路 ----

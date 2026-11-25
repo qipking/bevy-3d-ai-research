@@ -112,7 +112,8 @@ pub mod prelude {
     };
     pub use crate::selection::{ClickKind, Point, SELECTED_MODIFIER, Selection};
     pub use crate::clipboard::{
-        ClipboardText, Copied, copy_selection, copy_text, paste_from_clipboard,
+        ClipboardText, Copied, attach_image_paths, copy_selection, copy_text, dropped_file_text,
+        image_paths, paste_from_clipboard,
     };
     pub use crate::rich::{
         diff_rows, highlight_rows, markdown_rows, tool_result_rows, upstream_theme,

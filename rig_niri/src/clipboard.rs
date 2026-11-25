@@ -8,9 +8,13 @@
 //!   `Copied N lines`（上游原文，`1` 行时是 `Copied 1 line`）。
 //! - 粘贴：读剪贴板的文本，插到编辑器光标处；空剪贴板/读取失败给一句
 //!   可显示的错误，不 panic。
-//! - 粘贴图片：上游是“把剪贴板图片存成文件，再在输入里打 `@path`”。
-//!   `bevy_clipboard` 的 `image` feature 没有开，也没有临时文件存放约定，
-//!   所以这里保留 [`Paste::Image`] 与 `@path` 的**应用语义**（
+//! - 粘贴附件：上游是“把剪贴板图片存成文件，再在输入里打 `@path`”，
+//!   再把“粘贴/拖入的文本里的图片文件路径”也变成 `@path`。这里做后一半：
+//!   [`image_paths`] 识别文本里的图片路径，[`attach_image_paths`] 把它们原地
+//!   换成 `@path`，[`paste_text`] 插入替换后的文本；窗口拖入由应用层调
+//!   [`dropped_file_text`]。
+//! - 剪贴板图片：`bevy_clipboard` 的 `image` feature 没有开，也没有临时文件
+//!   存放约定，所以这里保留 [`Paste::Image`] 与 `@path` 的**应用语义**（
 //!   [`apply_paste`] / [`type_path`]），但没有从剪贴板取图片的入口。
 //!
 //! 真正的系统剪贴板由 `bevy_clipboard::Clipboard` 提供；为了让单测不碰
@@ -40,7 +44,8 @@
 //!
 //! Ctrl+V 时：`editor::keys` 把 `InputAction::PasteImage` 交到
 //! [`paste_from`]（优先内存替身、其次系统剪贴板），文本插到光标处；失败写
-//! [`PASTE_FAILED`] 状态行。**只粘文本**：图片分支没有入口，原因见上。
+//! [`PASTE_FAILED`] 状态行。文本里的图片路径变成 `@path`；剪贴板里**只有
+//! 图片**时仍然没有入口，原因见上。
 
 use std::path::{Path, PathBuf};
 
@@ -266,6 +271,177 @@ pub fn read_paste(clipboard: &mut impl ClipboardText) -> Result<Paste, String> {
     Ok(Paste::Text(text))
 }
 
+/// 文本里能被当成附件的图片扩展名（小写比较）。
+const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"];
+
+/// `text` 里的图片文件路径，按出现顺序返回。
+///
+/// 分词照 shell 的习惯：空白分隔；单/双引号里的空白算路径的一部分，引号本身
+/// 去掉；反斜杠转义下一个字符（Windows 上反斜杠是路径分隔符，不转义）。
+/// 每个词再经过 [`image_path`]：普通本地路径，或 host 为空/`localhost` 的
+/// `file://` URL（百分号解码）；**只看扩展名**，不要求文件此刻存在。
+///
+/// 已经带 `@` 的词跳过，免得把 `@/tmp/a.png` 再包一层。
+pub fn image_paths(text: &str) -> Vec<PathBuf> {
+    scan_words(text)
+        .into_iter()
+        .filter_map(|word| image_path(&word.text))
+        .collect()
+}
+
+/// 把 `text` 里识别到的图片路径原地换成 `@path`，其余文本原样保留。
+///
+/// 每个附件都在它原来的位置替换（多行文本里的换行、路径之间的分隔文字都
+/// 不动）；一个图片路径都没有时返回 `None`。含空白的路径按 [`reference`] 加
+/// 引号。
+pub fn attach_image_paths(text: &str) -> Option<String> {
+    let mut attached = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut found = false;
+    for word in scan_words(text) {
+        let Some(path) = image_path(&word.text) else {
+            continue;
+        };
+        attached.push_str(&text[copied..word.start]);
+        attached.push_str(&reference(&path.to_string_lossy()));
+        copied = word.end;
+        found = true;
+    }
+    if !found {
+        return None;
+    }
+    attached.push_str(&text[copied..]);
+    Some(attached)
+}
+
+/// 拖进窗口的文件若是一张图片，返回要插进输入框的 `@path`。
+///
+/// 只看扩展名（[`IMAGE_EXTENSIONS`]），不查文件是否存在；非图片返回 `None`，
+/// 调用方因此可以原样忽略它。
+pub fn dropped_file_text(path: &Path) -> Option<String> {
+    is_image_path(path).then(|| format!("@{}", path.display()))
+}
+
+/// 一个 shell 风格分词后的词，以及它在原文里的字节范围（含引号）。
+struct Word {
+    /// 词在原文里的起点。
+    start: usize,
+    /// 词在原文里的终点（不含）。
+    end: usize,
+    /// 去掉引号、处理转义后的词本身。
+    text: String,
+}
+
+/// 按空白/引号切词，保留每个词在原文里的范围。
+fn scan_words(text: &str) -> Vec<Word> {
+    let mut words = Vec::new();
+    let mut word: Option<(usize, String)> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = text.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match (quote, character) {
+            // 结束引号：不进入词本身，但它的位置仍属于这个词的原文范围。
+            (Some(open), character) if character == open => quote = None,
+            (Some(_), character) => {
+                word.get_or_insert_with(|| (index, String::new()))
+                    .1
+                    .push(character);
+            }
+            // 开始引号：引号本身不进词，词从引号处开始，范围会连引号一起替换。
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                word.get_or_insert_with(|| (index, String::new()));
+            }
+            (None, '\\') if !cfg!(windows) => {
+                if let Some((_, escaped)) = chars.next() {
+                    word.get_or_insert_with(|| (index, String::new()))
+                        .1
+                        .push(escaped);
+                }
+            }
+            (None, character) if character.is_whitespace() => {
+                if let Some((start, value)) = word.take() {
+                    words.push(Word {
+                        start,
+                        end: index,
+                        text: value,
+                    });
+                }
+            }
+            (None, character) => {
+                word.get_or_insert_with(|| (index, String::new()))
+                    .1
+                    .push(character);
+            }
+        }
+    }
+    if let Some((start, value)) = word {
+        words.push(Word {
+            start,
+            end: text.len(),
+            text: value,
+        });
+    }
+    words
+}
+
+/// 一个词指向的图片文件；不是本地图片路径就 `None`。
+fn image_path(part: &str) -> Option<PathBuf> {
+    if part.is_empty() || part.starts_with('@') {
+        return None;
+    }
+    let path = match part.strip_prefix("file://") {
+        Some(url) => PathBuf::from(local_url_path(url)?),
+        // 别的 scheme（http/https/...）不是本机文件，不猜成本地路径。
+        None if part.contains("://") => return None,
+        None => PathBuf::from(part),
+    };
+    is_image_path(&path).then_some(path)
+}
+
+/// `file://` 后面的本地路径；别的 host 指向本机读不到的文件，返回 `None`。
+fn local_url_path(url: &str) -> Option<String> {
+    let path = url.strip_prefix("localhost").unwrap_or(url);
+    path.starts_with('/')
+        .then(|| percent_decoded(path))
+        .flatten()
+}
+
+/// 把 `%XX` 还原成对应字节；结果不是合法 UTF-8 时 `None`。
+fn percent_decoded(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, after)) = rest.split_first() {
+        let hex = after
+            .get(..2)
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (byte, hex) {
+            (b'%', Some(decoded)) => {
+                bytes.push(decoded);
+                rest = after.get(2..).unwrap_or_default();
+            }
+            _ => {
+                bytes.push(byte);
+                rest = after;
+            }
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// 路径的扩展名是不是 [`IMAGE_EXTENSIONS`]（大小写不敏感）。
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|image| extension.eq_ignore_ascii_case(image))
+        })
+}
+
 /// 把粘贴内容应用在光标处（上游 `type_pasted` 的核心）。
 pub fn apply_paste(editor: &mut Editor, paste: Paste) {
     match paste {
@@ -276,11 +452,16 @@ pub fn apply_paste(editor: &mut Editor, paste: Paste) {
 
 /// 在光标处插入文本（上游 `paste_text` 的文本分支）。
 ///
-/// 换行归一成 `\n` 由 [`Editor::insert`] 负责。上游还会把“整段都是图片
-/// 路径”的粘贴拆成 `@path`；本 crate 还没有附件/拖放接线，这里只按文本插。
+/// 换行归一成 `\n` 由 [`Editor::insert`] 负责。文本里的图片文件路径会先被
+/// [`attach_image_paths`] 原地换成 `@path`（其余文字不动）；没有图片路径时
+/// 原样插入。
 pub fn paste_text(editor: &mut Editor, text: &str) {
-    if !text.is_empty() {
-        editor.insert(text);
+    if text.is_empty() {
+        return;
+    }
+    match attach_image_paths(text) {
+        Some(attached) => editor.insert(&attached),
+        None => editor.insert(text),
     }
 }
 
@@ -554,6 +735,125 @@ mod tests {
             read_paste(&mut clipboard),
             Ok(Paste::Text("text".to_owned()))
         );
+    }
+
+    // ---- 文本里的图片路径 -> @path ----
+
+    #[test]
+    fn image_paths_recognizes_plain_and_quoted_paths() {
+        assert_eq!(
+            image_paths("/tmp/x.png"),
+            vec![PathBuf::from("/tmp/x.png")]
+        );
+        assert_eq!(
+            image_paths("'/tmp/x.png'"),
+            vec![PathBuf::from("/tmp/x.png")],
+            "单引号只是分词用的，不进路径"
+        );
+        assert_eq!(
+            image_paths("\"/tmp/a b.png\""),
+            vec![PathBuf::from("/tmp/a b.png")],
+            "双引号里的空白属于路径"
+        );
+    }
+
+    #[test]
+    fn file_urls_are_percent_decoded() {
+        assert_eq!(
+            image_paths("file:///tmp/a%20b.png"),
+            vec![PathBuf::from("/tmp/a b.png")]
+        );
+        assert_eq!(
+            image_paths("file://localhost/tmp/a.png"),
+            vec![PathBuf::from("/tmp/a.png")],
+            "空 host / localhost 才是本机路径"
+        );
+        assert!(
+            image_paths("file://elsewhere/tmp/a.png").is_empty(),
+            "别的 host 不猜成本机路径"
+        );
+        assert!(
+            image_paths("https://example.com/a.png").is_empty(),
+            "别的 scheme 不是本机路径"
+        );
+    }
+
+    #[test]
+    fn image_paths_returns_every_image_in_order() {
+        assert_eq!(
+            image_paths("a.png and b.JPG and c.txt"),
+            vec![PathBuf::from("a.png"), PathBuf::from("b.JPG")],
+            "扩展名大小写不敏感，非图片不进来"
+        );
+    }
+
+    #[test]
+    fn an_existing_attachment_is_not_attached_again() {
+        assert_eq!(
+            image_paths("@/tmp/x.png"),
+            Vec::<PathBuf>::new(),
+            "已经是 @path 的词不再包一层"
+        );
+        assert_eq!(attach_image_paths("@/tmp/x.png"), None);
+    }
+
+    #[test]
+    fn non_image_paths_are_not_attached() {
+        assert!(image_paths("/tmp/x.txt").is_empty());
+        assert_eq!(attach_image_paths("look at /tmp/x.txt"), None);
+    }
+
+    #[test]
+    fn attach_image_paths_replaces_in_place() {
+        assert_eq!(
+            attach_image_paths("look at /tmp/x.png ok"),
+            Some("look at @/tmp/x.png ok".to_owned())
+        );
+        assert_eq!(
+            attach_image_paths("/tmp/a.png and /tmp/b.jpg"),
+            Some("@/tmp/a.png and @/tmp/b.jpg".to_owned()),
+            "多个图片路径各自替换，中间的连接词不动"
+        );
+    }
+
+    #[test]
+    fn attach_image_paths_keeps_line_breaks_and_quotes_spaces() {
+        assert_eq!(
+            attach_image_paths("look\n/tmp/a.png\nand /tmp/b.jpg"),
+            Some("look\n@/tmp/a.png\nand @/tmp/b.jpg".to_owned()),
+            "多行粘贴保持换行，附件各在自己的行"
+        );
+        assert_eq!(
+            attach_image_paths("see 'file:///tmp/a%20b.png' now"),
+            Some("see @\"/tmp/a b.png\" now".to_owned()),
+            "百分号解码后有空白，@path 加引号"
+        );
+    }
+
+    #[test]
+    fn pasting_a_text_with_an_image_path_attaches_it() {
+        let mut editor = editor("look: ");
+        let mut clipboard = MockClipboard {
+            content: Some("look at /tmp/x.png ok".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(paste_from_clipboard(&mut clipboard, &mut editor), Ok(()));
+        assert_eq!(editor.text(), "look: look at @/tmp/x.png ok");
+    }
+
+    #[test]
+    fn dropped_file_text_only_formats_images() {
+        assert_eq!(
+            dropped_file_text(Path::new("/tmp/a.png")),
+            Some("@/tmp/a.png".to_owned())
+        );
+        assert_eq!(
+            dropped_file_text(Path::new("/tmp/a.WEBP")),
+            Some("@/tmp/a.WEBP".to_owned()),
+            "扩展名大小写不敏感"
+        );
+        assert_eq!(dropped_file_text(Path::new("/tmp/notes.txt")), None);
+        assert_eq!(dropped_file_text(Path::new("/tmp/no-extension")), None);
     }
 
     // ---- 图片粘贴的语义（只到 @path，没有取图入口） ----

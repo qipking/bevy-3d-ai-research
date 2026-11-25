@@ -1675,6 +1675,21 @@ fn push_ask_block(
             Some(&choice.id),
         );
     }
+    // free-text 的问题可以点选项（如果有）也可以打字：本前端没有弹层输入框，
+    // 作答入口就是主输入框，所以在这块最后一行给一条 dim 指路。多选的
+    // free-text（`multiple`，选项 + 文本备注）还没做，Enter 不会作答，因此
+    // 不给会误导的提示。
+    if question.free_text && !question.multiple {
+        let hint = match question.multiline {
+            true => "类型作答：在输入框写，Enter 提交（Shift+Enter 换行）",
+            false => "类型作答：在输入框写，Enter 提交",
+        };
+        let line = Line::from(Span::styled(
+            format!("    {hint}"),
+            Style::new().dim(),
+        ));
+        push_ask_rows(rows, ask, "input-hint", vec![line], width, None);
+    }
 }
 
 /// 把当前还没回答的 `Ask` 写进确认面板（[`PanelId::Confirm`]）。

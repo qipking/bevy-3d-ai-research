@@ -94,30 +94,46 @@
 
 ---
 
-## 4. Ctrl+V 图片粘贴 / 拖入 `@path` —— 🟡 部分完成（文本粘贴已完成）
+## 4. Ctrl+V 附件粘贴 / 拖入 `@path` —— ✅ 文本/路径粘贴与拖入已完成；剪贴板图片解码未做（缺 feature）（2026-11-26）
 
-- **文本粘贴（已完成）**：Ctrl+V 绑的还是 `InputAction::PasteImage`（`keys.rs:621`），
-  但 `editor::act` 现在把它变成 `Act::Paste`（`editor.rs:1034`），`editor::keys` 调
-  `clipboard::paste_from`（`editor.rs:1291`，实现 `clipboard.rs:317`）：优先内存替身、其次
+- **文本粘贴（已完成）**：Ctrl+V 绑的还是 `InputAction::PasteImage`（`keys.rs:563`/`:649`），
+  `editor::act` 把它变成 `Act::Paste`（`editor.rs:1127`），`editor::keys` 调
+  `clipboard::paste_from`（`editor.rs:1409`，实现 `clipboard.rs:496`）：优先内存替身、其次
   `bevy_clipboard::Clipboard`，有文本就 `Editor::insert` 到光标处（多行文本里的
   `\n` 原样保留，`\r\n`/`\r` 归一）；空剪贴板、没有后端、读取失败写状态行的
-  `PASTE_FAILED`（`clipboard.rs:113`/`:116`，和 `Copied` 同一套状态反馈），成功粘贴会清掉
-  上一次的红色错误（`clipboard.rs:121`）。提示行也已经改成 `Ctrl+V paste`（`hints.rs:33`/`:41`），
+  `PASTE_FAILED`（`clipboard.rs:118`/`:121`，和 `Copied` 同一套状态反馈），成功粘贴会清掉
+  上一次的红色错误（`clipboard.rs:126`）。提示行已经改成 `Ctrl+V paste`（`hints.rs:33`/`:41`），
   和实际行为一致。
-- **测试**：`ctrl_v_pastes_text_at_the_cursor`（`editor.rs:3408`）、
-  `ctrl_v_with_an_empty_clipboard_shows_a_visible_error`（`:3430`）、
-  `ctrl_v_without_any_clipboard_resource_still_reports`（`:3454`）、
-  `a_successful_paste_clears_the_previous_error`（`:3477`）；纯逻辑在 `clipboard.rs:419`/`:509`/`:548`。
-- **还差**：图片粘贴（`bevy_clipboard` 的 `image` feature + `Scratch` 目录 + 落盘 +
-  `@path`，上游 `clipboard.rs:227` 的 `dropped_images` 一带）；剪贴板里只有图片时仍只会报
-  "The clipboard holds no text."（`clipboard.rs:59`/`:261`）。把图片文件拖进窗口变 `@path`
-  也没接——`grep -rn dropped_images rig_niri/src` 为 0，我们只有 `type_path`（`clipboard.rs:290`）。
-- **工作量**：**M**（图片通路）/ **S**（拖入找路径）。
-- **依赖**：图片部分依赖会话目录（`SessionPaths`，应用层已有）。
+- **文本里的图片路径（已完成）**：`clipboard::image_paths`（`clipboard.rs:285`）识别文本里的
+  图片文件路径，`clipboard::attach_image_paths`（`clipboard.rs:297`）把它们原地换成 `@path`
+  （其余文字、换行、路径之间的连接词都不动；没有图片路径返回 `None`）。粘贴成功路径
+  `paste_text`（`clipboard.rs:456`）先做这个替换再 `Editor::insert`。规则：
+  - 分词照 shell：空白分隔，单/双引号里的空白属于路径且引号去掉，反斜杠转义下一个字符
+    （Windows 除外）；已经是 `@path` 的词不再处理。
+  - `file://` 只接受空 host 或 `localhost`（别的 host 不猜成本机路径）；百分号解码
+    （`%20` → 空格），解码结果必须是合法 UTF-8。
+  - 只认扩展名 `png/jpg/jpeg/gif/webp/bmp/svg/avif`（大小写不敏感），**不要求文件此刻存在**。
+  - 替换按自然位置；含空白的路径写成 `@"/tmp/a b.png"`（和 `type_path` 的引用规则一致）。
+- **拖入（已完成）**：应用层 `drop_image_files`（`rig_harness_in_3d/src/lib.rs:382`，注册在
+  `:344` 的 `FeathersSystems::Prepare`）读 `bevy_window::FileDragAndDrop::DroppedFile`，用
+  `clipboard::dropped_file_text`（`clipboard.rs:321`）判断扩展名，图片就插 `@path`；非图片
+  文件忽略，没有 `Editor` 资源时静默忽略、不 panic。`FileDragAndDrop` 由 `WindowPlugin`
+  注册，`HarnessExtPlugin` 也补了 `add_message`（`rig_harness_in_3d/src/lib.rs:310`），
+  headless 测试因此能直接写消息。
+- **测试**：原有 Ctrl+V 四条（`editor.rs:3725` 起）不回归；路径纯逻辑在
+  `clipboard.rs:743`/`:761`/`:782`/`:791`/`:801`/`:807`/`:820`/`:834`/`:845`，
+  拖入在 `rig_harness_in_3d/src/lib.rs:920`/`:927`/`:937`。
+- **还差（剪贴板图片解码，未做）**：`bevy_clipboard` 没开 `image` feature，离线环境也拉不到
+  新依赖，所以不做"剪贴板里直接是图片"的解码/落盘。剪贴板里只有图片时仍只报
+  "The clipboard holds no text."（`clipboard.rs:64`/`:266`）；`Paste::Image`/`type_path`
+  （`clipboard.rs:469`）保留语义，等有了 `image` feature + `Scratch`/会话目录落盘约定再接
+  （上游 `clipboard.rs:227` 的 `dropped_images` 一带）。
+- **工作量**：**S**（剩余只有剪贴板图片解码/落盘）。
+- **依赖**：剪贴板图片部分依赖 `bevy_clipboard` 的 `image` feature 与会话目录（`SessionPaths`，应用层已有）。
 
 ---
 
-## 5. 确认/问题作答 —— ✅ 键盘作答已完成（输入框内作答仍未做）（2026-11-25）
+## 5. 确认/问题作答 —— ✅ 键盘作答 + 输入框作答已完成（2026-11-26）
 
 - **现在的行为**：确认 tile 里有未回答的 `Ask` 时，`keys::arm_inline_keys`（`keys.rs:720`）
   摘掉 Alt+1..9/Alt+0 绑定的 `Disabled`（绑定生成 `keys.rs:669` 一带）：Alt+n 用当前确认 tile
@@ -130,6 +146,23 @@
 - **点击与键盘共用一条路**：`editor::answer_ask`（`editor.rs:911`）是唯一的作答落点——
   应用层点击观察者 `kernel::answer_ask`（`rig_harness_in_3d/src/kernel.rs:291`）和键盘 Alt+n
   都调它；拒绝是 `editor::refuse_ask`（`:926`）。点击仍可点任何一块的任意选项。
+- **输入框作答（✅ 2026-11-26）**：最老的 `Ask` 是 free-text（`free_text && !multiple`，
+  上游 `ask.rs:62-82`）时，Enter 不再发送消息，而是用输入框里的文本回答它
+  （`editor::first_free_text_ask` → `answer_with_text`，`Decider::Person` + `Answer::text`，
+  即上游 `pick.rs:128-134` 的 `in_input`/`draft` 语义）；输入为空时 Enter 不作答也不发送。
+  多个 free-text 问题按内核效应 id FIFO 答最老的。`initial` 在这个问题第一次成为最老的
+  可作答问题时填进空输入框，Ask 实体上的 `AnswerSeeded` 保证只填一次（用户清空后不回填）；
+  `multiline` 问题照旧 Shift+Enter 换行、Enter 提交。确认 tile 的 free-text 块最后一行有
+  dim 提示 `类型作答：在输入框写，Enter 提交`（`batch::push_ask_block`）。选项型
+  `Ask`（`free_text == false`）不抢 Enter，仍是普通消息（上游 "next line is a message,
+  not its answer"）。
+- **测试（输入框作答）**：`enter_answers_a_free_text_ask_instead_of_delivering`、
+  `enter_with_an_empty_input_answers_nothing_and_sends_nothing`、
+  `enter_answers_the_oldest_free_text_ask_first`、
+  `a_multiline_free_text_ask_takes_every_line_typed_before_enter`、
+  `the_initial_text_is_filled_once_and_never_again`、
+  `enter_still_delivers_when_the_ask_only_has_choices`、
+  `the_confirm_tile_points_a_free_text_ask_at_the_input`（`editor.rs`）。
 - **应用层**：`answer_to_decision`（`kernel.rs:257`）现在也把"人拒绝问题"（Esc/Alt+0，没有
   `Answer`）转成被按住调用的拒绝；否则 hold 释放后，没决定的 `create_order` 会照常开跑。
 - **测试**（`rig_niri`，`editor.rs`）：`alt_one_answers_the_first_choice_of_the_confirm_ask`
@@ -262,7 +295,7 @@
 
 ---
 
-## 9. picker 队列 / 内置选项键 / `ChoiceKeys` 已完成（✅）；输入框作答与 `ChoiceSystems` 仍是缺口（🟡）
+## 9. picker 队列 / 内置选项键 / `ChoiceKeys` 已完成（✅）；`ChoiceSystems` 仍是缺口（🟡）
 
 - **picker 队列（✅ 2026-11-25）**：多个 picker 同时存在时，条带最右边仍然只有
   **一列**、一次显示一个，按创建顺序排队；关掉队首（Esc/回车提交/取消 → harness
@@ -298,15 +331,16 @@
   `choice_keys_without_a_picker_do_not_swallow_the_key`（`:3187`）。
 - **还没做**：上游的 `ChoiceSystems` 调度（上游 `pick.rs:589`）与
   `Tick`/`TickAll`/`TickNone`/`More`/`Answer` 变体（现在用 `Message` 让插件自己做）；
-  树里的 `more` 没键（树里 →/← 归折叠）；在输入框里作答（`in_input`/`draft`，
-  上游 `:132`，落到 `Answer::text`）——`grep -rn 'in_input' rig_niri/src` 仍为 0。
+  树里的 `more` 没键（树里 →/← 归折叠）。`Ask` 的输入框作答**不在 picker 这条路上**：
+  3D 前端的确认 tile 由 `editor.rs` 直接接 Enter（见 §5），所以 `in_input` 在
+  `rig_niri` 里仍为 0 是有意分叉，不再是缺口。
 - **测试（队列）**：`pickers_show_one_at_a_time_in_creation_order`（`:3523`）、
   `the_same_picker_is_never_queued_twice`（`:3605`）、`escape_hands_the_column_to_the_next_picker`
   （`:3640`）、`closing_a_picker_whose_preview_is_open_removes_the_whole_column`（`:3672`）、
   `an_ask_never_enters_the_picker_queue`（`:3720`）、
   `closing_after_a_focus_switch_clears_the_old_workspaces_column`（`:3745`）。
-- **工作量**：剩余部分 **M**（`ChoiceSystems` + 输入框作答；内置选项键/队列/滚动/说明已完成）。
-- **依赖**：`in_input`（输入框内作答）与 §5 的输入框作答是同一件事。
+- **工作量**：剩余部分 **S**（只剩 `ChoiceSystems`；内置选项键/队列/滚动/说明/输入框作答已完成）。
+- **依赖**：§5 的输入框作答已完成，不再卡在这里。
 
 
 ---
