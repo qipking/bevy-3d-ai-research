@@ -250,3 +250,22 @@ Render   ：panels::sync_panels（行→节点，按 key 前缀 diff）→ 编�
 - `feathers_in_3d` 不镜像图片/图标：按钮一律文字；`Outline` 已支持。
 - 输入框只借 feathers 外观，不换 `TextInput`（多行/光标/IME 自己管）。
 - 像素级对齐不做；`StatusLine` 组件、开放面板画布（F6）、多来源（S2–S6）未做。
+
+---
+
+## 10. 平台注意事项（Android，2026-11-26 核查）
+
+用户判断 bevy 对 Android 支持较好，适配应该不重。核查结论：**look 协议本身不阻碍 Android**
+（纯数据 + 纯函数，零 OS 调用）；真正要注意的是下面这些，按严重程度：
+
+| 项 | 现状 | 是否阻碍 |
+|---|---|---|
+| `bevy_clipboard` + `arboard` | `Cargo.toml` 无条件开 `system_clipboard`/`wayland`；`arboard` 3.7 的 `src/platform/mod.rs` 把 android 排除在所有平台后端之外 | **编译期硬点**：Android 上要把这两个 feature 平台条件化，先用内存替身（`ClipboardText` 抽象已留口） |
+| `rig-tui` 的终端依赖树 | 依赖 `crossterm`/`ratatui`/`syntect`/`two-face` 等；我们运行时不调用 | 潜在构建点：`crossterm` 没有显式 android 支持，需 NDK 实测；若过不去，再把 look 协议抽成 seam/vendored crate（顺带把 syntect 摘出 APK） |
+| 会话目录 | `Home::from_env()` 默认 `~/.rig`，`current_dir()` 在 Android 上可能不可用 | 运行期：显式 `RIG_HOME` 指 app data（`app()` 已有 `./.rig-home` 回退） |
+| 资源加载 | `BEVY_ASSET_ROOT` 是桌面路径方案 | 运行期：用 `AssetPlugin` 的 APK assets |
+| `rig-tools`/`rig-http` | shell 工具在 Android 上没有可执行环境 | 运行期：3D 前端可以不注册这些工具 |
+| 输入法/软键盘 | winit 支持 Android；`KeyboardInput`/IME 合成事件没实测 | 需真机验证 |
+
+顺序建议：平台条件化 clipboard feature → NDK `cargo check --target aarch64-linux-android` →
+若唯一错误来自 crossterm/syntect，再拆 look 协议 → 最后处理路径、assets、IME。

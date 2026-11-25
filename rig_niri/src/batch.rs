@@ -42,7 +42,7 @@ use rig_tui::ratatui::text::{Line, Span};
 use rig_tui::{
     AsideRender, CallItem, CallState, ChildCall, ContentRender, EntryRender, LookLine, RenderBatch,
     RenderContent, RenderInput, RenderKey, RenderOutput, RenderRequest, RenderSystems, Theme as RTheme,
-    ToolRender, TranscriptRender,
+    ToolRender, TranscriptRender, TranscriptSource,
 };
 
 use crate::editor::SubmittedPrompts;
@@ -912,6 +912,24 @@ pub fn dialogue_batch(
     width: u16,
     theme: &Theme,
 ) -> (RenderBatch, Vec<(TextId, Vec<Line<'static>>)>) {
+    // 内层类型才是 `conversation_frame` 吃的形状；`Conversation` 是 ECS 组件
+    // （元组结构体 + `Deref`），取 `.0` 不拷贝任何条目。
+    dialogue_batch_of(&conversation.0, Some(agent), width, theme)
+}
+
+/// 一份**内层** `rig_core::Conversation` -> 这一帧的批 + 文字块。
+///
+/// 和 [`dialogue_batch`] 是同一条纯函数路径，只是不要求它挂在某个 agent 实体
+/// 上、也不要求有 owner：`agent = None` 用于只读来源
+/// （[`rig_tui::TranscriptSource::Value`]，即一份存档对话），此时批里不指认
+/// 归属者，也没有管线会去读它。调用树/历史仍然是空的（存档没有本进程的调用
+/// 事实），和 [`dialogue_batch`] 一样不跑 look 调度。
+pub fn dialogue_batch_of(
+    conversation: &talk::Conversation,
+    agent: Option<Entity>,
+    width: u16,
+    theme: &Theme,
+) -> (RenderBatch, Vec<(TextId, Vec<Line<'static>>)>) {
     let rtheme = upstream_theme(theme);
     let frame = conversation_frame(
         conversation,
@@ -925,7 +943,7 @@ pub fn dialogue_batch(
     );
     let mut batch = RenderBatch {
         pane: None,
-        agent: Some(agent),
+        agent,
         width,
         requests: HashMap::new(),
     };
@@ -2004,6 +2022,96 @@ pub fn live_additions(world: &mut World, agent: Entity, width: u16) -> Vec<Keyed
         .collect();
     rows.extend(confirm_keyed_rows(&pending, width));
     rows
+}
+
+/// 一块转写窗格按 [`TranscriptSource`] 出**整段**行（还没按窗格高度窗口化）。
+///
+/// 三条来源各走各的路，但折行/排序都复用同一个 [`crate::transcript::Transcript`]
+/// 引擎（和聚焦管线、非聚焦条带同一套 `row_key`）：
+///
+/// * [`TranscriptSource::Shown`]：当前 [`ShownAgent`] 的对话 + 实时内容，和
+///   非聚焦条带的 [`dialogue_batch`] + [`live_additions`] 同一条链（侧窗格
+///   不跑 look 调度，所以卡片是默认画法）；
+/// * [`TranscriptSource::Agent`]：只画那个 agent 自己的 [`Conversation`] 与
+///   它的实时内容（[`live_additions`] 用 `ForAgent` 过滤），不跑 look；
+/// * [`TranscriptSource::Value`]：**只**画传进来的那份对话（存档/只读快照），
+///   没有实时内容、没有 Ask；上游对存档窗格也是这个口径。
+///
+/// 行 key 只由身份决定（消息/块序号、流式块的 `part` 哈希、效应 id），同一份
+/// 来源内容不变时每次调用逐行相同；`width` 是文字列数，折行照旧由引擎做。
+pub fn source_rows(world: &mut World, source: &TranscriptSource, width: u16) -> Vec<KeyedRow> {
+    let theme = world.get_resource::<Theme>().copied().unwrap_or_default();
+    match source {
+        TranscriptSource::Shown => {
+            let agent = world
+                .get_resource::<ShownAgent>()
+                .and_then(|shown| shown.0);
+            live_agent_rows(world, agent, width, &theme)
+        }
+        TranscriptSource::Agent(agent) => {
+            live_agent_rows(world, Some(*agent), width, &theme)
+        }
+        TranscriptSource::Value(conversation) => {
+            if width == 0 {
+                return Vec::new();
+            }
+            let (batch, texts) = dialogue_batch_of(conversation, None, width, &theme);
+            dialogue_rows(&batch, texts, width)
+        }
+    }
+}
+
+/// 一个活 agent（[`source_rows`] 的 `Shown`/`Agent` 两条来源）：对话 + 实时。
+///
+/// `agent = None`（没有 `ShownAgent`）时没有任何可画的东西；agent 存在但还没有
+/// [`Conversation`] 时，至少画它的实时内容（在飞调用/流式/Ask）。
+fn live_agent_rows(
+    world: &mut World,
+    agent: Option<Entity>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<KeyedRow> {
+    let Some(agent) = agent else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
+    // 先把对话拼成批：`Conversation` 的借用在 `live_additions` 要独占 world 之前
+    // 必须归还（批和文字块都是 owned 的）。
+    let dialogue = world
+        .get::<Conversation>(agent)
+        .map(|conversation| dialogue_batch_of(&conversation.0, Some(agent), width, theme));
+    let live = live_additions(world, agent, width);
+    let mut rows = match dialogue {
+        Some((batch, texts)) => dialogue_rows(&batch, texts, width),
+        None => Vec::new(),
+    };
+    rows.extend(live);
+    rows
+}
+
+/// 把 [`dialogue_batch_of`] 的批与文字块喂进一个临时 [`TranscriptEngine`]，
+/// 得到排好序、折好行的整段。
+///
+/// 引擎的块身份和顺序都来自 `BlockId`/`TextId`（按消息/块序号排），所以临时
+/// 引擎每帧重建也不会让行 key 漂移；保留条件和非聚焦条带一样：对话里已经删掉
+/// 的文字块不能留下（请求块由 `apply` 每帧覆盖）。
+fn dialogue_rows(
+    batch: &RenderBatch,
+    texts: Vec<(TextId, Vec<Line<'static>>)>,
+    width: u16,
+) -> Vec<KeyedRow> {
+    let mut engine = TranscriptEngine::default();
+    engine.set_width(width);
+    engine.apply(batch);
+    let mut kept: HashSet<TextId> = HashSet::new();
+    for (id, lines) in texts {
+        engine.set_text(id.clone(), lines);
+        kept.insert(id);
+    }
+    engine.retain_text(|id| matches!(id, TextId::Message { .. }) && kept.contains(id));
+    engine.keyed_rows().to_vec()
 }
 
 /// 对话里已经有的调用 id：实时块不再重复画它们（真管线里的 `rendered`）。
