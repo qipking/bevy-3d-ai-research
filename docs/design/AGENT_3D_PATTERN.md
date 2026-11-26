@@ -1,5 +1,18 @@
 # agent + 3D 程序设计开发范（rig_niri 模板）
 
+> **状态（2026-11-26 核对）：当前（大方向仍适用；少数扩展点已过时，见下）。**
+> 当前实现 = **niri 条带布局**（[`NIRI_SCROLL.md`](NIRI_SCROLL.md)）
+> + **feathers token 视觉**（[`FEATHERS_UI.md`](FEATHERS_UI.md)）
+> + **没有弹层**（[`../status/WORKSPACE_MODEL.md`](../status/WORKSPACE_MODEL.md) §8）。
+>
+> 本文已过时/已修正的点：
+> - **新面板**：优先用插件面板 `register_panel` / `add_panel_column`
+>   （[`PANEL_CANVAS.md`](PANEL_CANVAS.md)），**不要**再"给 `PanelId` 加一项"（§3.2 的旧写法，
+>   仍可用于 core 内置面板）。
+> - **完成度**：§2 写的"补全 待做"、§7 的"补全 / 滚动区嵌套 / 多会话面板 ⬜"已过时——
+>   补全（`complete.rs`）、转写滚动条（`pane.rs`）、多工作区（`workspaces.rs`）都已实现。
+> - **视觉**：不追终端像素，行/文字仍走 `LookLine`→`Row`，面板外壳走 feathers token。
+>
 > 定位：`rig_niri` = **rig-tui 的另一个完整前端**（视图层）；
 > `rig_harness_in_3d` = **通用 app 的 fork 模板**（harness 层：装配 + 扩展点）。
 > 上游跟进策略见 `rig_niri/UPSTREAM.md`；本文讲"怎么用它搭一个新 app"。
@@ -74,16 +87,16 @@ feathers 节点树（Node/Text/TextSpan，在视口外）
 
 | rig-tui 模块 | 模板里的对应物 | 说明 |
 |---|---|---|
-| `panel.rs`（`TuiPanel`/`Placement`） | `panels.rs`（`PanelId` + `PanelSpec` + 3D 锚点） | 终端按格子切，这里按世界坐标摆 |
+| `panel.rs`（`TuiPanel`/`Placement`） | `panels.rs`（`PanelId` + 行/根表）+ `layout.rs`（niri 分裂树） | 终端按格子切，这里按世界坐标摆；新面板优先走 `panel.rs::register_panel` |
 | `pane.rs` / `transcript.rs`（转写滚动） | `panels.rs::sync_panels` + `Overflow::scroll_y` | 增量 diff 代替重排 |
 | `renderers.rs`（look 调度） | `batch.rs`（`RenderBatch` + `RenderSystems::Render`） | rig-tui 是 `pub(crate)`，所以自己驱动 |
 | `status.rs` | `status.rs`（`StatusBar` + 一行） | 状态条目可扩展 |
-| `hints.rs` | `editor.rs` 的第二行 | 键位提示 |
-| `title.rs` | 窗口标题（`Window::title`） | 面板标题可做成面板第一行 |
+| `hints.rs` | `hints.rs`（条带之外的固定行） | 键位提示 |
+| `title.rs` | `title.rs`（窗格标题行） | 面板标题是 tile 第一行（`pane.rs::title_row`） |
 | `pick.rs`（选择器） | 闸门的 `Ask` 行 + `AskChoice` | 选项列表就是可点行 |
 | `input.rs` / `editor.rs` / `keys.rs` | `editor.rs` | 状态形状相同，键位收窄 |
 | `history.rs` | `Editor.history` + ↑↓ | |
-| `complete.rs` | 待做（命令补全） | 建议做成 `CompletionSource` trait |
+| `complete.rs` | `complete.rs`（`CompletionPlugin`） | 已实现 |
 | `markdown.rs` / `highlight.rs` / `diff.rs` | **looks**（在 `batch.rs`） | 内容表现属于业务 look |
 | `theme.rs` | `theme.rs`（`Theme` token） | 换主题只改一处 |
 | `render.rs` / `screen.rs` / `terminal.rs` | `feathers_in_3d` | 终端设备换成 3D 渲染 |
@@ -113,14 +126,13 @@ app.add_systems(TranscriptRender, my_look.in_set(RenderSystems::Render));
 ### 3.2 加一块面板
 
 ```rust
-// PanelId 加一项 + default_panels() 加一条 spec（尺寸/锚点/配色）
-PanelId::Side,
-// 再写一个系统往 PanelRows 里塞行
-fn side_rows(mut panels: ResMut<PanelRows>) {
-    panels.set(PanelId::Side, vec![KeyedRow { key: 1, hash: 1, row }]);
-}
+// 插件面板（推荐）：注册 -> 放进条带 -> 拿 bevy_ui 根，见 PANEL_CANVAS.md
+let panel = app.register_panel("git");
+let root = add_panel_column(world, workspace, panel, 0.28)?;
+// 内置 core 面板仍可写：PanelId 加一项 + default_tree() 改一条
 ```
-面板之间互不影响：每个面板自己的 3D 锚点、自己的增量状态。
+面板之间互不影响：每个面板自己的 3D 锚点、自己的增量状态。`PanelId::Plugin` 让插件
+不必改核心枚举（`PANEL_CANVAS.md` §3.1）。
 
 ### 3.3 加一个交互
 
@@ -189,5 +201,8 @@ app.add_observer(|click: On<PointerClick>, q: Query<&MyRowAction>| { ... });
 | 闸门 Ask/Decision + 可点选项 | ✅ |
 | 射线拾取 / 悬停 / 选择 / 复制 | ✅ |
 | 相机操作架（手柄/键盘） | ✅（无实体手柄，未真机验证） |
-| 补全、滚动区嵌套、多会话面板 | ⬜ |
-| 真实模型 | ⬜（接缝：`ReplyStream`） |
+| 补全（`complete.rs`） | ✅ |
+| 转写滚动条 / 条带横向滚动（`pane.rs` / `workspaces.rs`） | ✅ |
+| 多工作区（`workspaces.rs`，一个工作区一条 niri 条带） | ✅ |
+| 插件面板（`panel.rs` 切片 1/2） | ✅（切片 3 未做，见 `PANEL_CANVAS.md`） |
+| 真实模型 | ⬜（接缝：`ReplyStream`；`kernel.rs` 仍是脚本） |

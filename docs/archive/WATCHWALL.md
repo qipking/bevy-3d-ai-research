@@ -1,5 +1,7 @@
 # S1 监看墙：用数字定几何（2026-11-25）
 
+> **状态：已归档，仅历史参考；当前实现见 [status/ARCHITECTURE.md](../status/ARCHITECTURE.md)，空间 UI 纲领见 [design/SPATIAL_UI.md](../design/SPATIAL_UI.md)。**
+>
 > **已暂缓（同日）**：用户指示"视觉上的问题不要研究了"。本文与 `examples/watchwall.rs`（已删）
 > 只作决策记录留存，不再推进 LOD / 弧 / 信标的实现。当前优先级是功能面：会话、命令、设置、
 > 闸门、picker，用测试验收，不看截图。

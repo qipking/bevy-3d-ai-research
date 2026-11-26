@@ -1,5 +1,7 @@
 # 把 rig-harness 的 UI 完整换成 3D（实施计划）
 
+> **状态：已归档，仅历史参考；当前实现与进度见 [status/ARCHITECTURE.md](../status/ARCHITECTURE.md)、[status/REMAINING.md](../status/REMAINING.md)。**
+>
 > **2026-11-24 方向会议**：目标从"把 TUI 搬进 3D"上调为"**visionOS 级空间 UI 的 Bevy 实现**"。
 > 终端**交互**（键位、整屏切块）降级/丢弃，终端编码的**领域模型**（turn/call/Ask/Pick/StatusItems/
 > RenderBatch）全部保留；`frame.rs` 从"整个界面"降级为"卡片内部排版 + flat 模式"。

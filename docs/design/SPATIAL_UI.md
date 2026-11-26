@@ -1,5 +1,17 @@
 # 空间 UI 设计纲领（会议记录 + 决策）
 
+> **状态（2026-11-26 核对）：已废弃（作为路线图）；取代它的是下面这些文档，不要按这份做。**
+>
+> - **取代它的文档**：布局 → [`NIRI_SCROLL.md`](NIRI_SCROLL.md)；视觉 → [`FEATHERS_UI.md`](FEATHERS_UI.md)；
+>   工作区 → [`../status/WORKSPACE_MODEL.md`](../status/WORKSPACE_MODEL.md)；插件面板 →
+>   [`PANEL_CANVAS.md`](PANEL_CANVAS.md)；转写来源 → [`SHOW_AGENT.md`](SHOW_AGENT.md)。
+> - **与当前口径直接冲突**：§5/§6 的 P1"卡片化/自由摆放/可拖动缩放"、§4 的 ornament/浮层、
+>   §8 的"卡片在 0.6–1.0 m 前弧、可拖动可缩放"、§6 的 P2/P3 凝视/手势路线图。当前实现是
+>   **niri 条带里只有列**：没有自由浮动卡片、没有弹层、不做斗兽场/圆柱体/环/两级视角
+>   （用户已明确否掉）。
+> - **仍可参考（不是验收项）**：§1–§3 的"丢交互不丢模型""为什么是 Bevy ECS"
+>   "RealityKit 范式同构"这些判断没有变；§4/§7/§8 的 HIG 数值与无障碍要求是远期背景。
+>
 > **niri 的唯一用途**：`rig_niri` 移植 `rig-tui` 时，组件/窗口的**布局位置设计**参考
 > `reference/niri/niri-main`。除此之外（斗兽场、圆柱体总览、环、两级视角）全部不再推进。
 >

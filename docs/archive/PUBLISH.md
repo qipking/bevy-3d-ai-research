@@ -1,5 +1,7 @@
 # 三个 crate 的发布准备
 
+> **状态：已归档，仅历史参考；当前发布记录见 [reports/PUBLISH_GITHUB.md](../reports/PUBLISH_GITHUB.md)。**
+
 ## 仓库布局（建议：每个 crate 一个 GitHub 仓库）
 
 ```

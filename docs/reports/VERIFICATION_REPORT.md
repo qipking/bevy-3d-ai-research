@@ -1,5 +1,16 @@
 # 路线 B 验证报告（本地机续跑）
 
+> 状态：历史记录（2026-11-23 spike 快照）；其中“方案 A 走 Opaque 队列”“3D 文本未做”“半透明面板未验证”“research/ 下的 spike 布局”已被当前实现取代，当前状态见 [docs/status/REMAINING.md](../status/REMAINING.md)。
+
+> **已过时结论（2026-11-26 复核，原文一律保留）**
+>
+> 1. §3.3、§5.2 的“方案 A：全不透明节点走 Opaque 队列”是当时 spike 的权宜之计。现状是**方案 B**：`feathers_in_3d/src/sort.rs:1-37` 给同一面板所有节点同一个 `mesh_center` + 单调递增 `depth_bias`，覆写 `TransparentSortingInfo3d`；vendored 材质统一回到 `AlphaMode::Premultiplied`（`vendor/bevy_luma/crates/luma_engine/src/layout/render/material_3d.rs:196-201`），透明队列因此可用。
+> 2. §4.6、§5 的“3D 文本未做”已被取代：现在有 glyph atlas → `StandardMaterial` 的 3D 文本实现（`feathers_in_3d/src/text3d.rs:54` `sync_panel_text`）。
+> 3. §4.6 的“半透明面板未验证/本次走 Opaque 规避”已被取代：面板已回透明队列（同 1 的材质改动），不再靠 Opaque 规避。
+> 4. §1、§7 及“附：产物清单”里的 `research/` 目录布局已不存在：仓库根就是 workspace 根（`Cargo.toml:1-7`，members = `feathers_in_3d` / `rig_niri` / `rig_harness_in_3d`），当时的 `spike/` 现在是 `experiments/spike/`（`git ls-tree -r HEAD experiments`），`bevy_luma` 在 `vendor/bevy_luma/`，`CARGO_HOME` 在仓库根 `.cargo-home/`；证据图 `research/render/` 由 `render/rf_niri_app/` 取代，`render/probe/` 已在提交 `e5fb98c`（目录整理）里删除。文中路径只能当历史复现记录，照抄命令需按新路径改。
+> 5. §6 的“M1（渲染原型）2–3 人周”是当时的估算，不是当前计划；现在还剩什么以 [`REMAINING.md`](../status/REMAINING.md) 为准。
+> 6. §4.1 的“647% 放大下边缘过渡仅 1 物理像素”是当时的定量实测，作为历史证据成立；但“像素级”已不是当前验收口径——`docs/status/REMAINING.md:7-9`、`docs/status/PARITY.md:5-8` 明确改为“内容/行为对照 rig-tui，视觉与布局以 feathers + niri 为准”。
+
 > 承接：`spike/RESETUP_DOC.md`（阿里云服务器交接文档，2026-11-22）
 > 本机：Fedora Silverblue 45 / Ryzen 7 7840H (8C16T) / 58 GB / Rust 1.100.0
 > 日期：2026-11-23
@@ -139,6 +150,8 @@ luma 的 `UNodeMaterial3d` 默认 `AlphaMode::Premultiplied`（透明队列）�
 
 本次为了把"布局→3D 映射"验证干净，采用 A（对 luma 源码做了 1 处本地补丁，见 §5.2），并在报告里标注 B 是生产方案。
 
+（注：2026-11-26 已更新，现状见文首“已过时结论”第 1 条：方案 A 已弃用，生产实现是 `feathers_in_3d/src/sort.rs:1-37` 的透明排序覆写。）
+
 ---
 
 ## 4. 验证结果
@@ -232,6 +245,8 @@ x=851 (198,124,170)   <- 面板背景
 | — | 性能 | llvmpipe 软件渲染，数据无意义；需真机（本机有 Radeon 7600，但会话看不到 `/dev/dri`） |
 | — | 与 `bevy_ui` 2D 拾取的仲裁 | 未验证（本 spike 把 UI 挪出视口，天然不冲突） |
 
+（注：2026-11-26 已更新，上表“3D 文本”与“半透明面板”两行已被当前实现取代，见文首“已过时结论”第 2、3 条。）
+
 ---
 
 ## 5. spike 相对交接版的改动
@@ -263,6 +278,8 @@ fn alpha_mode(&self) -> AlphaMode {
 ```
 
 **这只是 spike 的权宜之计**；正式实现应改为 §3.3 方案 B（Transparent3d 排序覆写），保留半透明能力。
+
+（注：2026-11-26 已更新，现状见文首“已过时结论”第 1 条；该处补丁内容也已换成“统一 Premultiplied”，与 `feathers_in_3d` 的排序覆写配套。）
 
 ---
 

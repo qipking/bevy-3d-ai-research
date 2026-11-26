@@ -1,11 +1,12 @@
 # 开放面板画布（F6）：插件面板注册、条带列与行读回
 
-> **状态（2026-11-26）**：**切片 1、切片 2 都已实现**——插件能注册面板、把它作为
-> niri 列放进指定工作区、拿到 `bevy_ui` 根并 spawn 自己的子树（3D 镜像自动可见）、
-> 按 `RowLayout` + `PanelAreas` 读回“第 n 行的世界矩形”。切片 2 补上了
-> `StatusLine`（任意面板底部状态行）、`PanelAuto::AllWorkspaces` 自动工作区策略、
-> 插件列的整树移除/注销，以及插件列作为活动列（`ActiveTranscript` 之外的另一个
-> 焦点）。内置 `PanelId` 面板的行为与几何不变。
+> **状态（2026-11-26 核对）：切片 1、切片 2 已实现；切片 3 未实现。**
+>
+> | 切片 | 内容 | 状态 | 证据 |
+> |---|---|---|---|
+> | 1 | 插件面板注册、`PanelId::Plugin`、放进条带、行世界矩形读回 | ✅ 已实现 | `panel.rs:145`（`register`）、`panel.rs:271`（`add_panel_column`）、`panel.rs:704`（`DrawnRow`）、`panel.rs:722`（`drawn_row`）、`panels.rs:100`（`PanelId::Plugin`） |
+> | 2 | `StatusLine`、`PanelAuto::AllWorkspaces`、移除/注销、`ActivePanelColumn` | ✅ 已实现 | `status.rs:114`/`:361`、`panel.rs:65`（`PanelAuto`）、`:413`（`apply_auto_panels`）、`:440`/`:521`/`:541`（移除/注销）、`:600`（`ActivePanelColumn`） |
+> | 3 | 插件命令绑定、`DrawnRow` 文本/高亮读回、redraw 门控 | ⬜ 未实现（redraw 门控**明确不做**） | `DrawnRow` 只有几何字段（`panel.rs:704`–`:713`）；没有插件命令绑定入口；全仓没有 `RequestRedraw`/门控 |
 >
 > 落点：`rig_niri/src/panel.rs`（新）、`rig_niri/src/status.rs`（`StatusLine`）、
 > `rig_niri/src/panels.rs` 的 `PluginPanel` / `PanelId::Plugin`。行号是本次快照；
@@ -30,7 +31,7 @@
 
 ---
 
-## 2. 现状与缺口（切片 1 之前）
+## 2. 历史：切片 1 之前的缺口（已由切片 1/2 填上，保留作决策记录）
 
 | 位置 | 现状 | 缺口 |
 |---|---|---|
@@ -40,11 +41,11 @@
 | `panels.rs:298` `sync_panels` | 按工作区拿 `WorkspacePanels`，逐面板做行前缀 diff，生成 `RowLayout` | 只服务内置键；插件没有行归属 |
 | `panels.rs:109` `RowLayout` | `{panel, panel_entity, index}`，行实体上有 | 有行身份，但没有“换算世界矩形”的公开函数 |
 | `frame.rs:1053` `spawn_panel` | 一次装好 `Node`/chrome/`WorldPanel`/`MirrorRoot`/`PanelId` | 是 `pub` 的，但插件没有合法 `PanelId` 可传 |
-| `frame.rs:586` `lay_out_frame` | 每个工作区用自己的 `tree` + `roots` 算 `PanelAreas` | 树叶子只能是内置 `PanelId` |
+| `frame.rs:593` `lay_out_frame` | 每个工作区用自己的 `tree` + `roots` 算 `PanelAreas` | 树叶子只能是内置 `PanelId` |
 | `frame.rs:327` `PanelArea` | 树给的精确 `size`/`center`、格子近似 `rect`、行列数 | 足够做行读回的几何源 |
 | `layout.rs:99` `Size::Fraction` | 列宽 = 视口宽的比例；`append_column_at`（`:779`）追加到含转写的横向条带 | 没有“插件列 + 任意 fraction”的便捷入口 |
 | `layout.rs:912` `set_column_fraction` | 只改目标列的 `Fraction`，其它列一个字节不动 | 可复用（切片 1 就是 `append_column_at` 后调它） |
-| `workspaces.rs:732` `WorkspacePanels` | 每工作区 `rows`/`roots`/`spawned`/`areas` 权威快照 | 插件列必须同时更新“组件 + 聚焦全局代理” |
+| `workspaces.rs:758` `WorkspacePanels` | 每工作区 `rows`/`roots`/`spawned`/`areas` 权威快照 | 插件列必须同时更新“组件 + 聚焦全局代理” |
 | `status.rs:382`（上游 `reference/rig-tui-inspect/rig-tui-0.47.0/src/status.rs`）`StatusLine` | 上游是挂任意实体的组件，在它的一行画状态 | **切片 2 已补**：`status.rs` 的 `StatusLine` 挂在任意面板根上，在面板底部画一行；`PanelId::Status` 的现有状态行不变 |
 
 **3D 侧本来不是缺口**：`feathers_in_3d` 不认识 rig，`MirrorRoot`（`world3d.rs:126`）
@@ -89,7 +90,7 @@ world.entity_mut(root).insert(StatusLine::default());
 
 ### 3.1 身份：注册表 + 句柄，`PanelId::Plugin(..)`
 
-- `PanelRegistry::register(name) -> PluginPanel`（`panel.rs:65` / `:75`）：名字幂等，
+- `PanelRegistry::register(name) -> PluginPanel`（`panel.rs:145` / `:153`）：名字幂等，
   同名重复注册返回同一句柄；空名字生成 `plugin-panel-<n>`，不 panic。
 - `PanelId::Plugin(PluginPanel)`（`panels.rs:66`）：句柄是 `u64` 的薄包装
   （`Copy + Eq + Hash`），内置变体保持原样。
@@ -104,7 +105,7 @@ world.entity_mut(root).insert(StatusLine::default());
 
 ### 3.2 放进条带：`add_panel_column`
 
-`add_panel_column(world, workspace, panel, fraction) -> Option<Entity>`（`panel.rs:141`）：
+`add_panel_column(world, workspace, panel, fraction) -> Option<Entity>`（`panel.rs:271`）：
 
 1. 校验句柄已注册、工作区有 `Workspace` + `WorkspacePanels`；
 2. 在树的**工作副本**上 `append_column_at(PanelId::Transcript, leaf)`（新列接在
@@ -114,7 +115,7 @@ world.entity_mut(root).insert(StatusLine::default());
    `PanelId` 组件一次装好），挂 `WorkspacePanel(workspace)`；
 4. 更新该工作区组件（`tree`/`roots`/`rows`/`spawned`）；如果它是聚焦工作区，
    同时更新全局 `FrameTree`/`PanelRoots`/`PanelRows`/`PanelSpawned`——否则下一次
-   `commit_focused_panels`（`workspaces.rs:872`）会把组件写回成没有新列的旧全局副本；
+   `commit_focused_panels`（`workspaces.rs:898`）会把组件写回成没有新列的旧全局副本；
 5. 返回根实体，失败返回 `None`（只 `warn!`，不 panic）。
 
 **列宽/位置规则**（niri 第一原则）：新列是 `Size::Fraction(fraction)`，宽度
@@ -227,7 +228,7 @@ app.register_panel_with("git", PanelSpec::everywhere(0.28));
 ```
 
 `PanelRegistry` 为每块面板存一份 `PanelSpec`。`PanelAuto::AllWorkspaces` 由
-`apply_auto_panels`（`WorkspacesPlugin` 的 `Prepare`，exclusive system）补齐：
+`apply_auto_panels`（`panel.rs:413`，`WorkspacesPlugin` 的 `Prepare`，exclusive system）补齐：
 
 - 注册时已有 N 个工作区 → 第一帧每个工作区各加一列；
 - 之后 `spawn_workspace` / `spawn_workspace_with_tree` 新建的工作区 → 下一帧自动带上；
@@ -313,10 +314,10 @@ picker 时 reveal 插件列、关 picker 后插件列宽不变”。
   `WorkspacePanels.roots` 各有一个根实体）。同一个句柄在不同工作区可以是不同
   实体、不同列宽、不同行——这正是 niri “一个工作区一条条带”的模型。
 - 聚焦工作区的全局 `PanelRows`/`PanelRoots`/`FrameTree`/`PanelAreas` 是工作副本；
-  `apply_focus`（`workspaces.rs:935`）在切换时装载组件的根/树/行。
+  `apply_focus`（`workspaces.rs:961`）在切换时装载组件的根/树/行。
   所以 `add_panel_column` 对聚焦工作区必须同时写全局代理（§3.2 第 4 步），
   非聚焦工作区只写组件，不污染全局。
-- 应用层自己 `spawn_workspace`（`workspaces.rs:781`）创建的每个工作区都是独立
+- 应用层自己 `spawn_workspace`（`workspaces.rs:807`）创建的每个工作区都是独立
   条带；插件显式对某个工作区调用 `add_panel_column` 即可。切片 2 的
   `PanelAuto::AllWorkspaces` 由 `apply_auto_panels` 在每帧 `Prepare` 统一补齐：
   已有工作区 + 之后新建的工作区都覆盖，注册表是唯一策略来源。
@@ -356,14 +357,14 @@ picker 时 reveal 插件列、关 picker 后插件列宽不变”。
 测试：`panel.rs` 的 14 个测试覆盖切片 1 的注册/列/根/区域/镜像根/行世界矩形/
 reveal/重复输入/非聚焦工作区/queue/树叶子，以及切片 2 的 StatusLine（插件面板、
 输入框底行、多面板/宽度裁剪）、自动工作区（已有 + 新建）、移除后树逐字节复原、
-picker 共存、插件列活动焦点。`cargo test --workspace --offline` 全绿（`rig_niri`
-lib 595 → 602）。
+picker 共存、插件列活动焦点。`cargo test --workspace --offline` 全绿（`rig_niri` lib **606**，2026-11-26 实测）。
 
-### 切片 2 之后仍没做（见 `REMAINING.md` §10）
+### 切片 3：未实现（见 `REMAINING.md` §10）
 
 - 插件命令绑定入口（注册表 + 默认键位；`InputAction` / `run_command` 已有）；
 - `DrawnRow` 的可见性辅助（`effective_clip` 非空）与行文本/高亮读回扩展；
-- `RequestRedraw` / 脏区门控（本设计明确不做）。
+  `DrawnRow` 现在只有 `panel`/`index`/`world_rect`（`panel.rs:704`–`:713`），没有文本/高亮字段；
+- `RequestRedraw` / 脏区门控：**明确不做**（每帧重排 + 每帧 `sync_mirror`，见 §1/§4）。
 
 ### 验收口径
 

@@ -1,5 +1,19 @@
 # rig-tui × feathers × 移动端：改造方案（无 VR）
 
+> **状态（2026-11-26 核对）：计划（部分实现），不是当前布局/视觉的权威文档。**
+>
+> - **已落地（桌面部分）**：`rig_niri` 已存在并可用；工具/Gate/Ask/卡片（M0–M2 的桌面部分）
+>   已实现，见 `rig_harness_in_3d/src/kernel.rs:46`（`search_products`）/`:191`（`payment_gate`）、
+>   `rig_niri/src/batch.rs:599`（`rebuild_batch`）；视觉改为 feathers
+>   token（[`FEATHERS_UI.md`](FEATHERS_UI.md)），布局改为 niri 条带（[`NIRI_SCROLL.md`](NIRI_SCROLL.md)）。
+> - **未实现**：§5 的移动端陀螺仪相机（`camera_rig.rs` 只留了"以后换设备姿态"的接口，
+>   没有 `DeviceOrientation`/`gyro_camera`）；真机 Android/iOS 构建未做。
+> - **与当前口径直接冲突**：§3.1 的"前端渲染 Answerer（feathers **模态面板**）"和 §7 的
+>   "支付闸门……模态"——当前**没有弹层**，确认是条带里的确认 tile（`WORKSPACE_MODEL.md` §8）；
+>   §6 的 `panel.rs（PanelCanvas）` 已被插件面板 API 取代（[`PANEL_CANVAS.md`](PANEL_CANVAS.md)），
+>   `feathers_draw.rs` 也没有这个文件名（对应 `feathers_in_3d`）。
+> - **仍有效**：§2 工具层写法、§3 Gate 机制、§5 陀螺仪设计（作为移动端计划）、§8 风险。
+>
 > 范围收敛：**feathers（3D 空间面板）+ rig-tui 内核 + feathers UI 适配 + 移动端陀螺仪相机**。不做 VR。
 > 业务：大模型导购助手，6 个业务工具，支付前闸门。
 > 日期：2026-11-23　｜　源码证据：`rig-tui-inspect/`（rig-tui / rig-ecs / rig-harness / rig-core / rig-tools 0.47 源码）

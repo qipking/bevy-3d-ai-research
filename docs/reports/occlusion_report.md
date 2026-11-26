@@ -1,5 +1,15 @@
 # 面板本体被清空后"立方体浮到前面"——遮挡排查报告
 
+> 状态：历史记录（2026-11-23 快照，随提交 `dacd61c` 入库）；其中“修 `rig_niri/src/main.rs` 的 `unhover_row` 补 rows 守卫”“下一步把 guard 应用到 rig_niri”“`render/probe/` 证据可复跑”已被当前实现取代，当前状态见 [docs/status/REMAINING.md](../status/REMAINING.md)。
+
+> **已过时结论（2026-11-26 复核，原文一律保留）**
+>
+> 1. 定位锚点失效：`rig_niri/src/main.rs` 不在当前树（`git ls-tree HEAD rig_niri/src` 无 `main.rs`，该 crate 现在是 lib），`grep -rn "unhover"` 在 `rig_niri/src` 与 `feathers_in_3d/src` 均为 0 行。行底色现在是行模型自带的静态值：`Row::band` → `BackgroundColor`（`rig_niri/src/transcript.rs:399-400`），band 颜色取自主题的 17 个语义色（`rig_niri/src/rich.rs:15`），不存在“PointerOut 时把面板根/行背景写成 alpha=0”的代码路径。
+> 2. 修复已结案，但记录它的提交不在当前 main 祖先链上：`3c02d69`（`fix(rig-feathers): PointerOut 冒泡清空面板背景（遮挡异常结案）`，author date 2026-11-23 06:25）的 `git merge-base --is-ancestor 3c02d69 HEAD` 退出码 1（历史经 jj 重写）；报告与探针随 `dacd61c` 入库，而 `dacd61c` 的 `rig-feathers/src` 已经是 lib（无 `main.rs`，`git grep PointerOut` 无结果），守卫的载体在那之前就没了。§4“在真正的 `rig_niri/src/main.rs` 应用 guard”因此已无对象。
+> 3. 证据路径变了：`occlusion_probe/` 现在是 `experiments/occlusion_probe/`（HEAD 里 11 个文件，`git ls-files experiments/occlusion_probe`）；`render/probe/` 的截图与日志不在工作树，只能从历史提交取（`git show dacd61c:render/probe/…`），提交 `e5fb98c`（目录整理）把它从工作树删掉。
+> 4. 行号锚点漂移：`feathers_in_3d/world3d.rs:168-173`/`:211` 现在对应 `world3d.rs:334`（读 `BackgroundColor`）与 `:726-756`（写 `mat.color`）；`sort.rs:50-67` 对应 `apply_panel_sort`（`sort.rs:51`）。函数名/类型名才是锚，行号以 2026-11-23 快照为准。
+> 5. “`feathers_in_3d` 未改、库内无 bug”只是**这次遮挡排查**的结论，当时成立；库随后确有与本 bug 无关的渲染侧改动：透明排序覆写 `feathers_in_3d/src/sort.rs:1-37`（提交 `dad35f6`）。
+
 **结论**：库里没问题。是 `rig_niri` 的 `unhover_row` 观察者缺少"这实体是不是一行"的判断，把**面板根实体**的背景色写成了 alpha=0；`feathers_in_3d` 忠实把这个颜色同步进 `UNodeMaterial3d`，SDF 的 body 因此全被 discard（边框仍画），背后的不透明立方体就从"洞"里露出来。看起来像立方体跑到前面，实际是面板本体消失了。与深度测试、透明排序、clip uniform、面板网格尺寸都无关。
 
 复现：用 06:42 构建的 `rig_niri/target/debug/rig_niri` 可 100% 复现 → `render/probe/parent_repro/05_scrolled.png`（本体像素=清屏色，立方体像素=橙色）。把拷贝 `occlusion_probe/rig_dbg` 的 `PANEL_H` 改成 300 后，跑出的 `render/probe/repro300_bug/05_scrolled.png` 与报告的 300px 描述完全一致（面板深色底整块消失，橙色立方体出现在面板内、盖在内容上）；同一拷贝加一行 `rows` guard 后 `repro300_fix/05_scrolled.png` 恢复正常遮挡。
@@ -88,7 +98,7 @@ BEVY_ASSET_ROOT=… RF_SHOT_DIR=$PWD/../../render/probe/repro300_fix ./target/de
 
 - `bevy_picking` 0.20 的 `PointerOut` 定义就是会冒泡：`bevy_picking-0.20.1/src/events.rs:246-265`，`#[entity_event(propagate = PointerTraversal, auto_propagate)]`，文档写明 "Unlike `PointerLeave` … bubbles up to all of the target entity's ancestors"。
 - 面板根**不是**被点中的：`render/probe/dbg_tour2/log.txt` 显示 `has_pickable=false`、`panel itself in PanelPickIndex=false`（14 个 rect 全是行）。所以事件只能来自子实体冒泡。
-- 写入者是 `rig_niri/src/main.rs:321-333` 的 `unhover_row`：它只查 `selected`，**没有** `rows.contains(entity)`；对比 `hover_row`（`main.rs:305-319`）就有这个 guard。于是 `PointerOut` 冒泡到面板根时，面板根的 `BackgroundColor` 被写成 `srgba(0.10,0.14,0.22,0.0)`。
+- 写入者是 `rig_niri/src/main.rs:321-333` 的 `unhover_row`：它只查 `selected`，**没有** `rows.contains(entity)`；对比 `hover_row`（`main.rs:305-319`）就有这个 guard。于是 `PointerOut` 冒泡到面板根时，面板根的 `BackgroundColor` 被写成 `srgba(0.10,0.14,0.22,0.0)`。（注：2026-11-26 已更新，`main.rs` 与 `unhover_row` 都不存在了，现状见文首“已过时结论”第 1 条。）
 - `feathers_in_3d` 侧只是如实镜像：`world3d.rs:168-173` 从 `BackgroundColor` 取 `base_color`，`world3d.rs:211` 写 `mat.color`；clobber 后日志为 `node 330v0 … color=Vec4(0.0100,0.0174,0.0397, 0.0)`（`render/probe/clobber300/log.txt:89`）。
 - shader 里 body 和 border 共用一次输出：`unode_3d.wesl:277-281` 的 `body_alpha`、`:366-369` 的 `shape_alpha`、`:415-419` 的 `discard`。`color.a=0` 时 body 贡献为 0，border 仍按 `border_color.a` 画出来——正好是截图里的"只有蓝色边框、没有深色底"。
 
@@ -118,6 +128,8 @@ BEVY_ASSET_ROOT=… RF_SHOT_DIR=$PWD/../../render/probe/repro300_fix ./target/de
 ## 4. 修复 / 建议
 
 **改 `rig_niri`（本次不允许动，交给并行修改的同学）**，一行：
+
+（注：2026-11-26 已更新——修复已合入历史、`main.rs` 已拆掉，下面这段补丁只作为当时的修改示意，见文首“已过时结论”第 1、2 条。）
 
 ```rust
 fn unhover_row(
@@ -149,6 +161,8 @@ fn unhover_row(
 ### 下一步
 - 在真正的 `rig_niri/src/main.rs` 应用上面的 guard（拷贝里已验证），用 300px+滚动+原来 15 行内容再跑一次 tour，确认 05/06 不再露立方体；顺便观察行 band 是否还在。
 - 给行加"band 原始色"组件，unhover 时恢复，避免 hover 一次后 band 永久丢失这一类副作用。
+
+（注：2026-11-26 已更新，以上两步都已完成/被取代：guard 随历史提交结案，`main.rs` 拆分后整条 hover-band 写法被 feathers 主题的静态 `Row::band` 替代；现状见文首“已过时结论”第 1、2、5 条与 `rig_niri/src/transcript.rs:399-400`。）
 
 ## 5. 产物
 

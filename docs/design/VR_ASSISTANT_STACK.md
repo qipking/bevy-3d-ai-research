@@ -1,5 +1,20 @@
 # 大模型驱动 3D / VR 助手：技术栈与架构研究
 
+> **状态（2026-11-26 核对）：当前（部分实现的研究记录）——M0 已完成，M1 大部分完成，
+> M2/M3（VR）未实现，仍是计划。**
+>
+> - **已落地**：Bevy **0.20.1** + `rig-ecs` 0.47 内嵌（L3）、feathers 视觉、路线 B 的
+>   `feathers_in_3d` 3D 面板（`rig_niri/src/frame.rs:691` 的 `place_panels`）、3D 文本桥
+>   （`feathers_in_3d/src/text3d.rs`，本文 §6 的方案 A）。
+> - **与当前实现的差距**：桌面布局已经不是本文设想的"卡片自由摆放"，而是 **niri 条带**
+>   （[`NIRI_SCROLL.md`](NIRI_SCROLL.md)），视觉口径见 [`FEATHERS_UI.md`](FEATHERS_UI.md)；
+>   VR/OpenXR（M2/M3）仍未做，本文 §2 的版本三角（OpenXR 只到 Bevy 0.19）仍是真约束。
+> - **与当前口径直接冲突**：§8 把 Picker 写成"对话框/菜单（feathers dialog/select）"——
+>   当前**没有弹层**，picker 是条带最右一列（`WORKSPACE_MODEL.md` §8、
+>   [`PANEL_CANVAS.md`](PANEL_CANVAS.md)）；§7 的"面板可抓取/移动/缩放"未实现
+>   （可拖动的是**整个工作区条带**，不是单个面板）。
+> - **仍有效**：§2 版本三角、§6 的 3D 文本三方案与验收判据、§10 风险登记、§11 本机能力边界。
+>
 > 目标：**feathers 做前端 · rig 做内核 · 已验证的 3D feathers（路线 B）做空间面板 · rig 的工具调用取后端服务器数据 · 最终交付一个 VR 应用**
 > 本机：Fedora 45 / Ryzen 7 7840H / 无 GPU 直通（llvmpipe）/ **无 OpenXR 运行时**（无 Monado / SteamVR）
 > 日期：2026-11-23　｜　前置证据：`VERIFICATION_REPORT.md`（路线 B 实测）、`spike/RESETUP_DOC.md`（luma/feathers 源码级分析）
